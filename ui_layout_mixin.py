@@ -1054,6 +1054,7 @@ class UiLayoutMixin:
         self.base_angle_label = None
         self.length_label = None
         self.orientation_status_label = None
+        self.grid_crs_warning_label = None
 
         (
             self.snap_checkbox,
@@ -1069,6 +1070,7 @@ class UiLayoutMixin:
             self.base_angle_label,
             self.length_label,
             self.orientation_status_label,
+            self.grid_crs_warning_label,
         ) = build_grid_options_controls(
             self.dlg.horizontalLayout_2,
             use_snap=self.grid_use_snap,

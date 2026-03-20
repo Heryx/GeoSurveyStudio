@@ -65,10 +65,12 @@ class GridWorkflowMixin:
         self.base_angle_label = None
         self.length_label = None
         self.orientation_status_label = None
+        self.grid_crs_warning_label = None
         self.orientation_helper_dialog = None
         self.orientation_helper_status_label = None
         self.orientation_helper_edits = {}
         self._orientation_helper_syncing = False
+        self._grid_crs_signal_connected = False
         self.internal_grid_checkbox = None
         self.last_area_layer = None
         self.last_grid_layer = None
@@ -77,9 +79,20 @@ class GridWorkflowMixin:
         self._gpr_z_min = 0.0           # Z minimo del volume caricato
         self._gpr_z_step = 0.05         # passo Z (profondità per slice)
         self._gpr_n_slices = 0          # numero totale slice calcolate
+        try:
+            QgsProject.instance().crsChanged.connect(self._refresh_grid_crs_warning_label)
+            self._grid_crs_signal_connected = True
+        except Exception:
+            self._grid_crs_signal_connected = False
 
     def _cleanup_grid_state(self):
         """Teardown grid workflow transient UI state. Called by plugin unload()."""
+        if getattr(self, "_grid_crs_signal_connected", False):
+            try:
+                QgsProject.instance().crsChanged.disconnect(self._refresh_grid_crs_warning_label)
+            except Exception:
+                pass
+            self._grid_crs_signal_connected = False
         if self.orientation_helper_dialog is not None:
             try:
                 self.orientation_helper_dialog.hide()
@@ -93,6 +106,25 @@ class GridWorkflowMixin:
         self.orientation_helper_status_label = None
         self.orientation_helper_edits = {}
         self._orientation_helper_syncing = False
+        self.grid_crs_warning_label = None
+
+    def _refresh_grid_crs_warning_label(self):
+        label = getattr(self, "grid_crs_warning_label", None)
+        if label is None:
+            return
+        try:
+            project_crs = QgsProject.instance().crs()
+        except Exception:
+            project_crs = None
+        if project_crs is None or (not project_crs.isGeographic()):
+            label.setText("")
+            label.setVisible(False)
+            return
+        label.setText(
+            f"Warning: project CRS {project_crs.authid()} is geographic. "
+            "Grid distances are interpreted in degrees."
+        )
+        label.setVisible(True)
 
     def _orientation_main_fields_map(self):
         dlg = getattr(self, "dlg", None)
@@ -427,6 +459,7 @@ class GridWorkflowMixin:
         if self.internal_grid_checkbox is not None:
             self.grid_internal_enabled = bool(self.internal_grid_checkbox.isChecked())
         self._apply_grid_snapping_config()
+        self._refresh_grid_crs_warning_label()
 
     def _on_internal_grid_toggled(self, checked):
         enabled = bool(checked)
@@ -732,6 +765,7 @@ class GridWorkflowMixin:
             QMessageBox.critical(self.dlg, "Export Error", f"Unable to export GeoPackage: {e}")
 
     def _confirm_planar_units_for_grid(self):
+        self._refresh_grid_crs_warning_label()
         project_crs = QgsProject.instance().crs()
         if not project_crs.isGeographic():
             return True
