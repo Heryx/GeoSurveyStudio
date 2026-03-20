@@ -9,6 +9,25 @@ from __future__ import annotations
 
 import numpy as np
 
+try:
+    from qgis.core import Qgis, QgsMessageLog
+except Exception:  # pragma: no cover - QGIS runtime not available in headless tests
+    Qgis = None
+    QgsMessageLog = None
+
+
+def _log_gpr(message: str, level=None) -> None:
+    """Log to QGIS panel when available, fallback to stdout otherwise."""
+    msg = str(message)
+    if QgsMessageLog is not None and Qgis is not None:
+        try:
+            lvl = Qgis.Info if level is None else level
+            QgsMessageLog.logMessage(msg, "RasterLinker", lvl)
+            return
+        except Exception:
+            pass
+    print(msg)
+
 
 # ---------------------------------------------------------------------------
 # Primitivi FFT (senza scipy)
@@ -68,20 +87,29 @@ def _bandpass_fft(
             mask_inside[taper] = 0.5 * (1.0 - np.cos(np.pi * x))
             mask[inside] = mask_inside
     if float(np.sum(mask)) < 1.0:
-        print(
+        _log_gpr(
             f"[GPR] bandpass: banda [{low_mhz:.3f},{high_mhz:.3f}] MHz vuota "
             f"(dt_ns={dt_ns:.6g})."
         )
         return np.array(data, dtype=np.float32, copy=True)
 
     out = np.empty_like(data, dtype=np.float32)
-    for i in range(data.shape[1]):
-        tr = data[:, i].astype(np.float64, copy=False)
-        tr = tr - float(np.mean(tr))
-        tr_pad = np.pad(tr, (pad, pad), mode="reflect")
-        Xf = np.fft.rfft(tr_pad)
-        y_pad = np.fft.irfft(Xf * mask, n=tr_pad.size)
-        out[:, i] = y_pad[pad:pad + N].astype(np.float32)
+    n_traces = int(data.shape[1])
+    n_freq = int(mask.shape[0])
+    # Keep memory bounded on very large profile sets.
+    target_bytes = 64 * 1024 * 1024
+    bytes_per_trace = max(1, 16 * (Np + n_freq))
+    cols_per_block = max(1, int(target_bytes // bytes_per_trace))
+    cols_per_block = min(cols_per_block, max(1, n_traces))
+    for start in range(0, n_traces, cols_per_block):
+        stop = min(n_traces, start + cols_per_block)
+        # Work on (n_traces_block, n_samples) contiguous chunks for faster FFT.
+        block = np.ascontiguousarray(data[:, start:stop].T, dtype=np.float64)
+        block = block - np.mean(block, axis=1, keepdims=True)
+        block_pad = np.pad(block, ((0, 0), (pad, pad)), mode="reflect")
+        Xf = np.fft.rfft(block_pad, axis=1)
+        y_pad = np.fft.irfft(Xf * mask.reshape(1, -1), n=block_pad.shape[1], axis=1)
+        out[:, start:stop] = y_pad[:, pad:pad + N].T.astype(np.float32, copy=False)
     return out
 
 
@@ -121,36 +149,37 @@ def _detect_t0_single(
     backup_nsamp: int,
     search_end: int,
 ) -> int:
-    tr  = np.asarray(trace, dtype=np.float64)
+    tr = np.asarray(trace, dtype=np.float64)
     win = tr[:search_end]
-    pk  = float(np.max(np.abs(win)))
+    abs_win = np.abs(win)
+    pk = float(np.max(abs_win))
     if pk < 1e-12:
         return 0
-    thr_abs    = threshold * pk
-    breach_idx = 0
-    for s in range(search_end):
-        if abs(tr[s]) >= thr_abs:
-            breach_idx = s
-            break
+    thr_abs = threshold * pk
+    breaches = np.flatnonzero(abs_win >= thr_abs)
+    breach_idx = int(breaches[0]) if breaches.size > 0 else 0
     if method == "threshold":
         t0 = breach_idx
     elif method == "peak":
         t0 = breach_idx
-        for s in range(breach_idx + 1, search_end - 1):
-            if abs(tr[s]) > abs(tr[s - 1]) and abs(tr[s]) > abs(tr[s + 1]):
-                t0 = s
-                break
+        seg = np.abs(tr[breach_idx:search_end])
+        if seg.size >= 3:
+            peaks = np.where((seg[1:-1] > seg[:-2]) & (seg[1:-1] > seg[2:]))[0]
+            if peaks.size > 0:
+                t0 = breach_idx + int(peaks[0]) + 1
     elif method == "zero_crossing":
         peak_idx = breach_idx
-        for s in range(breach_idx + 1, search_end - 1):
-            if abs(tr[s]) > abs(tr[s - 1]) and abs(tr[s]) > abs(tr[s + 1]):
-                peak_idx = s
-                break
+        seg = np.abs(tr[breach_idx:search_end])
+        if seg.size >= 3:
+            peaks = np.where((seg[1:-1] > seg[:-2]) & (seg[1:-1] > seg[2:]))[0]
+            if peaks.size > 0:
+                peak_idx = breach_idx + int(peaks[0]) + 1
         t0 = peak_idx
-        for s in range(peak_idx + 1, search_end - 1):
-            if tr[s] * tr[s + 1] <= 0.0:
-                t0 = s
-                break
+        seg_cross = tr[peak_idx:search_end]
+        if seg_cross.size >= 2:
+            crossings = np.where(seg_cross[:-1] * seg_cross[1:] <= 0.0)[0]
+            if crossings.size > 0:
+                t0 = peak_idx + int(crossings[0])
     else:
         t0 = breach_idx
     return max(0, t0 - backup_nsamp)
@@ -173,10 +202,26 @@ def time_zero_correction(
             data[:, i], method, threshold, backup_nsamp, search_end
         )
     if mode == "line_by_line":
-        t0_median     = int(np.median(t0_indices))
+        t0_median = int(np.median(t0_indices))
         t0_indices[:] = t0_median
+    if mode == "individual":
+        _log_gpr(
+            f"[GPR] time_zero: method={method} mode={mode}  "
+            f"t0_min={t0_indices.min()}  t0_max={t0_indices.max()}  "
+            f"n_samples_out={n_s}"
+        )
+        out = np.zeros((n_s, n_t), dtype=np.float32)
+        for i in range(n_t):
+            t0_i = int(t0_indices[i])
+            if t0_i <= 0:
+                out[:, i] = data[:, i]
+                continue
+            src = data[t0_i:, i]
+            if src.size > 0:
+                out[:src.size, i] = src
+        return out
     t0_max = int(t0_indices.max())
-    print(
+    _log_gpr(
         f"[GPR] time_zero: method={method} mode={mode}  "
         f"t0_min={t0_indices.min()}  t0_max={t0_max}  "
         f"n_samples_out={n_s - t0_max}"
@@ -255,7 +300,7 @@ def background_removal(
     if win_eff > n_t and n_t > 0:
         # Prevent oversized windows from silently behaving inconsistently.
         win_eff = int(n_t)
-        print(
+        _log_gpr(
             f"[GPR] bg_removal: win clampato a n_traces={n_t} "
             f"(richiesto={win_req})."
         )
@@ -266,25 +311,25 @@ def background_removal(
     s_lo    = max(0, int(sample_start))
     s_hi    = min(n_s, int(sample_end)) if sample_end > 0 else n_s
     if sample_end > 0 and s_hi <= s_lo:
-        print(
+        _log_gpr(
             f"[GPR] bg_removal: range campioni non valido "
             f"[{s_lo}:{s_hi}], imposto A=0 (fino alla fine)."
         )
         s_hi = n_s
-    print(
+    _log_gpr(
         f"[GPR] bg_diag: mode={mode} win={win_eff if win_eff > 0 else 'auto'}  "
         f"samples=[{s_lo}:{s_hi}/{n_s}]  "
         f"mean_inter-trace_std={row_std.mean():.6g}  "
         f"rows_zero_std={n_zero}/{n_s}"
     )
     if (s_hi - s_lo) < 64:
-        print(
+        _log_gpr(
             f"[GPR] bg_removal: ATTENZIONE finestra campioni corta "
             f"({s_hi - s_lo} campioni). Potresti vedere bande residue."
         )
 
     if s_lo >= s_hi:
-        print("[GPR] bg_removal: finestra campioni vuota, nessuna modifica.")
+        _log_gpr("[GPR] bg_removal: finestra campioni vuota, nessuna modifica.")
         return d64.astype(np.float32)
 
     # Sub-matrice su cui operare
@@ -302,13 +347,13 @@ def background_removal(
             # Adatta ref alla finestra campioni
             ref_sub = ref[s_lo:min(s_hi, ref.shape[0])]
             if ref_sub.shape[0] != sub.shape[0]:
-                print(
+                _log_gpr(
                     f"[GPR] bg_removal grid_by_grid: ref len {ref_sub.shape[0]} "
                     f"!= window {sub.shape[0]}; fallback a line_by_line auto."
                 )
                 ref_sub = sub.mean(axis=1)
         else:
-            print("[GPR] bg_removal: grid_by_grid senza reference_trace; fallback a line_by_line auto.")
+            _log_gpr("[GPR] bg_removal: grid_by_grid senza reference_trace; fallback a line_by_line auto.")
             ref_sub = sub.mean(axis=1)
         out = d64.copy()
         corr = sub - ref_sub.reshape(-1, 1)
@@ -322,7 +367,7 @@ def background_removal(
     # ---------------------------------------------------------------
     if win_eff <= 0 or win_eff >= n_t:
         mean_trace = sub.mean(axis=1, keepdims=True)
-        print(f"[GPR] bg_removal: global mean subtracted  n_t={n_t}  s=[{s_lo}:{s_hi}]")
+        _log_gpr(f"[GPR] bg_removal: global mean subtracted  n_t={n_t}  s=[{s_lo}:{s_hi}]")
         out = d64.copy()
         corr = sub - mean_trace
         block = out[s_lo:s_hi, :]
@@ -345,7 +390,7 @@ def background_removal(
     sum_lo[:, lo_t == 0] = 0.0
     win_len    = (hi_t - lo_t + 1).reshape(1, -1)
     local_mean = (sum_hi - sum_lo) / win_len
-    print(
+    _log_gpr(
         f"[GPR] bg_removal: sliding win={win_eff}  s=[{s_lo}:{s_hi}]  "
         f"eff_win=[{(hi_t-lo_t+1).min()},{(hi_t-lo_t+1).max()}]"
     )
@@ -410,11 +455,30 @@ def bandpass_filter(
 
 
 def hilbert_envelope(data: np.ndarray) -> np.ndarray:
-    out = np.empty_like(data, dtype=np.float32)
-    for i in range(data.shape[1]):
-        out[:, i] = np.abs(
-            _hilbert_numpy(data[:, i].astype(np.float64))
-        ).astype(np.float32)
+    arr = np.asarray(data, dtype=np.float64)
+    n_s, n_t = arr.shape
+    if n_s <= 1 or n_t <= 0:
+        return np.abs(arr).astype(np.float32, copy=True)
+    out = np.empty((n_s, n_t), dtype=np.float32)
+    n_freq = int(n_s // 2 + 1)
+    w = np.zeros(n_freq, dtype=np.complex128)
+    if n_s % 2 == 0:
+        if n_freq > 2:
+            w[1:-1] = -1j
+    else:
+        if n_freq > 1:
+            w[1:] = -1j
+    target_bytes = 64 * 1024 * 1024
+    bytes_per_trace = max(1, 16 * (n_s + n_freq))
+    cols_per_block = max(1, int(target_bytes // bytes_per_trace))
+    cols_per_block = min(cols_per_block, max(1, n_t))
+    for start in range(0, n_t, cols_per_block):
+        stop = min(n_t, start + cols_per_block)
+        block = np.ascontiguousarray(arr[:, start:stop].T, dtype=np.float64)
+        R = np.fft.rfft(block, axis=1)
+        hilb = np.fft.irfft(R * w.reshape(1, -1), n=n_s, axis=1)
+        env = np.sqrt(np.maximum(block * block + hilb * hilb, 0.0))
+        out[:, start:stop] = env.T.astype(np.float32, copy=False)
     return out
 
 
@@ -432,10 +496,11 @@ def normalize_display(data: np.ndarray) -> np.ndarray:
         else:
             mn = 0.0
             mx = 0.0
-        print(
+        _log_gpr(
             "[GPR] ATTENZIONE: dati nulli dopo processing. "
             f"Shape={arr.shape}  dtype={arr.dtype}  "
-            f"min={mn:.4g}  max={mx:.4g}"
+            f"min={mn:.4g}  max={mx:.4g}",
+            level=(Qgis.Warning if Qgis is not None else None),
         )
         return np.zeros_like(arr)
     return np.clip(arr / vmax, -1.0, 1.0).astype(np.float32)
@@ -650,8 +715,10 @@ def apply_pipeline(
         mn = float(arr.min())
         mx = float(arr.max())
         nz = int(np.count_nonzero(arr))
-        print(f"[GPR] {tag:40s}  min={mn:.4g}  max={mx:.4g}  "
-              f"nonzero={nz}/{arr.size}  shape={arr.shape}")
+        _log_gpr(
+            f"[GPR] {tag:40s}  min={mn:.4g}  max={mx:.4g}  "
+            f"nonzero={nz}/{arr.size}  shape={arr.shape}"
+        )
 
     _log("raw", out)
 

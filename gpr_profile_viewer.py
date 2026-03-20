@@ -1366,7 +1366,7 @@ class GprProfileViewer(QMainWindow):
         self._cb_tz_method.setCurrentText("peak")
         self._cb_tz_method.setEnabled(False)
         self._cb_tz_mode = QComboBox()
-        self._cb_tz_mode.addItems(["line_by_line", "scan_by_scan"])
+        self._cb_tz_mode.addItems(["line_by_line", "scan_by_scan", "individual"])
         self._cb_tz_mode.setCurrentText("line_by_line")
         self._cb_tz_mode.setEnabled(False)
         self._spin_tz_threshold = QDoubleSpinBox()

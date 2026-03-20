@@ -12,7 +12,6 @@ from qgis.core import (
     QgsField,
     QgsGeometry,
     QgsPointXY,
-    QgsProject,
     QgsVectorLayer,
 )
 
@@ -93,12 +92,13 @@ def create_oriented_grid(
         )
 
     def build_offsets(total_length, step):
+        eps = 1e-9
         offsets = []
         value = 0.0
-        while value < total_length:
+        while value <= (total_length - eps):
             offsets.append(value)
             value += step
-        if not offsets or abs(offsets[-1] - total_length) > 1e-9:
+        if not offsets or abs(offsets[-1] - total_length) > eps:
             offsets.append(total_length)
         return offsets
 
@@ -127,5 +127,4 @@ def create_oriented_grid(
 
     pr.addFeatures(features)
     grid_layer.updateExtents()
-    QgsProject.instance().addMapLayer(grid_layer)
     return grid_layer

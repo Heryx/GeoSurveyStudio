@@ -1,3 +1,5 @@
+import math
+
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
     QFileDialog,
@@ -31,6 +33,14 @@ from .layer_property_utils import get_layer_property, set_layer_property
 
 
 class GridWorkflowMixin:
+    @staticmethod
+    def _parse_float_text(value):
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("Empty numeric value")
+        # Support both dot and european comma decimal separators.
+        return float(text.replace(",", "."))
+
     def _init_grid_state(self):
         """Initialise grid workflow state. Called by the plugin constructor."""
         self.grid_use_snap = True
@@ -320,8 +330,8 @@ class GridWorkflowMixin:
 
             if internal_enabled:
                 # Read spacing values from UI only when internal grid is enabled.
-                distance_x = float(self.dlg.lineEditDistanceX.text().strip())
-                distance_y = float(self.dlg.lineEditDistanceY.text().strip())
+                distance_x = self._parse_float_text(self.dlg.lineEditDistanceX.text())
+                distance_y = self._parse_float_text(self.dlg.lineEditDistanceY.text())
                 # Create grid
                 grid_layer = create_grid_from_polygon(
                     polygon_layer,
@@ -492,7 +502,7 @@ class GridWorkflowMixin:
         if angle_rad is None:
             self.base_angle_label.setText("Base: --")
         else:
-            angle_deg = (angle_rad * 180.0 / 3.141592653589793) % 360.0
+            angle_deg = (angle_rad * 180.0 / math.pi) % 360.0
             self.base_angle_label.setText(f"Base: {angle_deg:.1f}deg")
 
         if self.length_label is not None:
@@ -765,10 +775,10 @@ class GridWorkflowMixin:
 
     def _get_grid_dimensions_from_fields(self):
         try:
-            x0_val = float(self.dlg.lineEditX0Y0.text().strip())
-            x1_val = float(self.dlg.lineEditX1Y0.text().strip())
-            y0_val = float(self.dlg.lineEditY0.text().strip())
-            y1_val = float(self.dlg.lineEditX0Y1.text().strip())
+            x0_val = self._parse_float_text(self.dlg.lineEditX0Y0.text())
+            x1_val = self._parse_float_text(self.dlg.lineEditX1Y0.text())
+            y0_val = self._parse_float_text(self.dlg.lineEditY0.text())
+            y1_val = self._parse_float_text(self.dlg.lineEditX0Y1.text())
         except Exception:
             return None
         size_x = abs(x1_val - x0_val)
@@ -791,8 +801,8 @@ class GridWorkflowMixin:
 
             internal_enabled = bool(self.internal_grid_checkbox.isChecked()) if self.internal_grid_checkbox is not None else True
             if internal_enabled:
-                cell_x = float(self.dlg.lineEditDistanceX.text().strip())
-                cell_y = float(self.dlg.lineEditDistanceY.text().strip())
+                cell_x = self._parse_float_text(self.dlg.lineEditDistanceX.text())
+                cell_y = self._parse_float_text(self.dlg.lineEditDistanceY.text())
                 if cell_x <= 0 or cell_y <= 0:
                     QMessageBox.warning(self.dlg, "Invalid Cell Size", "Cell X and Cell Y must be positive.")
                     return
