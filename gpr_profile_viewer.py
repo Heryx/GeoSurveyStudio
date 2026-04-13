@@ -1184,6 +1184,7 @@ class GprProfileViewer(QMainWindow):
             "pre_agc_gain": "Range gain applicato prima dell'AGC.",
             "agc": "Equalizza dinamicamente l'ampiezza con finestra locale.",
             "envelope": "Converte il segnale in inviluppo Hilbert (solo ampiezza).",
+            "manual_gain": "Gain lineare/esponenziale manuale (come GPR-Slice). Applicato dopo AGC.",
         }
         return txt.get(str(step_id), "")
 
@@ -1236,6 +1237,14 @@ class GprProfileViewer(QMainWindow):
             fl.addRow("Breakpoints:", self._btn_range_gain_curve)
             return host
 
+        if sid == "manual_gain":
+            fl.addRow("Tipo:", self._cb_manual_gain_type)
+            fl.addRow("Gain superficie:", self._spin_manual_gain_start)
+            fl.addRow("Gain profondita':", self._spin_manual_gain_end)
+            fl.addRow("Da campione:", self._spin_manual_gain_sample_start)
+            fl.addRow("A campione (0=fine):", self._spin_manual_gain_sample_end)
+            return host
+
         lbl = QLabel("Nessun comando disponibile.")
         lbl.setWordWrap(True)
         fl.addRow(lbl)
@@ -1282,6 +1291,7 @@ class GprProfileViewer(QMainWindow):
             "agc": bool(getattr(self, "_chk_agc", None) and self._chk_agc.isChecked()),
             "bandpass": bool(getattr(self, "_chk_bp", None) and self._chk_bp.isChecked()),
             "envelope": bool(getattr(self, "_chk_envelope", None) and self._chk_envelope.isChecked()),
+            "manual_gain": bool(getattr(self, "_chk_manual_gain", None) and self._chk_manual_gain.isChecked()),
         }
 
     def _current_chain_order(self) -> list[str]:
@@ -1338,6 +1348,8 @@ class GprProfileViewer(QMainWindow):
             pre_agc_enabled = bool(enabled.get("pre_agc_gain", False))
             if self._is_qt_alive(getattr(self, "_chk_range_gain", None)):
                 self._chk_range_gain.setChecked(pre_agc_enabled)
+            if self._is_qt_alive(getattr(self, "_chk_manual_gain", None)):
+                self._chk_manual_gain.setChecked(bool(enabled.get("manual_gain", self._chk_manual_gain.isChecked())))
         finally:
             self._syncing_filter_chain = False
 
@@ -1483,6 +1495,71 @@ class GprProfileViewer(QMainWindow):
             "Converte il segnale in inviluppo Hilbert all'interno della pipeline."
         )
 
+        # Manual gain (Linear / Exponential — come GPR-Slice)
+        self._chk_manual_gain = QCheckBox()
+        self._chk_manual_gain.setChecked(False)
+        self._chk_manual_gain.setToolTip(
+            "Gain manuale dipendente dalla profondita' (lineare o esponenziale).\n"
+            "Equivalente al 'Linear/Exponential Gain' di GPR-Slice.\n"
+            "Applicato dopo AGC (se attivo), prima della normalizzazione display."
+        )
+        self._cb_manual_gain_type = QComboBox()
+        self._cb_manual_gain_type.addItem("Lineare", "linear")
+        self._cb_manual_gain_type.addItem("Esponenziale", "exponential")
+        self._cb_manual_gain_type.setEnabled(False)
+        self._cb_manual_gain_type.setToolTip(
+            "Tipo di curva di gain:\n"
+            "  Lineare:      g(t) aumenta linearmente da gain_start a gain_end\n"
+            "  Esponenziale: g(t) = gain_start * exp(log(gain_end/gain_start)*t)"
+        )
+        self._spin_manual_gain_start = QDoubleSpinBox()
+        self._spin_manual_gain_start.setRange(0.0, 1000.0)
+        self._spin_manual_gain_start.setSingleStep(0.5)
+        self._spin_manual_gain_start.setValue(1.0)
+        self._spin_manual_gain_start.setEnabled(False)
+        self._spin_manual_gain_start.setToolTip("Amplificazione al campione 0 (superficie).")
+        self._spin_manual_gain_end = QDoubleSpinBox()
+        self._spin_manual_gain_end.setRange(0.0, 1000.0)
+        self._spin_manual_gain_end.setSingleStep(1.0)
+        self._spin_manual_gain_end.setValue(20.0)
+        self._spin_manual_gain_end.setEnabled(False)
+        self._spin_manual_gain_end.setToolTip("Amplificazione all'ultimo campione (profondita' max).")
+        self._spin_manual_gain_sample_start = QSpinBox()
+        self._spin_manual_gain_sample_start.setRange(0, 9999)
+        self._spin_manual_gain_sample_start.setValue(0)
+        self._spin_manual_gain_sample_start.setEnabled(False)
+        self._spin_manual_gain_sample_start.setToolTip("Primo campione su cui applicare il gain (0 = dall'inizio).")
+        self._spin_manual_gain_sample_end = QSpinBox()
+        self._spin_manual_gain_sample_end.setRange(0, 9999)
+        self._spin_manual_gain_sample_end.setValue(0)
+        self._spin_manual_gain_sample_end.setEnabled(False)
+        self._spin_manual_gain_sample_end.setToolTip("Ultimo campione escluso (0 = fino alla fine).")
+
+        def _toggle_manual_gain(checked):
+            self._cb_manual_gain_type.setEnabled(checked)
+            self._spin_manual_gain_start.setEnabled(checked)
+            self._spin_manual_gain_end.setEnabled(checked)
+            self._spin_manual_gain_sample_start.setEnabled(checked)
+            self._spin_manual_gain_sample_end.setEnabled(checked)
+            self._apply_processing()
+
+        self._chk_manual_gain.toggled.connect(_toggle_manual_gain)
+        self._cb_manual_gain_type.currentIndexChanged.connect(
+            lambda _i: self._apply_processing() if self._chk_manual_gain.isChecked() else None
+        )
+        self._spin_manual_gain_start.valueChanged.connect(
+            lambda _v: self._apply_processing() if self._chk_manual_gain.isChecked() else None
+        )
+        self._spin_manual_gain_end.valueChanged.connect(
+            lambda _v: self._apply_processing() if self._chk_manual_gain.isChecked() else None
+        )
+        self._spin_manual_gain_sample_start.valueChanged.connect(
+            lambda _v: self._apply_processing() if self._chk_manual_gain.isChecked() else None
+        )
+        self._spin_manual_gain_sample_end.valueChanged.connect(
+            lambda _v: self._apply_processing() if self._chk_manual_gain.isChecked() else None
+        )
+
         # Display
         self._spin_gain = QDoubleSpinBox()
         self._spin_gain.setRange(0.1, 20.0); self._spin_gain.setSingleStep(0.5)
@@ -1552,6 +1629,7 @@ class GprProfileViewer(QMainWindow):
             self._chk_bp,
             self._chk_envelope,
             self._chk_range_gain,
+            self._chk_manual_gain,
         ):
             try:
                 _chk.toggled.connect(self._on_filter_chain_source_toggled)
@@ -2601,6 +2679,22 @@ class GprProfileViewer(QMainWindow):
             "envelope": bool(getattr(self, "_chk_envelope", None) and self._chk_envelope.isChecked()),
             "bp_low_mhz": float(bp_lo),
             "bp_high_mhz": float(bp_hi),
+            "manual_gain": bool(getattr(self, "_chk_manual_gain", None) and self._chk_manual_gain.isChecked()),
+            "manual_gain_type": str(
+                self._cb_manual_gain_type.currentData() or "linear"
+            ) if getattr(self, "_cb_manual_gain_type", None) else "linear",
+            "manual_gain_start": float(
+                self._spin_manual_gain_start.value()
+            ) if getattr(self, "_spin_manual_gain_start", None) else 1.0,
+            "manual_gain_end": float(
+                self._spin_manual_gain_end.value()
+            ) if getattr(self, "_spin_manual_gain_end", None) else 20.0,
+            "manual_gain_sample_start": int(
+                self._spin_manual_gain_sample_start.value()
+            ) if getattr(self, "_spin_manual_gain_sample_start", None) else 0,
+            "manual_gain_sample_end": int(
+                self._spin_manual_gain_sample_end.value()
+            ) if getattr(self, "_spin_manual_gain_sample_end", None) else 0,
             "chain_order": self._current_chain_order(),
         }
 
@@ -3047,6 +3141,14 @@ class GprProfileViewer(QMainWindow):
                 "gain_max": float(self._spin_gain_deep.value()),
                 "breakpoints": [[float(x), float(y)] for x, y in points.tolist()],
             },
+            "manual_gain": {
+                "enabled": bool(getattr(self, "_chk_manual_gain", None) and self._chk_manual_gain.isChecked()),
+                "gain_type": str(self._cb_manual_gain_type.currentData() or "linear") if getattr(self, "_cb_manual_gain_type", None) else "linear",
+                "gain_start": float(self._spin_manual_gain_start.value()) if getattr(self, "_spin_manual_gain_start", None) else 1.0,
+                "gain_end": float(self._spin_manual_gain_end.value()) if getattr(self, "_spin_manual_gain_end", None) else 20.0,
+                "sample_start": int(self._spin_manual_gain_sample_start.value()) if getattr(self, "_spin_manual_gain_sample_start", None) else 0,
+                "sample_end": int(self._spin_manual_gain_sample_end.value()) if getattr(self, "_spin_manual_gain_sample_end", None) else 0,
+            },
             "hyperbola": {
                 "enabled": bool(self._chk_hyperbola.isChecked()),
                 "rdp": float(self._spin_hyperbola_rdp.value()),
@@ -3100,6 +3202,24 @@ class GprProfileViewer(QMainWindow):
 
         self._chk_range_gain.setChecked(bool(rg.get("enabled", self._chk_range_gain.isChecked())))
         self._btn_range_gain_curve.setEnabled(bool(self._chk_range_gain.isChecked()))
+
+        # Manual gain.
+        mg = payload.get("manual_gain", {}) if isinstance(payload.get("manual_gain"), dict) else {}
+        if mg and getattr(self, "_chk_manual_gain", None):
+            if getattr(self, "_spin_manual_gain_start", None):
+                self._spin_manual_gain_start.setValue(float(mg.get("gain_start", self._spin_manual_gain_start.value())))
+            if getattr(self, "_spin_manual_gain_end", None):
+                self._spin_manual_gain_end.setValue(float(mg.get("gain_end", self._spin_manual_gain_end.value())))
+            if getattr(self, "_spin_manual_gain_sample_start", None):
+                self._spin_manual_gain_sample_start.setValue(int(mg.get("sample_start", self._spin_manual_gain_sample_start.value())))
+            if getattr(self, "_spin_manual_gain_sample_end", None):
+                self._spin_manual_gain_sample_end.setValue(int(mg.get("sample_end", self._spin_manual_gain_sample_end.value())))
+            if getattr(self, "_cb_manual_gain_type", None):
+                gain_type = str(mg.get("gain_type", "linear"))
+                idx = self._cb_manual_gain_type.findData(gain_type)
+                if idx >= 0:
+                    self._cb_manual_gain_type.setCurrentIndex(idx)
+            self._chk_manual_gain.setChecked(bool(mg.get("enabled", self._chk_manual_gain.isChecked())))
 
         # Hyperbola.
         self._spin_hyperbola_rdp.setValue(float(hy.get("rdp", self._spin_hyperbola_rdp.value())))

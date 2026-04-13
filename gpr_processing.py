@@ -339,9 +339,12 @@ def background_removal(
 
     # Sub-matrice su cui operare
     sub = d64[s_lo:s_hi, :]   # (n_win, n_t)
-    # Keep perfectly flat rows untouched (e.g., pure zero rows after truncation).
-    row_std_sub = np.std(sub, axis=1)
-    valid_rows = row_std_sub > 1e-12
+    # Exclude only rows that are ALL identically zero (padding artefacts after
+    # time-zero truncation). Rows with low but non-zero std (ground coupling,
+    # direct wave) must still be processed — their constant horizontal component
+    # IS the background that needs to be subtracted.
+    row_abs_max = np.max(np.abs(sub), axis=1)
+    valid_rows = row_abs_max > 0.0
 
     # ---------------------------------------------------------------
     # grid_by_grid
@@ -494,6 +497,64 @@ def hilbert_envelope(data: np.ndarray) -> np.ndarray:
     return out
 
 
+def manual_gain(
+    data: np.ndarray,
+    gain_type: str = "linear",
+    gain_start: float = 1.0,
+    gain_end: float = 1.0,
+    sample_start: int = 0,
+    sample_end: int = 0,
+) -> np.ndarray:
+    """Applica un gain manuale dipendente dalla profondità (depth-varying gain).
+
+    Equivalente al 'Linear Gain' / 'Exponential Gain' di GPR-Slice:
+    moltiplica ogni campione per una curva di amplificazione che cresce
+    dalla superficie (gain_start) alla massima profondità (gain_end).
+
+    Parametri
+    ----------
+    data         : (n_samples, n_traces) float32
+    gain_type    : 'linear' | 'exponential'
+                     linear      : g(t) interpolato linearmente tra gain_start e gain_end
+                     exponential : g(t) = gain_start * exp(log(gain_end/gain_start) * t)
+                                   se gain_start > 0, altrimenti fallback a lineare
+    gain_start   : amplificazione al campione 0 (superficie)
+    gain_end     : amplificazione al campione n_samples-1 (profondità max)
+    sample_start : primo campione su cui applicare il gain (0 = dall'inizio)
+    sample_end   : ultimo campione escluso (0 = fino alla fine)
+    """
+    arr = np.asarray(data, dtype=np.float32)
+    n_s, n_t = arr.shape
+    if n_s <= 0 or n_t <= 0:
+        return arr.copy()
+
+    g0 = max(float(gain_start), 0.0)
+    g1 = max(float(gain_end), 0.0)
+    s_lo = max(0, int(sample_start))
+    s_hi = min(n_s, int(sample_end)) if sample_end > 0 else n_s
+    if s_lo >= s_hi:
+        return arr.copy()
+
+    n_win = s_hi - s_lo
+    t = np.linspace(0.0, 1.0, n_win, dtype=np.float64)
+
+    if gain_type == "exponential" and g0 > 1e-12 and g1 > 1e-12:
+        alpha = np.log(g1 / g0)
+        g = g0 * np.exp(alpha * t)
+    else:
+        g = g0 + (g1 - g0) * t
+
+    g = np.clip(g, 0.0, 1e6).astype(np.float32)
+
+    out = arr.copy()
+    out[s_lo:s_hi, :] = (arr[s_lo:s_hi, :] * g.reshape(-1, 1)).astype(np.float32)
+    _log_gpr(
+        f"[GPR] manual_gain: type={gain_type}  g0={g0:.3g}  g1={g1:.3g}  "
+        f"s=[{s_lo}:{s_hi}]  shape={arr.shape}"
+    )
+    return out
+
+
 def normalize_display(data: np.ndarray) -> np.ndarray:
     arr = np.asarray(data, dtype=np.float32)
     finite = np.isfinite(arr)
@@ -559,6 +620,15 @@ DEFAULT_PIPELINE = {
     "bp_low_mhz":       100.0,
     "bp_high_mhz":      1200.0,
     "envelope":         False,
+    # Manual depth-varying gain (Linear / Exponential).
+    # Applied after AGC (if active) and before normalize_display.
+    # Equivalent to GPR-Slice "Linear Gain" / "Exponential Gain".
+    "manual_gain":          False,
+    "manual_gain_type":     "linear",   # 'linear' | 'exponential'
+    "manual_gain_start":    1.0,        # amplificazione al campione 0 (superficie)
+    "manual_gain_end":      10.0,       # amplificazione all'ultima profondità
+    "manual_gain_sample_start": 0,      # 0 = dall'inizio
+    "manual_gain_sample_end":   0,      # 0 = fino alla fine
     "chain_order":      None,
 }
 
@@ -592,6 +662,10 @@ FILTER_REGISTRY = {
         "label": "Inviluppo (Hilbert)",
         "param_key": "envelope",
     },
+    "manual_gain": {
+        "label": "Gain manuale (lineare/esponenziale)",
+        "param_key": "manual_gain",
+    },
 }
 
 DEFAULT_CHAIN_ORDER = [
@@ -602,6 +676,7 @@ DEFAULT_CHAIN_ORDER = [
     "pre_agc_gain",
     "agc",
     "envelope",
+    "manual_gain",
 ]
 
 
@@ -812,6 +887,23 @@ def apply_pipeline(
             if bool(p.get("envelope", False)):
                 out = hilbert_envelope(out)
                 _log("envelope(hilbert)", out)
+            continue
+
+        if step == "manual_gain":
+            if bool(p.get("manual_gain", False)):
+                out = manual_gain(
+                    out,
+                    gain_type=str(p.get("manual_gain_type", "linear")),
+                    gain_start=float(p.get("manual_gain_start", 1.0)),
+                    gain_end=float(p.get("manual_gain_end", 10.0)),
+                    sample_start=int(p.get("manual_gain_sample_start", 0)),
+                    sample_end=int(p.get("manual_gain_sample_end", 0)),
+                )
+                _log(
+                    f"manual_gain(type={p.get('manual_gain_type','linear')} "
+                    f"g0={p.get('manual_gain_start',1.0)} g1={p.get('manual_gain_end',10.0)})",
+                    out,
+                )
             continue
 
     if normalize_output:
