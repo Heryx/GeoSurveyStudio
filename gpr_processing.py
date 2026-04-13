@@ -33,19 +33,6 @@ def _log_gpr(message: str, level=None) -> None:
 # Primitivi FFT (senza scipy)
 # ---------------------------------------------------------------------------
 
-def _hilbert_numpy(x: np.ndarray) -> np.ndarray:
-    N  = len(x)
-    Xf = np.fft.fft(x)
-    h  = np.zeros(N, dtype=np.float64)
-    if N % 2 == 0:
-        h[0] = h[N // 2] = 1.0
-        h[1:N // 2] = 2.0
-    else:
-        h[0] = 1.0
-        h[1:(N + 1) // 2] = 2.0
-    return np.fft.ifft(Xf * h)
-
-
 def _bandpass_fft(
     data: np.ndarray,
     dt_ns: float,
@@ -252,7 +239,7 @@ def background_removal(
     sample_end: int = 0,
 ) -> np.ndarray:
     """
-    Background removal (GPR-SLICE §Background Removal, pag. 166).
+    Background removal: sottrae la traccia orizzontale media (clutter) da ogni campione.
 
     Sottrae una traccia di riferimento (il "clutter" orizzontale costante)
     da ogni traccia del radargram.
@@ -470,29 +457,41 @@ def bandpass_filter(
 
 
 def hilbert_envelope(data: np.ndarray) -> np.ndarray:
+    """Compute Hilbert envelope along the sample axis (axis 0).
+
+    Constructs the analytic signal via full FFT (two-sided spectrum):
+      Xf = fft(x)
+      h[k]: 1 at DC, 2 for positive freqs, 0 for negative freqs, 1 at Nyquist (even N)
+      z = ifft(Xf * h)   →  complex analytic signal
+      env = |z| = sqrt(real² + imag²)
+
+    This matches scipy.signal.hilbert exactly and is computed in blocks
+    to keep peak RAM bounded on large radargrams.
+    """
     arr = np.asarray(data, dtype=np.float64)
     n_s, n_t = arr.shape
     if n_s <= 1 or n_t <= 0:
         return np.abs(arr).astype(np.float32, copy=True)
     out = np.empty((n_s, n_t), dtype=np.float32)
-    n_freq = int(n_s // 2 + 1)
-    w = np.zeros(n_freq, dtype=np.complex128)
+    # Build the two-sided Hilbert multiplier h[k] of length n_s.
+    h = np.zeros(n_s, dtype=np.float64)
     if n_s % 2 == 0:
-        if n_freq > 2:
-            w[1:-1] = -1j
+        h[0] = h[n_s // 2] = 1.0
+        h[1:n_s // 2] = 2.0
     else:
-        if n_freq > 1:
-            w[1:] = -1j
+        h[0] = 1.0
+        h[1:(n_s + 1) // 2] = 2.0
     target_bytes = 64 * 1024 * 1024
-    bytes_per_trace = max(1, 16 * (n_s + n_freq))
+    # Each trace needs ~3 complex arrays of length n_s (fft, multiply, ifft).
+    bytes_per_trace = max(1, 3 * 16 * n_s)
     cols_per_block = max(1, int(target_bytes // bytes_per_trace))
     cols_per_block = min(cols_per_block, max(1, n_t))
     for start in range(0, n_t, cols_per_block):
         stop = min(n_t, start + cols_per_block)
         block = np.ascontiguousarray(arr[:, start:stop].T, dtype=np.float64)
-        R = np.fft.rfft(block, axis=1)
-        hilb = np.fft.irfft(R * w.reshape(1, -1), n=n_s, axis=1)
-        env = np.sqrt(np.maximum(block * block + hilb * hilb, 0.0))
+        Xf = np.fft.fft(block, axis=1)
+        analytic = np.fft.ifft(Xf * h.reshape(1, -1), axis=1)
+        env = np.abs(analytic)
         out[:, start:stop] = env.T.astype(np.float32, copy=False)
     return out
 
@@ -507,9 +506,9 @@ def manual_gain(
 ) -> np.ndarray:
     """Applica un gain manuale dipendente dalla profondità (depth-varying gain).
 
-    Equivalente al 'Linear Gain' / 'Exponential Gain' di GPR-Slice:
-    moltiplica ogni campione per una curva di amplificazione che cresce
-    dalla superficie (gain_start) alla massima profondità (gain_end).
+    Gain manuale dipendente dalla profondità: moltiplica ogni campione
+    per una curva di amplificazione che cresce dalla superficie
+    (gain_start) alla massima profondità (gain_end).
 
     Parametri
     ----------
@@ -620,15 +619,6 @@ DEFAULT_PIPELINE = {
     "bp_low_mhz":       100.0,
     "bp_high_mhz":      1200.0,
     "envelope":         False,
-    # Manual depth-varying gain (Linear / Exponential).
-    # Applied after AGC (if active) and before normalize_display.
-    # Equivalent to GPR-Slice "Linear Gain" / "Exponential Gain".
-    "manual_gain":          False,
-    "manual_gain_type":     "linear",   # 'linear' | 'exponential'
-    "manual_gain_start":    1.0,        # amplificazione al campione 0 (superficie)
-    "manual_gain_end":      10.0,       # amplificazione all'ultima profondità
-    "manual_gain_sample_start": 0,      # 0 = dall'inizio
-    "manual_gain_sample_end":   0,      # 0 = fino alla fine
     "chain_order":      None,
 }
 
@@ -662,10 +652,6 @@ FILTER_REGISTRY = {
         "label": "Inviluppo (Hilbert)",
         "param_key": "envelope",
     },
-    "manual_gain": {
-        "label": "Gain manuale (lineare/esponenziale)",
-        "param_key": "manual_gain",
-    },
 }
 
 DEFAULT_CHAIN_ORDER = [
@@ -676,7 +662,6 @@ DEFAULT_CHAIN_ORDER = [
     "pre_agc_gain",
     "agc",
     "envelope",
-    "manual_gain",
 ]
 
 
@@ -887,23 +872,6 @@ def apply_pipeline(
             if bool(p.get("envelope", False)):
                 out = hilbert_envelope(out)
                 _log("envelope(hilbert)", out)
-            continue
-
-        if step == "manual_gain":
-            if bool(p.get("manual_gain", False)):
-                out = manual_gain(
-                    out,
-                    gain_type=str(p.get("manual_gain_type", "linear")),
-                    gain_start=float(p.get("manual_gain_start", 1.0)),
-                    gain_end=float(p.get("manual_gain_end", 10.0)),
-                    sample_start=int(p.get("manual_gain_sample_start", 0)),
-                    sample_end=int(p.get("manual_gain_sample_end", 0)),
-                )
-                _log(
-                    f"manual_gain(type={p.get('manual_gain_type','linear')} "
-                    f"g0={p.get('manual_gain_start',1.0)} g1={p.get('manual_gain_end',10.0)})",
-                    out,
-                )
             continue
 
     if normalize_output:

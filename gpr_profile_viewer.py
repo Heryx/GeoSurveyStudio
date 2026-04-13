@@ -66,6 +66,7 @@ from .gpr_processing import (
     DEFAULT_CHAIN_ORDER,
     FILTER_REGISTRY,
     normalize_display,
+    manual_gain,
 )
 
 try:
@@ -1184,7 +1185,6 @@ class GprProfileViewer(QMainWindow):
             "pre_agc_gain": "Range gain applicato prima dell'AGC.",
             "agc": "Equalizza dinamicamente l'ampiezza con finestra locale.",
             "envelope": "Converte il segnale in inviluppo Hilbert (solo ampiezza).",
-            "manual_gain": "Gain lineare/esponenziale manuale (come GPR-Slice). Applicato dopo AGC.",
         }
         return txt.get(str(step_id), "")
 
@@ -1402,8 +1402,7 @@ class GprProfileViewer(QMainWindow):
         self._chk_bg = QCheckBox()
         self._chk_bg.setChecked(False)
         self._chk_bg.setToolTip(
-            "Background Removal (GPR-SLICE section Background Removal, pag. 166).\n"
-            "Sottrae la traccia media per eliminare banding orizzontale.\n\n"
+            "Background Removal: sottrae la traccia media per eliminare banding orizzontale.\n\n"
             "ATTENZIONE: rimuove anche riflessi reali paralleli al profilo."
         )
 
@@ -1495,13 +1494,13 @@ class GprProfileViewer(QMainWindow):
             "Converte il segnale in inviluppo Hilbert all'interno della pipeline."
         )
 
-        # Manual gain (Linear / Exponential — come GPR-Slice)
+        # Manual gain (depth-varying, Linear / Exponential)
         self._chk_manual_gain = QCheckBox()
         self._chk_manual_gain.setChecked(False)
         self._chk_manual_gain.setToolTip(
             "Gain manuale dipendente dalla profondita' (lineare o esponenziale).\n"
-            "Equivalente al 'Linear/Exponential Gain' di GPR-Slice.\n"
-            "Applicato dopo AGC (se attivo), prima della normalizzazione display."
+            "Step display: applicato dopo la normalizzazione, prima della visualizzazione.\n"
+            "I campioni profondi vengono saturati a bianco/nero se il gain e' elevato."
         )
         self._cb_manual_gain_type = QComboBox()
         self._cb_manual_gain_type.addItem("Lineare", "linear")
@@ -1541,23 +1540,24 @@ class GprProfileViewer(QMainWindow):
             self._spin_manual_gain_end.setEnabled(checked)
             self._spin_manual_gain_sample_start.setEnabled(checked)
             self._spin_manual_gain_sample_end.setEnabled(checked)
-            self._apply_processing()
+            # manual_gain is a display-only step: no pipeline re-run needed.
+            self._apply_gain_only()
 
         self._chk_manual_gain.toggled.connect(_toggle_manual_gain)
         self._cb_manual_gain_type.currentIndexChanged.connect(
-            lambda _i: self._apply_processing() if self._chk_manual_gain.isChecked() else None
+            lambda _i: self._apply_gain_only() if self._chk_manual_gain.isChecked() else None
         )
         self._spin_manual_gain_start.valueChanged.connect(
-            lambda _v: self._apply_processing() if self._chk_manual_gain.isChecked() else None
+            lambda _v: self._apply_gain_only() if self._chk_manual_gain.isChecked() else None
         )
         self._spin_manual_gain_end.valueChanged.connect(
-            lambda _v: self._apply_processing() if self._chk_manual_gain.isChecked() else None
+            lambda _v: self._apply_gain_only() if self._chk_manual_gain.isChecked() else None
         )
         self._spin_manual_gain_sample_start.valueChanged.connect(
-            lambda _v: self._apply_processing() if self._chk_manual_gain.isChecked() else None
+            lambda _v: self._apply_gain_only() if self._chk_manual_gain.isChecked() else None
         )
         self._spin_manual_gain_sample_end.valueChanged.connect(
-            lambda _v: self._apply_processing() if self._chk_manual_gain.isChecked() else None
+            lambda _v: self._apply_gain_only() if self._chk_manual_gain.isChecked() else None
         )
 
         # Display
@@ -2679,22 +2679,10 @@ class GprProfileViewer(QMainWindow):
             "envelope": bool(getattr(self, "_chk_envelope", None) and self._chk_envelope.isChecked()),
             "bp_low_mhz": float(bp_lo),
             "bp_high_mhz": float(bp_hi),
+            # manual_gain is a display-only step applied in _compose_display_data,
+            # not in the processing pipeline. Keep the key so has_active_filters
+            # can trigger a pipeline re-run when manual_gain is the only active control.
             "manual_gain": bool(getattr(self, "_chk_manual_gain", None) and self._chk_manual_gain.isChecked()),
-            "manual_gain_type": str(
-                self._cb_manual_gain_type.currentData() or "linear"
-            ) if getattr(self, "_cb_manual_gain_type", None) else "linear",
-            "manual_gain_start": float(
-                self._spin_manual_gain_start.value()
-            ) if getattr(self, "_spin_manual_gain_start", None) else 1.0,
-            "manual_gain_end": float(
-                self._spin_manual_gain_end.value()
-            ) if getattr(self, "_spin_manual_gain_end", None) else 20.0,
-            "manual_gain_sample_start": int(
-                self._spin_manual_gain_sample_start.value()
-            ) if getattr(self, "_spin_manual_gain_sample_start", None) else 0,
-            "manual_gain_sample_end": int(
-                self._spin_manual_gain_sample_end.value()
-            ) if getattr(self, "_spin_manual_gain_sample_end", None) else 0,
             "chain_order": self._current_chain_order(),
         }
 
@@ -2726,6 +2714,7 @@ class GprProfileViewer(QMainWindow):
                 "agc",
                 "envelope",
                 "pre_agc_gain",
+                "manual_gain",
             )
         )
         if not has_active_filters:
@@ -3376,10 +3365,49 @@ class GprProfileViewer(QMainWindow):
             if depth_gain is not None:
                 proc_disp = (proc_disp * depth_gain).astype(np.float32, copy=False)
 
-        # Normalize once, then apply only scalar display gain.
+        # Normalize to ±1 range first, then apply display gains on top.
+        # The scalar gain and manual_gain are applied AFTER normalization so that
+        # normalize_display does not cancel them.  Values that exceed ±1 after
+        # the gains are intentionally saturated by the final clip — this is the
+        # correct visual behaviour (deep samples clamp to full black/white).
         base = normalize_display(proc_disp).astype(np.float32, copy=False)
+
+        # Scalar display gain (brightness knob).
         gain = float(self._spin_gain.value()) if hasattr(self, "_spin_gain") else 1.0
         disp = (base * gain).astype(np.float32, copy=False)
+
+        # Manual depth-varying gain — applied last so it is not undone by
+        # normalize_display.  The pipeline no longer runs manual_gain; the
+        # function is called directly here as a display-only transform.
+        chk_mg = getattr(self, "_chk_manual_gain", None)
+        if chk_mg is not None and bool(chk_mg.isChecked()):
+            try:
+                mg_type = str(
+                    self._cb_manual_gain_type.currentData() or "linear"
+                ) if getattr(self, "_cb_manual_gain_type", None) else "linear"
+                mg_start = float(
+                    self._spin_manual_gain_start.value()
+                ) if getattr(self, "_spin_manual_gain_start", None) else 1.0
+                mg_end = float(
+                    self._spin_manual_gain_end.value()
+                ) if getattr(self, "_spin_manual_gain_end", None) else 10.0
+                mg_s0 = int(
+                    self._spin_manual_gain_sample_start.value()
+                ) if getattr(self, "_spin_manual_gain_sample_start", None) else 0
+                mg_s1 = int(
+                    self._spin_manual_gain_sample_end.value()
+                ) if getattr(self, "_spin_manual_gain_sample_end", None) else 0
+                disp = manual_gain(
+                    disp,
+                    gain_type=mg_type,
+                    gain_start=mg_start,
+                    gain_end=mg_end,
+                    sample_start=mg_s0,
+                    sample_end=mg_s1,
+                ).astype(np.float32, copy=False)
+            except Exception:
+                pass
+
         return np.clip(disp, -1.0, 1.0).astype(np.float32, copy=False)
 
     def _apply_gain_only(self):
@@ -3611,8 +3639,9 @@ class GprProfileViewer(QMainWindow):
         if real_aspect and dist_max > 1e-9 and depth_max > 1e-9:
             # VE=1.0 preserves metric scale; VE>1 increases vertical readability.
             aspect_export = float(vertical_exag)
+        disp_export = self._resample_disp_to_uniform_grid(self._disp_data, dist_arr)
         ax.imshow(
-            self._disp_data,
+            disp_export,
             aspect=aspect_export,
             cmap=cmap,
             vmin=vmin,
@@ -3643,6 +3672,41 @@ class GprProfileViewer(QMainWindow):
     # Disegno
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resample_disp_to_uniform_grid(
+        disp: np.ndarray,
+        dist_arr: np.ndarray,
+    ) -> np.ndarray:
+        """Resample disp (n_samples, n_traces) onto a uniform distance grid.
+
+        Each column of *disp* corresponds to a trace at the cumulative distance
+        dist_arr[i].  Because surveys are driven at variable speed the trace
+        spacing is usually non-uniform.  imshow maps every column to an equal-
+        width pixel, so non-uniform spacing produces a geometrically distorted
+        radargram.  This function corrects that by interpolating each sample row
+        onto a regular grid before rendering.
+        """
+        n_s, n_t = disp.shape
+        if n_t < 2 or dist_arr.size < 2:
+            return disp
+        d = np.asarray(dist_arr, dtype=np.float64)
+        if d.size != n_t:
+            return disp
+        d_min = float(d[0])
+        d_max = float(d[-1])
+        if not (np.isfinite(d_min) and np.isfinite(d_max)) or d_max <= d_min:
+            return disp
+        # Check whether the grid is already sufficiently uniform (saves CPU).
+        steps = np.diff(d)
+        step_mean = float(np.mean(steps))
+        if step_mean > 0.0 and float(np.std(steps)) / step_mean < 0.01:
+            return disp  # < 1 % variation — no resampling needed
+        uniform = np.linspace(d_min, d_max, n_t, dtype=np.float64)
+        out = np.empty((n_s, n_t), dtype=np.float32)
+        for i in range(n_s):
+            out[i] = np.interp(uniform, d, disp[i]).astype(np.float32)
+        return out
+
     def _redraw(self):
         if not HAS_MPL or self._disp_data is None:
             return
@@ -3665,6 +3729,10 @@ class GprProfileViewer(QMainWindow):
         if not np.isfinite(depth_max) or depth_max <= 0:
             depth_max = max(1.0, float(n_out))
 
+        # Resample to uniform distance grid so imshow is not geometrically distorted
+        # by variable survey speed (non-uniform trace spacing).
+        disp_uniform = self._resample_disp_to_uniform_grid(self._disp_data, dist_arr)
+
         self._ax.clear()
         # Keep fixed display limits so gain controls affect what the user sees.
         vmin, vmax = -1.0, 1.0
@@ -3683,7 +3751,7 @@ class GprProfileViewer(QMainWindow):
                 ve = 1.0
         ve = float(np.clip(ve, 0.5, 20.0))
         self._im = self._ax.imshow(
-            self._disp_data,
+            disp_uniform,
             # Mantieni il riempimento del pannello; la scala reale e' gestita sotto con set_aspect+datalim.
             aspect="auto",
             cmap=cmap,
