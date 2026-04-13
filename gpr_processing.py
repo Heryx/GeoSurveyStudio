@@ -205,20 +205,25 @@ def time_zero_correction(
         t0_median = int(np.median(t0_indices))
         t0_indices[:] = t0_median
     if mode == "individual":
+        # Come scan_by_scan ma loggato separatamente: ogni traccia è shiftata
+        # al proprio t0, l'output è troncato a n_s - t0_max (no zero-padding).
+        # Lo zero-padding (vecchio comportamento) creava righe inconsistenti in
+        # fondo al radargram che distorcevano bg_removal e la visualizzazione.
+        t0_max_ind = int(t0_indices.max())
         _log_gpr(
             f"[GPR] time_zero: method={method} mode={mode}  "
-            f"t0_min={t0_indices.min()}  t0_max={t0_indices.max()}  "
-            f"n_samples_out={n_s}"
+            f"t0_min={t0_indices.min()}  t0_max={t0_max_ind}  "
+            f"n_samples_out={n_s - t0_max_ind}"
         )
-        out = np.zeros((n_s, n_t), dtype=np.float32)
+        if t0_max_ind <= 0:
+            return data
+        n_out_ind = n_s - t0_max_ind
+        out = np.zeros((n_out_ind, n_t), dtype=np.float32)
         for i in range(n_t):
             t0_i = int(t0_indices[i])
-            if t0_i <= 0:
-                out[:, i] = data[:, i]
-                continue
             src = data[t0_i:, i]
-            if src.size > 0:
-                out[:src.size, i] = src
+            n_copy = min(len(src), n_out_ind)
+            out[:n_copy, i] = src[:n_copy]
         return out
     t0_max = int(t0_indices.max())
     _log_gpr(
@@ -347,11 +352,18 @@ def background_removal(
             # Adatta ref alla finestra campioni
             ref_sub = ref[s_lo:min(s_hi, ref.shape[0])]
             if ref_sub.shape[0] != sub.shape[0]:
+                target_n = int(sub.shape[0])
+                old_n = int(ref_sub.shape[0])
                 _log_gpr(
-                    f"[GPR] bg_removal grid_by_grid: ref len {ref_sub.shape[0]} "
-                    f"!= window {sub.shape[0]}; fallback a line_by_line auto."
+                    f"[GPR] bg_removal grid_by_grid: ref len {old_n} "
+                    f"!= window {target_n}; ridimensiono la traccia di riferimento."
                 )
-                ref_sub = sub.mean(axis=1)
+                if target_n < old_n:
+                    ref_sub = ref_sub[:target_n]
+                else:
+                    ext = np.zeros(target_n, dtype=np.float64)
+                    ext[:old_n] = ref_sub
+                    ref_sub = ext
         else:
             _log_gpr("[GPR] bg_removal: grid_by_grid senza reference_trace; fallback a line_by_line auto.")
             ref_sub = sub.mean(axis=1)
@@ -486,7 +498,7 @@ def normalize_display(data: np.ndarray) -> np.ndarray:
     arr = np.asarray(data, dtype=np.float32)
     finite = np.isfinite(arr)
     if finite.any():
-        vmax = float(np.max(np.abs(arr[finite])))
+        vmax = _normalize_display_vmax(np.abs(arr[finite]))
     else:
         vmax = 0.0
     if vmax < 1e-12:
@@ -504,6 +516,18 @@ def normalize_display(data: np.ndarray) -> np.ndarray:
         )
         return np.zeros_like(arr)
     return np.clip(arr / vmax, -1.0, 1.0).astype(np.float32)
+
+
+def _normalize_display_vmax(arr_abs_finite: np.ndarray) -> float:
+    """Percentile-based vmax: robusto agli spike isolati."""
+    if arr_abs_finite.size == 0:
+        return 0.0
+    p98 = float(np.percentile(arr_abs_finite, 98.0))
+    # Se il 98° percentile è quasi zero (dato piatto), usa il massimo assoluto
+    # come fallback per non perdere segnali molto deboli ma reali.
+    if p98 < 1e-12:
+        return float(np.max(arr_abs_finite))
+    return p98
 
 
 # ---------------------------------------------------------------------------
@@ -769,7 +793,7 @@ def apply_pipeline(
 
         if step == "agc":
             if p["agc"]:
-                out = agc_gain(out, window=int(p["agc_win"]), clip_percentile=None)
+                out = agc_gain(out, window=int(p["agc_win"]), clip_percentile=99.5)
                 _log(f"agc(win={p['agc_win']})", out)
             continue
 

@@ -33,8 +33,10 @@ from qgis.PyQt.QtWidgets import (
     QGroupBox, QFormLayout, QPushButton, QDialogButtonBox, QScrollArea, QDockWidget, QLineEdit,
 )
 from qgis.core import (
+    Qgis,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsMessageLog,
     QgsPointXY,
     QgsProject,
     QgsWkbTypes,
@@ -2663,10 +2665,20 @@ class GprProfileViewer(QMainWindow):
         if finite_ratio < 0.5 or spread < 1e-6:
             try:
                 self._proc_data = np.asarray(self._raw_data, dtype=np.float32)
-                self._safe_set_text(
-                    self._lbl_status,
-                    "Processing inconcludente: visualizzazione fallback su dato grezzo."
+                msg = (
+                    f"Processing inconcludente "
+                    f"(finite={finite_ratio:.0%}, spread={spread:.2e}): "
+                    "visualizzazione fallback su dato grezzo."
                 )
+                self._safe_set_text(self._lbl_status, msg)
+                try:
+                    QgsMessageLog.logMessage(
+                        f"[GPR] _apply_processing fallback: {msg}",
+                        "RasterLinker",
+                        Qgis.Warning,
+                    )
+                except Exception:
+                    print(f"[GPR] _apply_processing fallback: {msg}")
             except Exception:
                 pass
 
@@ -2736,6 +2748,10 @@ class GprProfileViewer(QMainWindow):
         if bool(getattr(self, "_chk_range_gain", None) and self._chk_range_gain.isChecked()):
             self._apply_processing()
         else:
+            # Gain disabled: update last params so _compose_display_data knows
+            # pre_agc is no longer baked into _proc_data.
+            if hasattr(self, "_last_pipeline_params"):
+                self._last_pipeline_params["pre_agc_gain"] = False
             self._apply_gain_only()
 
     def _on_range_gain_surface_changed(self, _value: float):
@@ -3226,9 +3242,16 @@ class GprProfileViewer(QMainWindow):
             return None
 
         proc_disp = proc.astype(np.float32, copy=True)
-        pre_agc_applied = bool(getattr(self, "_last_pipeline_params", {}).get("pre_agc_gain", False))
-        if not pre_agc_applied:
-            # Apply depth gain on processed amplitudes BEFORE normalize_display.
+        # The range-gain is applied inside the pipeline (pre_agc_gain step) only
+        # when the checkbox is currently checked AND the pipeline was actually run
+        # with that parameter. We detect this by checking both the current UI state
+        # AND the last pipeline params — they must agree to avoid double-application
+        # or missed application (e.g. when the checkbox is toggled after processing).
+        chk_rg_on = bool(getattr(self, "_chk_range_gain", None) and self._chk_range_gain.isChecked())
+        last_pre_agc = bool(getattr(self, "_last_pipeline_params", {}).get("pre_agc_gain", False))
+        pre_agc_in_proc = chk_rg_on and last_pre_agc
+        if not pre_agc_in_proc:
+            # Apply depth gain as display-only transform BEFORE normalize_display.
             depth_gain = self._build_depth_range_gain(int(proc_disp.shape[0]))
             if depth_gain is not None:
                 proc_disp = (proc_disp * depth_gain).astype(np.float32, copy=False)
@@ -3635,6 +3658,20 @@ class GprProfileViewer(QMainWindow):
             distances = (np.arange(n_tr, dtype=np.float64) * max(step, 1e-6)).astype(np.float64)
         if distances.size <= 0:
             return None
+
+        # Normalize distances to start at 0, matching the display axis extent
+        # built by _display_distance_axis (which subtracts d0).
+        if distances.size > 0 and np.isfinite(distances[0]):
+            distances = distances - distances[0]
+        finite_d = np.isfinite(distances)
+        if not finite_d.any():
+            return None
+        if not finite_d.all():
+            idx_arr = np.arange(distances.size, dtype=np.float64)
+            ok = np.where(finite_d)[0].astype(np.float64)
+            distances = np.interp(idx_arr, ok, distances[finite_d]).astype(np.float64)
+        if distances.size > 1:
+            distances = np.maximum.accumulate(distances)
 
         depth_max = self._depth_max_display(prof)
         idx_t = int(np.searchsorted(distances, float(self._cursor_x)))
