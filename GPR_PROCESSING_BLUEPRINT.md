@@ -360,9 +360,29 @@ blocco chain, valori da `_phase1_params()`, merge in `_current_processing_params
   `compute_slice`), così il pannello Varianti alimenta direttamente il nuovo
   motore invece di aggiungere accoppiamento al vecchio.
 
-**Fase 4 — migrazione avanzata + eigen/median/FK.**
-`migration_kirchhoff` (+ offset Tx-Rx, + topo), `migration_v_profile`,
-`eigen_filter`, `median_filter2d`, `fk_filter`.
+**Fase 4 — migrazione avanzata + eigen/median/FK. ✅ FATTA (2026-09).**
+Funzioni pure numpy in `gpr_processing.py` (nessuna dip. scipy):
+- `eigen_filter(data, drop, keep_last)` — SVD (`np.linalg.svd`), azzera le prime
+  `drop` componenti (clutter orizzontale coerente); `keep_last` isola una banda.
+- `median_filter2d(data, w_trace, w_sample)` — mediana 2D via
+  `sliding_window_view` (+ fallback), de-spike.
+- `fk_filter(data, dt_ns, dx_m, mask)` — primitiva: applica una maschera FK
+  fornita dal chiamante (la UI di painting la fornira' in una fase successiva).
+- `fk_dip_filter(data, dt_ns, dx_m, v_min, v_max, mode, taper)` — ventaglio in
+  FK per velocita' apparente `f/kx`: rimuove/isola onda diretta, ground-roll,
+  rumore inclinato. Testato: `reject + pass ≈ input`.
+- `kirchhoff_migration_2d(data, dt_ns, dx_m, velocity_m_s, aperture_m,
+  tr_offset_m)` — diffraction stack con obliquita' `cosθ` + spreading
+  `1/√(v·t)`; `velocity_m_s` scalare **o** array 1D lungo n_samples
+  (⇒ copre `migration_v_profile` "profile"); offset Tx-Rx bistatico.
+  Testato: collassa un'iperbole sintetica all'apice (±6 campioni).
+Wiring: `DEFAULT_PIPELINE` (tutti OFF), `FILTER_REGISTRY`, `DEFAULT_CHAIN_ORDER`
+(19 step; `eigen_filter` dopo bg, `fk_dip` dopo bandpass, `median2d` dopo boxcar,
+`kirchhoff` dopo `migration`), `_step_fingerprint`, branch `apply_pipeline`.
+UI: aggiunti a `_PHASE1_SPECS` / `_PHASE1_STEP_IDS` / help → controlli generici
+via `_build_phase1_step_controls`. 8 test in `test/test_gpr_processing_adv.py`
+(tot 27). `migration_kirchhoff_topo` NON fatta (serve elevazione per traccia,
+va con la Fase 5 navigazione/topografia).
 
 **Fase 5 — navigazione completa + dominio griglia.**
 Modello marker + 4 modi; reverse/staggering/angolo arbitrario persistenti;

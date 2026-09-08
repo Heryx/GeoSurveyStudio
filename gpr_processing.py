@@ -1040,6 +1040,299 @@ def power_gain(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Filtri avanzati (Fase 4) — eigen / median 2D / FK / Kirchhoff. Puro numpy.
+# ---------------------------------------------------------------------------
+
+def eigen_filter(
+    data: np.ndarray,
+    drop: int = 1,
+    keep_last: int = 0,
+) -> np.ndarray:
+    """Filtro a immagini proprie (SVD): rimuove il clutter orizzontale coerente.
+
+    Decompone il radargramma ``A = U S Vt`` e ricostruisce azzerando le prime
+    ``drop`` componenti (le più energetiche = bande orizzontali quasi costanti,
+    l'onda diretta, il ringing). È un background removal "morbido" che non
+    sottrae una singola traccia media.
+
+    ``keep_last`` > 0 tiene solo le componenti nell'intervallo
+    ``[drop:keep_last]`` (utile per isolare strutture a media energia).
+
+    Adattato concettualmente da RGPR (E. Huber, G. Hans), GPL (>= 2),
+    ``R/eigenFilter.R`` — reimplementato da zero con ``numpy.linalg.svd``.
+    """
+    if data is None:
+        return np.zeros((0, 0), dtype=np.float32)
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim != 2 or arr.size == 0:
+        return arr.copy()
+    arr = np.nan_to_num(arr, copy=True, nan=0.0, posinf=0.0, neginf=0.0)
+    n_s, n_t = arr.shape
+    if n_s < 2 or n_t < 2:
+        return arr
+    d0 = max(0, int(drop))
+    k = int(min(n_s, n_t))
+    if d0 >= k:
+        _log_gpr(f"[GPR] eigen_filter: drop={d0} >= rango {k}, output nullo.")
+        return np.zeros_like(arr)
+    try:
+        U, S, Vt = np.linalg.svd(arr.astype(np.float64), full_matrices=False)
+    except np.linalg.LinAlgError:
+        _log_gpr("[GPR] eigen_filter: SVD non convergente, nessuna modifica.")
+        return arr
+    S2 = S.copy()
+    S2[:d0] = 0.0
+    hi = int(keep_last)
+    if hi > d0:
+        S2[hi:] = 0.0
+    out = (U * S2) @ Vt
+    _log_gpr(
+        f"[GPR] eigen_filter: drop={d0} keep_last={hi if hi > d0 else 'all'}  "
+        f"rango={k}  energia_residua={float(np.sum(S2 ** 2) / max(np.sum(S ** 2), 1e-20)):.3f}"
+    )
+    return out.astype(np.float32)
+
+
+def median_filter2d(
+    data: np.ndarray,
+    w_trace: int = 1,
+    w_sample: int = 1,
+) -> np.ndarray:
+    """Mediana 2D scorrevole (de-spike). Semi-ampiezze ``w_trace`` (asse tracce)
+    e ``w_sample`` (asse campioni). 0/0 = no-op. Bordi in reflect.
+
+    Adattato concettualmente da RGPR ``filter2D(type="median")``, GPL (>= 2) —
+    reimplementato con ``numpy.lib.stride_tricks.sliding_window_view``.
+    """
+    if data is None:
+        return np.zeros((0, 0), dtype=np.float32)
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim != 2 or arr.size == 0:
+        return arr.copy()
+    arr = np.nan_to_num(arr, copy=True, nan=0.0, posinf=0.0, neginf=0.0)
+    n_s, n_t = arr.shape
+    hs = max(0, int(w_sample))
+    ht = max(0, int(w_trace))
+    if (hs == 0 and ht == 0) or n_s < 2 or n_t < 2:
+        return arr
+    hs = min(hs, max(0, n_s - 1))
+    ht = min(ht, max(0, n_t - 1))
+    ks, kt = 2 * hs + 1, 2 * ht + 1
+    padded = np.pad(arr.astype(np.float64), ((hs, hs), (ht, ht)), mode="reflect")
+    try:
+        from numpy.lib.stride_tricks import sliding_window_view
+        win = sliding_window_view(padded, (ks, kt))          # (n_s, n_t, ks, kt)
+        out = np.median(win, axis=(-2, -1))
+    except Exception:
+        # fallback O(n_s*n_t*k^2) senza stride tricks
+        out = np.empty((n_s, n_t), dtype=np.float64)
+        for i in range(n_s):
+            for j in range(n_t):
+                out[i, j] = np.median(padded[i:i + ks, j:j + kt])
+    _log_gpr(f"[GPR] median_filter2d: w_trace={ht} w_sample={hs}  shape={arr.shape}")
+    return out.astype(np.float32)
+
+
+def _fk_transform(arr64: np.ndarray, dt_s: float, dx_m: float):
+    """FFT 2D spazio-tempo. Ritorna (FK, f_hz, kx_cyc_per_m) con fftshift."""
+    n_s, n_t = arr64.shape
+    FK = np.fft.fftshift(np.fft.fft2(arr64))
+    f = np.fft.fftshift(np.fft.fftfreq(n_s, d=dt_s))       # Hz (può essere <0)
+    kx = np.fft.fftshift(np.fft.fftfreq(n_t, d=dx_m))      # cicli/m
+    return FK, f, kx
+
+
+def fk_filter(
+    data: np.ndarray,
+    dt_ns: float,
+    dx_m: float,
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Applica una maschera nel dominio FK (f, kx) e antitrasforma.
+
+    ``mask`` : array reale (n_s, n_t) in [0,1] **già in ordine fftshift**
+    (0 = blanca, 1 = passa). Se None → identità. La UI di painting fornirà
+    la maschera; qui è la primitiva pura.
+    """
+    if data is None:
+        return np.zeros((0, 0), dtype=np.float32)
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim != 2 or arr.size == 0:
+        return arr.copy()
+    arr = np.nan_to_num(arr, copy=True, nan=0.0, posinf=0.0, neginf=0.0)
+    if mask is None:
+        return arr
+    n_s, n_t = arr.shape
+    m = np.asarray(mask, dtype=np.float64)
+    if m.shape != (n_s, n_t):
+        _log_gpr(f"[GPR] fk_filter: mask {m.shape} != dato {arr.shape}, ignorata.")
+        return arr
+    dt_s = float(dt_ns) * 1e-9
+    dx = max(float(dx_m), 1e-6)
+    if not np.isfinite(dt_s) or dt_s <= 0.0:
+        return arr
+    FK = np.fft.fftshift(np.fft.fft2(arr.astype(np.float64)))
+    out = np.real(np.fft.ifft2(np.fft.ifftshift(FK * m)))
+    _log_gpr(f"[GPR] fk_filter: mask fill={float(np.mean(m)):.3f}  shape={arr.shape}")
+    return out.astype(np.float32)
+
+
+def fk_dip_filter(
+    data: np.ndarray,
+    dt_ns: float,
+    dx_m: float,
+    v_min: float = 0.0,
+    v_max: float = 0.0,
+    mode: str = "reject",
+    taper: float = 0.15,
+) -> np.ndarray:
+    """Filtro a ventaglio in FK per velocità apparente ``v_app = f / kx``.
+
+    Rimuove (``mode='reject'``) o isola (``mode='pass'``) gli eventi la cui
+    pendenza apparente cade in ``[v_min, v_max]`` m/s. Tipico per togliere
+    onda diretta / ground-roll / rumore inclinato coerente. ``v_min<=0`` →
+    0 ; ``v_max<=0`` → +inf. ``taper`` = frazione di transizione morbida.
+    """
+    if data is None:
+        return np.zeros((0, 0), dtype=np.float32)
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim != 2 or arr.size == 0:
+        return arr.copy()
+    arr = np.nan_to_num(arr, copy=True, nan=0.0, posinf=0.0, neginf=0.0)
+    n_s, n_t = arr.shape
+    if n_s < 4 or n_t < 4:
+        return arr
+    dt_s = float(dt_ns) * 1e-9
+    dx = max(float(dx_m), 1e-6)
+    if not np.isfinite(dt_s) or dt_s <= 0.0:
+        return arr
+    vlo = max(0.0, float(v_min))
+    vhi = float(v_max) if float(v_max) > 0.0 else np.inf
+
+    _, f, kx = _fk_transform(arr.astype(np.float64), dt_s, dx)
+    F, KX = np.meshgrid(np.abs(f), np.abs(kx), indexing="ij")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        v_app = np.where(KX > 1e-12, F / KX, np.inf)   # m/s
+    inband = (v_app >= vlo) & (v_app <= vhi)
+    keep = (~inband) if str(mode).strip().lower() == "reject" else inband
+    mask = keep.astype(np.float64)
+    # taper morbido sul bordo della banda in scala log-velocità
+    tf = float(np.clip(taper, 0.0, 0.5))
+    if tf > 0.0 and np.isfinite(vhi):
+        edge = tf * (np.log(max(vhi, 1e-6)) - np.log(max(vlo, 1e-6) + 1e-6))
+        if edge > 0:
+            dist = np.minimum(
+                np.abs(np.log(np.clip(v_app, 1e-6, None)) - np.log(max(vlo, 1e-6) + 1e-6)),
+                np.abs(np.log(np.clip(v_app, 1e-6, None)) - np.log(max(vhi, 1e-6))),
+            )
+            soft = 0.5 * (1.0 - np.cos(np.pi * np.clip(dist / edge, 0.0, 1.0)))
+            near = dist < edge
+            mask[near] = soft[near] if str(mode).strip().lower() == "reject" else (1.0 - soft[near])
+
+    FK = np.fft.fftshift(np.fft.fft2(arr.astype(np.float64)))
+    out = np.real(np.fft.ifft2(np.fft.ifftshift(FK * mask)))
+    _log_gpr(
+        f"[GPR] fk_dip_filter: v=[{vlo:.3g},{vhi:.3g}] mode={mode} "
+        f"pass_frac={float(np.mean(mask)):.3f}  shape={arr.shape}"
+    )
+    return out.astype(np.float32)
+
+
+def kirchhoff_migration_2d(
+    data: np.ndarray,
+    dt_ns: float,
+    dx_m: float = 0.05,
+    velocity_m_s: float = 1.0e8,
+    aperture_m: float = 0.0,
+    tr_offset_m: float = 0.0,
+) -> np.ndarray:
+    """Migrazione Kirchhoff / diffraction-stack 2D a tempi.
+
+    Per ogni campione di uscita ``(i0, j0)`` somma le ampiezze del dato lungo
+    l'iperbole di diffrazione entro l'apertura, con pesi di obliquità
+    ``cos θ`` e di spreading sferico ``1/sqrt(v t)``. ``velocity_m_s`` può
+    essere uno scalare **oppure** un array 1D lungo ``n_samples`` (profilo di
+    velocità variabile con la profondità → copre ``migration_v_profile``).
+    ``tr_offset_m`` = separazione fissa Tx-Rx (modello bistatico).
+    ``aperture_m`` <= 0 → apertura automatica (mezza traccia).
+
+    Adattato concettualmente da RGPR ``migration(type="kirchhoff")``, GPL (>= 2),
+    e da GPR standard (diffraction stack) — reimplementato da zero.
+    """
+    if data is None:
+        return np.zeros((0, 0), dtype=np.float32)
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim != 2 or arr.size == 0:
+        return arr.copy()
+    arr = np.nan_to_num(arr, copy=True, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+    n_s, n_t = arr.shape
+    if n_s < 4 or n_t < 4:
+        return arr.astype(np.float32)
+
+    dt = float(dt_ns) * 1e-9
+    dx = max(float(dx_m), 1e-4)
+    if not np.isfinite(dt) or dt <= 0.0:
+        return arr.astype(np.float32)
+
+    v = np.asarray(velocity_m_s, dtype=np.float64)
+    if v.ndim == 0:
+        v_vec = np.full(n_s, max(float(v), 1e3))
+    else:
+        v_vec = np.interp(
+            np.arange(n_s, dtype=np.float64),
+            np.linspace(0.0, n_s - 1, v.size),
+            np.clip(v.astype(np.float64), 1e3, None),
+        )
+    half = float(tr_offset_m) * 0.5
+    ap = float(aperture_m) if float(aperture_m) > 0.0 else (0.5 * n_t * dx)
+    max_off = max(1, int(round(ap / dx)))
+
+    t_axis = np.arange(n_s, dtype=np.float64) * dt
+    out = np.zeros_like(arr)
+    jj = np.arange(n_t)
+    for i0 in range(n_s):
+        t0 = t_axis[i0]
+        if t0 <= 0.0:
+            out[i0, :] = arr[i0, :]
+            continue
+        vi = v_vec[i0]
+        depth = 0.5 * vi * t0                       # profondità apparente all'apice
+        for off in range(-max_off, max_off + 1):
+            src_j = jj + off
+            m = (src_j >= 0) & (src_j < n_t)
+            if not np.any(m):
+                continue
+            xr = off * dx
+            r1 = np.hypot(xr - half, depth)
+            r2 = np.hypot(xr + half, depth)
+            t_hyp = (r1 + r2) / vi                  # tempo bistatico a due vie
+            s = t_hyp / dt
+            if s > (n_s - 1) or s < 0.0:
+                continue
+            s0 = int(np.floor(s))
+            fr = s - s0
+            s1 = min(s0 + 1, n_s - 1)
+            dist_mean = 0.5 * (r1 + r2)
+            obliq = depth / dist_mean if dist_mean > 1e-9 else 0.0
+            spread = 1.0 / np.sqrt(max(vi * t_hyp, 1e-12))
+            w = obliq * spread
+            if w <= 0.0:
+                continue
+            a = arr[s0, src_j[m]] * (1.0 - fr) + arr[s1, src_j[m]] * fr
+            out[i0, jj[m]] += w * a
+    # riscala per riportare l'ampiezza nell'ordine del dato d'ingresso
+    peak_in = float(np.max(np.abs(arr))) or 1.0
+    peak_out = float(np.max(np.abs(out))) or 1.0
+    if peak_out > 1e-20:
+        out *= peak_in / peak_out
+    _log_gpr(
+        f"[GPR] kirchhoff_migration_2d: v={'array' if v.ndim else f'{float(v):.3e}'} "
+        f"dx={dx:.3f} aperture={ap:.2f}m txrx={tr_offset_m:.3f}  shape={arr.shape}"
+    )
+    return out.astype(np.float32)
+
+
 def normalize_display(data: np.ndarray) -> np.ndarray:
     if data is None:
         return np.zeros((0, 0), dtype=np.float32)
@@ -1140,6 +1433,24 @@ DEFAULT_PIPELINE = {
     "power_gain_exp":       1.0,
     "power_gain_t0_ns":     0.0,
     "power_gain_scale":     1.0,
+    # --- Filtri Fase 4 (disattivi di default) ----------------------------
+    "eigen_filter":         False,
+    "eigen_drop":           1,            # n. componenti SVD azzerate
+    "eigen_keep_last":      0,            # 0 = tieni tutte oltre `drop`
+    "median2d":             False,
+    "median2d_w_trace":     1,
+    "median2d_w_sample":    1,
+    "fk_dip":               False,
+    "fk_dip_vmin":          0.0,          # m/s (0 = 0)
+    "fk_dip_vmax":          0.0,          # m/s (0 = +inf)
+    "fk_dip_mode":          "reject",     # 'reject' | 'pass'
+    "fk_dip_taper":         0.15,
+    "fk_dip_dx_m":          0.05,         # spaziatura tracce (m)
+    "kirchhoff":            False,
+    "kirchhoff_velocity_m_s": 1.0e8,
+    "kirchhoff_dx_m":       0.05,
+    "kirchhoff_aperture_m": 0.0,          # 0 = auto (mezza traccia)
+    "kirchhoff_txrx_m":     0.0,
     "chain_order":          None,
 }
 
@@ -1205,6 +1516,22 @@ FILTER_REGISTRY = {
         "label": "Range gain analitico (t^a / exp)",
         "param_key": "power_gain",
     },
+    "eigen_filter": {
+        "label": "Filtro eigen-image (SVD)",
+        "param_key": "eigen_filter",
+    },
+    "median2d": {
+        "label": "Mediana 2D (de-spike)",
+        "param_key": "median2d",
+    },
+    "fk_dip": {
+        "label": "Filtro FK a ventaglio (dip)",
+        "param_key": "fk_dip",
+    },
+    "kirchhoff": {
+        "label": "Migrazione Kirchhoff 2D",
+        "param_key": "kirchhoff",
+    },
 }
 
 DEFAULT_CHAIN_ORDER = [
@@ -1212,11 +1539,15 @@ DEFAULT_CHAIN_ORDER = [
     "timezero",
     "dcshift",
     "bg_removal",
+    "eigen_filter",
     "notch",
     "bandpass",
+    "fk_dip",
     "whiten",
     "boxcar",
+    "median2d",
     "migration",
+    "kirchhoff",
     "pre_agc_gain",
     "power_gain",
     "agc",
@@ -1328,6 +1659,31 @@ def _step_fingerprint(
             "power_gain", bool(p.get("power_gain")), str(p.get("power_gain_mode", "power")),
             float(p.get("power_gain_exp", 1.0)), float(p.get("power_gain_t0_ns", 0.0)),
             float(p.get("power_gain_scale", 1.0)), dt_ns, input_shape
+        )
+    elif step == "eigen_filter":
+        return (
+            "eigen_filter", bool(p.get("eigen_filter")), int(p.get("eigen_drop", 1)),
+            int(p.get("eigen_keep_last", 0)), input_shape
+        )
+    elif step == "median2d":
+        return (
+            "median2d", bool(p.get("median2d")), int(p.get("median2d_w_trace", 1)),
+            int(p.get("median2d_w_sample", 1)), input_shape
+        )
+    elif step == "fk_dip":
+        return (
+            "fk_dip", bool(p.get("fk_dip")), float(p.get("fk_dip_vmin", 0.0)),
+            float(p.get("fk_dip_vmax", 0.0)), str(p.get("fk_dip_mode", "reject")),
+            float(p.get("fk_dip_taper", 0.15)), float(p.get("fk_dip_dx_m", 0.05)),
+            dt_ns, input_shape
+        )
+    elif step == "kirchhoff":
+        return (
+            "kirchhoff", bool(p.get("kirchhoff")),
+            float(p.get("kirchhoff_velocity_m_s", 1.0e8)),
+            float(p.get("kirchhoff_dx_m", 0.05)),
+            float(p.get("kirchhoff_aperture_m", 0.0)),
+            float(p.get("kirchhoff_txrx_m", 0.0)), dt_ns, input_shape
         )
     return (step, bool(p.get(step)), input_shape)
 
@@ -1645,6 +2001,57 @@ def apply_pipeline(
                     scale=float(p.get("power_gain_scale", 1.0)),
                 )
                 _log(f"power_gain({p.get('power_gain_mode', 'power')})", out)
+
+        elif step == "eigen_filter":
+            if bool(p.get("eigen_filter", False)):
+                out = eigen_filter(
+                    out,
+                    drop=int(p.get("eigen_drop", 1)),
+                    keep_last=int(p.get("eigen_keep_last", 0)),
+                )
+                _log(f"eigen_filter(drop={p.get('eigen_drop', 1)})", out)
+
+        elif step == "median2d":
+            if bool(p.get("median2d", False)):
+                out = median_filter2d(
+                    out,
+                    w_trace=int(p.get("median2d_w_trace", 1)),
+                    w_sample=int(p.get("median2d_w_sample", 1)),
+                )
+                _log(
+                    f"median2d(wt={p.get('median2d_w_trace', 1)} "
+                    f"ws={p.get('median2d_w_sample', 1)})",
+                    out,
+                )
+
+        elif step == "fk_dip":
+            if bool(p.get("fk_dip", False)):
+                out = fk_dip_filter(
+                    out,
+                    dt_ns,
+                    float(p.get("fk_dip_dx_m", 0.05)),
+                    v_min=float(p.get("fk_dip_vmin", 0.0)),
+                    v_max=float(p.get("fk_dip_vmax", 0.0)),
+                    mode=str(p.get("fk_dip_mode", "reject")),
+                    taper=float(p.get("fk_dip_taper", 0.15)),
+                )
+                _log(f"fk_dip(mode={p.get('fk_dip_mode', 'reject')})", out)
+
+        elif step == "kirchhoff":
+            if bool(p.get("kirchhoff", False)):
+                out = kirchhoff_migration_2d(
+                    out,
+                    dt_ns=dt_ns,
+                    dx_m=float(p.get("kirchhoff_dx_m", 0.05)),
+                    velocity_m_s=float(p.get("kirchhoff_velocity_m_s", 1.0e8)),
+                    aperture_m=float(p.get("kirchhoff_aperture_m", 0.0)),
+                    tr_offset_m=float(p.get("kirchhoff_txrx_m", 0.0)),
+                )
+                _log(
+                    f"kirchhoff(v={float(p.get('kirchhoff_velocity_m_s', 1e8)):.3e} "
+                    f"dx={p.get('kirchhoff_dx_m', 0.05)})",
+                    out,
+                )
 
         if can_use_cache:
             stage_cache[idx] = (fp, out.copy())

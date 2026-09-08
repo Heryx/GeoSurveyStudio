@@ -1279,6 +1279,10 @@ class GprProfileViewer(QMainWindow):
             "amp_eq": "Equalizzazione d'ampiezza: gain = scala_ref / RMS(finestra mobile).",
             "rad_threshold": "Azzera i campioni la cui ampiezza sta dentro le soglie.",
             "power_gain": "Range gain analitico: potenza t^a o esponenziale exp(a*t).",
+            "eigen_filter": "Filtro a immagini proprie (SVD): rimuove il clutter orizzontale coerente.",
+            "median2d": "Mediana 2D scorrevole: elimina spike isolati preservando i bordi.",
+            "fk_dip": "Filtro FK a ventaglio: rimuove/isola eventi per velocita' apparente (dip).",
+            "kirchhoff": "Migrazione Kirchhoff 2D (diffraction stack) con obliquita' + spreading.",
         }
         return txt.get(str(step_id), "")
 
@@ -1289,6 +1293,7 @@ class GprProfileViewer(QMainWindow):
     #   choice-> (lista_opzioni, default)
     _PHASE1_STEP_IDS = (
         "dcshift", "boxcar", "notch", "whiten", "amp_eq", "rad_threshold", "power_gain",
+        "eigen_filter", "median2d", "fk_dip", "kirchhoff",
     )
     _PHASE1_SPECS = {
         "dcshift": [
@@ -1321,6 +1326,27 @@ class GprProfileViewer(QMainWindow):
             ("power_gain_exp", "Esponente a:", "float", -5.0, 5.0, 1.0, 2, 0.1),
             ("power_gain_t0_ns", "t0 (ns):", "float", 0.0, 5000.0, 0.0, 1, 1.0),
             ("power_gain_scale", "Scala:", "float", 0.01, 100.0, 1.0, 2, 0.1),
+        ],
+        "eigen_filter": [
+            ("eigen_drop", "Componenti da azzerare:", "int", 0, 64, 1),
+            ("eigen_keep_last", "Tieni fino a (0=tutte):", "int", 0, 64, 0),
+        ],
+        "median2d": [
+            ("median2d_w_trace", "Semi-ampiezza tracce:", "int", 0, 32, 1),
+            ("median2d_w_sample", "Semi-ampiezza campioni:", "int", 0, 64, 1),
+        ],
+        "fk_dip": [
+            ("fk_dip_mode", "Modo:", "choice", ["reject", "pass"], "reject"),
+            ("fk_dip_vmin", "v min (m/s):", "float", 0.0, 3.0e8, 0.0, 0, 1.0e6),
+            ("fk_dip_vmax", "v max (m/s, 0=inf):", "float", 0.0, 3.0e8, 0.0, 0, 1.0e6),
+            ("fk_dip_dx_m", "dx tracce (m):", "float", 0.001, 10.0, 0.05, 3, 0.01),
+            ("fk_dip_taper", "Taper:", "float", 0.0, 0.5, 0.15, 2, 0.05),
+        ],
+        "kirchhoff": [
+            ("kirchhoff_velocity_m_s", "Velocita' (m/s):", "float", 1.0e6, 3.0e8, 1.0e8, 0, 1.0e6),
+            ("kirchhoff_dx_m", "dx tracce (m):", "float", 0.001, 10.0, 0.05, 3, 0.01),
+            ("kirchhoff_aperture_m", "Apertura (m, 0=auto):", "float", 0.0, 200.0, 0.0, 2, 0.5),
+            ("kirchhoff_txrx_m", "Offset Tx-Rx (m):", "float", 0.0, 3.0, 0.0, 3, 0.02),
         ],
     }
 
@@ -3411,6 +3437,10 @@ class GprProfileViewer(QMainWindow):
                 "amp_eq",
                 "rad_threshold",
                 "power_gain",
+                "eigen_filter",
+                "median2d",
+                "fk_dip",
+                "kirchhoff",
             )
         )
         if not has_active_filters:

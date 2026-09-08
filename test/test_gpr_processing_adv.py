@@ -18,6 +18,11 @@ from gpr_processing import (
     radar_threshold,
     power_gain,
     bandpass_filter,
+    eigen_filter,
+    median_filter2d,
+    fk_filter,
+    fk_dip_filter,
+    kirchhoff_migration_2d,
 )
 
 
@@ -270,6 +275,109 @@ class TestPhase1Filters(unittest.TestCase):
         a = apply_pipeline(data, {**p, "chain_order": old_order}, dt_ns=0.3)
         b = apply_pipeline(data, {**p, "chain_order": list(DEFAULT_CHAIN_ORDER)}, dt_ns=0.3)
         np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-5)
+
+
+class TestPhase4Filters(unittest.TestCase):
+
+    def _synth(self, n_s=160, n_t=48, seed=0):
+        rng = np.random.default_rng(seed)
+        return (rng.standard_normal((n_s, n_t)) * 2.0).astype(np.float32)
+
+    def test_eigen_filter_removes_coherent_band(self):
+        sig = self._synth()
+        band = sig + 30.0 * np.ones_like(sig)          # strong coherent horizontal
+        band[40, :] += np.linspace(-5, 5, band.shape[1])  # slight tilt
+        out = eigen_filter(band, drop=1)
+        self.assertEqual(out.shape, band.shape)
+        self.assertLess(float(np.abs(out).mean()), float(np.abs(band).mean()))
+        # drop >= rank -> zeros
+        z = eigen_filter(band, drop=999)
+        self.assertTrue(np.allclose(z, 0.0))
+        # drop=0 -> reconstruction ~ identity
+        r = eigen_filter(band, drop=0)
+        np.testing.assert_allclose(r, band, rtol=1e-3, atol=1e-2)
+
+    def test_median_filter2d_despikes(self):
+        data = np.zeros((60, 40), dtype=np.float32)
+        data[30, 20] = 500.0
+        out = median_filter2d(data, w_trace=1, w_sample=1)
+        self.assertAlmostEqual(float(out[30, 20]), 0.0, places=4)
+        # no-op
+        np.testing.assert_allclose(median_filter2d(data, 0, 0), data)
+
+    def test_fk_filter_mask_roundtrip(self):
+        data = self._synth(seed=2)
+        # mask=None -> identity
+        np.testing.assert_allclose(fk_filter(data, 0.4, 0.05, None), data)
+        # all-ones mask -> FFT/IFFT round-trip (within numeric noise)
+        ones = np.ones_like(data, dtype=np.float64)
+        rt = fk_filter(data, 0.4, 0.05, ones)
+        np.testing.assert_allclose(rt, data, rtol=1e-4, atol=1e-3)
+        # all-zeros mask -> ~zeros
+        zeros = np.zeros_like(data, dtype=np.float64)
+        self.assertLess(float(np.abs(fk_filter(data, 0.4, 0.05, zeros)).max()), 1e-3)
+
+    def test_fk_dip_filter_shape_and_modes_are_complementary(self):
+        data = self._synth(seed=3)
+        rej = fk_dip_filter(data, 0.4, 0.05, v_min=0.0, v_max=5e7, mode="reject", taper=0.0)
+        pas = fk_dip_filter(data, 0.4, 0.05, v_min=0.0, v_max=5e7, mode="pass", taper=0.0)
+        self.assertEqual(rej.shape, data.shape)
+        self.assertTrue(np.isfinite(rej).all() and np.isfinite(pas).all())
+        # reject + pass should reconstruct the (DC-inclusive) input closely
+        np.testing.assert_allclose(rej + pas, data, rtol=1e-3, atol=1e-2)
+
+    def test_kirchhoff_focuses_diffraction(self):
+        n_s, n_t = 256, 128
+        dt_ns, dx_m, v = 0.5, 0.05, 1e8
+        t0_ns = 60.0
+        x0 = 64 * dx_m
+        f0 = 100e6
+        tw = np.arange(-20, 21) * (dt_ns * 1e-9)
+        ricker = (1.0 - 2.0 * (np.pi * f0 * tw) ** 2) * np.exp(-(np.pi * f0 * tw) ** 2)
+        synth = np.zeros((n_s, n_t), dtype=np.float64)
+        for it in range(n_t):
+            x = it * dx_m
+            t = np.sqrt(t0_ns ** 2 + (4.0 * (x - x0) ** 2) / (0.1 ** 2))
+            samp = int(round(t / dt_ns))
+            for iw, wv in enumerate(ricker):
+                s = samp + iw - len(ricker) // 2
+                if 0 <= s < n_s:
+                    synth[s, it] += wv
+        mig = kirchhoff_migration_2d(synth, dt_ns, dx_m, v, aperture_m=n_t * dx_m)
+        self.assertEqual(mig.shape, (n_s, n_t))
+        self.assertTrue(np.isfinite(mig).all())
+        peak = np.unravel_index(np.argmax(np.abs(mig)), mig.shape)
+        self.assertAlmostEqual(peak[0], int(round(t0_ns / dt_ns)), delta=6)
+        self.assertAlmostEqual(peak[1], 64, delta=4)
+
+    def test_kirchhoff_accepts_velocity_profile(self):
+        data = self._synth(n_s=128, n_t=32, seed=9)
+        v_of_t = np.linspace(0.8e8, 1.2e8, 128)
+        out = kirchhoff_migration_2d(data, 0.4, 0.05, v_of_t, aperture_m=0.8)
+        self.assertEqual(out.shape, data.shape)
+        self.assertTrue(np.isfinite(out).all())
+
+    def test_phase4_registered_default_off_and_in_chain(self):
+        for sid in ("eigen_filter", "median2d", "fk_dip", "kirchhoff"):
+            self.assertIn(sid, FILTER_REGISTRY)
+            self.assertIn(sid, DEFAULT_PIPELINE)
+            self.assertFalse(DEFAULT_PIPELINE[sid])
+            self.assertIn(sid, DEFAULT_CHAIN_ORDER)
+
+    def test_phase4_pipeline_on_off(self):
+        data = self._synth(n_s=96, n_t=24)
+        p = dict(DEFAULT_PIPELINE)
+        for k in ("dewow", "bg_removal", "agc"):
+            p[k] = False
+        p["chain_order"] = ["median2d"]
+        p["median2d"] = True
+        p["median2d_w_trace"] = 1
+        p["median2d_w_sample"] = 1
+        on = apply_pipeline(data, p, dt_ns=0.4, normalize_output=False)
+        self.assertFalse(np.allclose(on, data))
+        p["median2d"] = False
+        off = apply_pipeline(data, p, dt_ns=0.4, normalize_output=False)
+        np.testing.assert_allclose(off, data, rtol=1e-5, atol=1e-4)
 
 
 if __name__ == "__main__":
