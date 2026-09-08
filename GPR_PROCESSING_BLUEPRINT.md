@@ -401,11 +401,18 @@ va con la Fase 5 navigazione/topografia).
   staggering), `line_plan_coords` (ascissa→E/N per qualunque angolo, incl. ANG
   a lunghezza frazionaria con riproiezione sul segmento). 16 test in
   `test/test_navigation.py`.
+- `grid_geometry.py` (nuovo, puro numpy): `rotate_translate(grid, angle_deg,
+  out_origin, mode)` (ricampionamento bilineare NaN-aware; `fix_origin` porta
+  l'angolo SW sorgente su `out_origin`, `translate_origin` porta l'angolo SW del
+  nuovo raster); `append_grids(grids, overlap='mean'|'first'|'last')` (fonde
+  gridset con stessa cella nell'inviluppo); `edge_match(a, b, axis, overlap_cells)`
+  (pareggia la media nella striscia di giunzione). 9 test in
+  `test/test_grid_geometry.py`.
 - **Rinviato:** integrazione UI in `gpr_manual_positioning_dialog.py` (assegna i
   4 modi, mostra i marker sul radargramma, flag reverse/stagger persistenti,
-  multi information-file); `rotate_translate_grid` / `append_gridsets`
-  (georef-coupled → vanno con la Fase E del timeslice). `migration_kirchhoff_topo`
-  usa `line_plan_coords` + elevazione per traccia — resta da cablare nel viewer.
+  multi information-file). `migration_kirchhoff_topo` usa `line_plan_coords` +
+  elevazione per traccia — resta da cablare nel viewer. `grid_geometry` va
+  agganciato al percorso timeslice (Fase E del workplan).
 
 **Fase 6 — avanzato/opzionale. ✅ FATTA (2026-09).**
 Funzioni pure numpy in `gpr_processing.py`:
