@@ -440,18 +440,38 @@ class GprOgprVolumeMixin:
         depth_max  = max(p.depth_max_m for p in profiles)
         n_channels = max(p.n_channels  for p in profiles)
 
-        params = self._ask_ogpr_slice_params(
-            profiles=profiles,
-            n_channels  = n_channels,
-            depth_max_m = depth_max,
-            default_group = default_group,
-            saved = saved,
-            slice_params=slice_params,
-        )
-        if params is None:
-            return
-        params = dict(params or {})
-        dialog_extra_slice_params = dict(params.pop("advanced", {}) or {})
+        # Fase D: when the caller already carries a SliceSpec (from the single
+        # SliceSpecPanel form), skip the legacy parameter dialog entirely - the
+        # form is always visible and complete.
+        active_spec = (slice_params or {}).get("_spec")
+        if active_spec is not None:
+            from .slice_params_compat import spec_to_build_params
+
+            resolved_spec = (
+                active_spec if active_spec.is_resolved()
+                else active_spec.resolve(profiles)
+            )
+            params = spec_to_build_params(
+                resolved_spec,
+                channel=int((slice_params or {}).get("channel", -1)),
+                combine_method=str((slice_params or {}).get("combine_method", "mean")),
+                group_name=default_group,
+            )
+            dialog_extra_slice_params = {}
+        else:
+            resolved_spec = None
+            params = self._ask_ogpr_slice_params(
+                profiles=profiles,
+                n_channels  = n_channels,
+                depth_max_m = depth_max,
+                default_group = default_group,
+                saved = saved,
+                slice_params=slice_params,
+            )
+            if params is None:
+                return
+            params = dict(params or {})
+            dialog_extra_slice_params = dict(params.pop("advanced", {}) or {})
 
         group_name = params["group_name"]
         output_dir = os.path.join(project_root, "GPR_Processing", "timeslices", group_name)
@@ -609,6 +629,9 @@ class GprOgprVolumeMixin:
                     sidecar_params["task_timing_s"] = dict(task_timing_s)
                 if extra_slice_params.get("amplitude_sigma") is not None:
                     sidecar_params["amplitude_sigma"] = extra_slice_params.get("amplitude_sigma")
+                if resolved_spec is not None:
+                    # Fase D: keep the exact SliceSpec so a re-slice restores it verbatim.
+                    sidecar_params["slice_spec"] = resolved_spec.to_dict()
                 save_ogpr_slicer_params(output_dir, sidecar_params)
 
                 # --- registra nel catalogo (riusa GprVolumeMixin) ---
@@ -763,6 +786,11 @@ class GprOgprVolumeMixin:
             extra_slice_params=extra_slice_params,
             output_dir=output_dir,
             epsg=epsg,
+            spec=resolved_spec,
+            source_variant=(
+                str(getattr(resolved_spec, "source_variant", "raw"))
+                if resolved_spec is not None else "raw"
+            ),
         )
         self._ogpr_slice_task_active = True
         start_task_with_progress_dialog(
