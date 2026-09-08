@@ -192,6 +192,15 @@ class GeoSurveyStudioPlugin(
             self.check_dependencies_action.setIcon(deps_icon)
         self.first_start = True
         self._maybe_run_startup_dependency_check()
+        try:
+            from qgis.core import QgsProject
+            QgsProject.instance().projectRead.connect(self._on_qgis_project_read)
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                f"Could not connect projectRead signal: {exc}",
+                "GeoSurvey Studio",
+                Qgis.Warning,
+            )
 
     def _plugin_version(self) -> str:
         """Read plugin version from metadata.txt."""
@@ -345,6 +354,11 @@ class GeoSurveyStudioPlugin(
 
     def unload(self):
         """Unload the plugin."""
+        try:
+            from qgis.core import QgsProject
+            QgsProject.instance().projectRead.disconnect(self._on_qgis_project_read)
+        except Exception:
+            pass
         if self.dlg is not None:
             self._save_ui_settings()
         # Chiudi viewer GPR se aperto
@@ -374,6 +388,14 @@ class GeoSurveyStudioPlugin(
                 QgsMessageLog.logMessage(str(e), "GeoSurvey Studio", Qgis.Warning)
             self.plugin_toolbar.deleteLater()
             self.plugin_toolbar = None
+        tools_dock = getattr(self, "tools_dock_widget", None)
+        if tools_dock is not None:
+            try:
+                self.iface.removeDockWidget(tools_dock)
+                tools_dock.deleteLater()
+            except Exception:
+                pass
+            self.tools_dock_widget = None
         if self.dock_widget is not None:
             self.iface.removeDockWidget(self.dock_widget)
             self.dock_widget.deleteLater()

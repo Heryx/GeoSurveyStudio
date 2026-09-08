@@ -69,11 +69,13 @@ def choose_timeslice_import_action(
     mismatch_count,
     suspicious_count,
     project_crs_authid="",
+    import_crs_authid="",
     scope_label="selected images",
 ):
     """
     Show compact validation dialog and return one of:
       - "cancel"
+      - "set_crs" (user wants to choose the import CRS now, then re-validate)
       - "compatible" (import only CRS-compatible + non-suspicious)
       - "all_georef" (import all georeferenced, skip missing-CRS)
     """
@@ -85,6 +87,7 @@ def choose_timeslice_import_action(
     georef_count = max(0, total - int(missing_crs_count))
     crs_text = _crs_summary(records)
     proj = str(project_crs_authid or "").strip() or "Unknown"
+    import_crs = str(import_crs_authid or "").strip()
     if int(mismatch_count) == 0 and georef_count > 0:
         project_status = "OK"
     elif georef_count <= 0:
@@ -99,21 +102,40 @@ def choose_timeslice_import_action(
         msg.setIcon(QMessageBox.Warning)
         msg.setWindowTitle("Time-slice Import Check")
         msg.setText(f"Importing {total} image(s).")
+        if int(missing_crs_count) > 0:
+            if import_crs:
+                recommended = (
+                    f"Recommended action: Set Import CRS (currently {import_crs}) "
+                    "if the images need a different one, then re-check."
+                )
+            else:
+                recommended = (
+                    "Recommended action: Set Import CRS. The images have a valid "
+                    "position (world file) but no coordinate system; pick the CRS "
+                    "of your survey (e.g. EPSG:32631) and it will be assigned on import."
+                )
+        else:
+            recommended = "Recommended action: Import Compatible Only."
+
         msg.setInformativeText(
             "\n".join(
                 [
                     f"Detected CRS: {crs_text}",
                     f"Project CRS: {proj}",
+                    f"Import CRS: {import_crs or 'not set'}",
                     f"CRS check: {project_status}",
                     f"Non-georeferenced images: {int(missing_crs_count)} (will be skipped)",
                     f"Suspicious extent: {int(suspicious_count)}",
                     "",
-                    "Recommended action: Import Compatible Only.",
+                    recommended,
                 ]
             )
         )
 
         details_btn = msg.addButton("View Details", QMessageBox.HelpRole)
+        set_crs_btn = None
+        if int(missing_crs_count) > 0:
+            set_crs_btn = msg.addButton("Set Import CRS…", QMessageBox.ActionRole)
         compatible_btn = None
         all_georef_btn = None
 
@@ -132,6 +154,8 @@ def choose_timeslice_import_action(
         if clicked == details_btn:
             _show_details(parent, details_text)
             continue
+        if set_crs_btn is not None and clicked == set_crs_btn:
+            return "set_crs"
         if clicked == cancel_btn:
             return "cancel"
         if compatible_btn is not None and clicked == compatible_btn:

@@ -21,6 +21,8 @@ import numpy as np
 
 from .gpr_las_slicer import (
     _bin_with_idw,
+    _idw_gather,
+    _apply_idw,
     _write_qml_multiband,
     _write_tif_rgb,
     _write_tif_singleband,
@@ -441,9 +443,14 @@ def _slice_arrays_to_tifs(
         min_points=min_points,
     )
 
-    z_levels = np.arange(float(z_min), float(z_max) + float(z_step) * 0.5, float(z_step))
+    # Slice centers tile [z_min, z_max], coherent with the LAS/PDAL paths.
+    z_centers = np.arange(
+        float(z_min) + float(z_step) / 2.0, float(z_max), float(z_step)
+    )
+    if z_centers.size == 0:
+        z_centers = np.array([(float(z_min) + float(z_max)) / 2.0])
     results = []
-    for iz, z_lev in enumerate(z_levels):
+    for iz, z_lev in enumerate(z_centers):
         z_from = float(z_lev - z_step / 2.0)
         z_to = float(z_lev + z_step / 2.0)
         mask = (z >= z_from) & (z < z_to)
@@ -458,12 +465,11 @@ def _slice_arrays_to_tifs(
             if r_values is None or g_values is None or b_values is None:
                 raise RuntimeError("RGB values are missing for value_field='rgb'.")
 
-            def _ch(ch_arr):
-                return _bin_with_idw(x[mask], y[mask], ch_arr[mask], **kw)
-
-            r_grid = _ch(r_values)
-            g_grid = _ch(g_values)
-            b_grid = _ch(b_values)
+            # Build the KD-tree / weights once, reuse for the 3 channels.
+            gather = _idw_gather(x[mask], y[mask], **kw)
+            r_grid = _apply_idw(gather, r_values[mask], n_x, n_y)
+            g_grid = _apply_idw(gather, g_values[mask], n_x, n_y)
+            b_grid = _apply_idw(gather, b_values[mask], n_x, n_y)
             ranges = _write_tif_rgb(
                 r_grid,
                 g_grid,
@@ -662,9 +668,11 @@ def slice_csv_to_tifs(
             if use_rgb:
                 if pr.size == 0 or pg.size == 0 or pb.size == 0:
                     continue
-                r_grid = _bin_with_idw(px, py, pr, **kw)
-                g_grid = _bin_with_idw(px, py, pg, **kw)
-                b_grid = _bin_with_idw(px, py, pb, **kw)
+                # Build the KD-tree / weights once, reuse for the 3 channels.
+                gather = _idw_gather(px, py, **kw)
+                r_grid = _apply_idw(gather, pr, n_x, n_y)
+                g_grid = _apply_idw(gather, pg, n_x, n_y)
+                b_grid = _apply_idw(gather, pb, n_x, n_y)
                 ranges = _write_tif_rgb(
                     r_grid,
                     g_grid,

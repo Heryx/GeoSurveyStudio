@@ -32,7 +32,7 @@ class TableModelsTest(unittest.TestCase):
         model.set_rows(rows)
 
         self.assertEqual(model.rowCount(), 1)
-        self.assertEqual(model.columnCount(), 6)
+        self.assertEqual(model.columnCount(), 7)
 
         idx_trace = model.index(0, 1)
         self.assertEqual(model.data(idx_trace, Qt.DisplayRole), "tr_007")

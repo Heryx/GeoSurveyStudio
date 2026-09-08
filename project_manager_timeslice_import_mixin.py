@@ -119,9 +119,20 @@ class ProjectManagerTimesliceImportMixin:
         if not layer.isValid():
             return {"is_valid_raster": False}
         extent = layer.extent()
+        crs_authid = layer.crs().authid() if layer.crs().isValid() else None
+        crs_assumed = False
+        if not crs_authid:
+            # World-file-only rasters (.tfw/.jgw/.wld) carry a valid affine
+            # transform but no CRS. Fall back to the configured import CRS so
+            # they are accepted instead of being rejected as "missing CRS".
+            preferred = self._get_preferred_import_crs()
+            if preferred is not None and preferred.isValid():
+                crs_authid = preferred.authid()
+                crs_assumed = True
         return {
             "is_valid_raster": True,
-            "crs": layer.crs().authid() if layer.crs().isValid() else None,
+            "crs": crs_authid,
+            "crs_assumed": crs_assumed,
             "width": layer.width(),
             "height": layer.height(),
             "band_count": layer.bandCount(),
@@ -141,6 +152,7 @@ class ProjectManagerTimesliceImportMixin:
         ymin = extent.get("ymin")
         ymax = extent.get("ymax")
         crs_authid = (meta.get("crs") or "").strip()
+        crs_assumed = bool(meta.get("crs_assumed"))
         project_crs = QgsProject.instance().crs()
 
         missing_crs = False
@@ -150,6 +162,8 @@ class ProjectManagerTimesliceImportMixin:
         if not crs_authid:
             missing_crs = True
             warnings.append("Missing CRS in raster metadata.")
+        elif crs_assumed:
+            warnings.append(f"No embedded CRS; will be assigned {crs_authid} on import.")
         elif project_crs.isValid() and crs_authid != project_crs.authid():
             crs_mismatch = True
             warnings.append(f"CRS mismatch: raster {crs_authid}, project {project_crs.authid()}.")
@@ -193,50 +207,70 @@ class ProjectManagerTimesliceImportMixin:
             return preferred
         return None
 
+    def _reinspect_timeslice_records(self, records):
+        """Re-run raster inspection on each record (e.g. after the import CRS changed)."""
+        for rec in records:
+            src = rec.get("source_path")
+            if not src:
+                continue
+            fresh = self._inspect_timeslice(src)
+            if fresh.get("is_valid_raster"):
+                rec["meta"] = fresh
+
     def _validate_timeslice_records_before_import(self, records, scope_label="selected images"):
         if not records:
             return records, 0, False
 
-        issue_rows = []
-        missing_crs_count = 0
-        mismatch_count = 0
-        suspicious_count = 0
+        while True:
+            issue_rows = []
+            missing_crs_count = 0
+            mismatch_count = 0
+            suspicious_count = 0
 
-        for rec in records:
-            meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
-            issues = self._timeslice_georef_issues(meta)
-            rec["warnings"] = list(issues.get("warnings") or [])
-            rec["issues"] = issues
-            if issues.get("missing_crs"):
-                missing_crs_count += 1
-            if issues.get("crs_mismatch"):
-                mismatch_count += 1
-            if issues.get("suspicious_extent"):
-                suspicious_count += 1
-            if issues.get("has_issue"):
-                issue_rows.append(rec)
+            for rec in records:
+                meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
+                issues = self._timeslice_georef_issues(meta)
+                rec["warnings"] = list(issues.get("warnings") or [])
+                rec["issues"] = issues
+                if issues.get("missing_crs"):
+                    missing_crs_count += 1
+                if issues.get("crs_mismatch"):
+                    mismatch_count += 1
+                if issues.get("suspicious_extent"):
+                    suspicious_count += 1
+                if issues.get("has_issue"):
+                    issue_rows.append(rec)
 
-        if not issue_rows:
-            return records, 0, False
+            if not issue_rows:
+                return records, 0, False
 
-        project_crs_authid = ""
-        try:
-            prj = QgsProject.instance().crs()
-            if prj is not None and prj.isValid():
-                project_crs_authid = prj.authid()
-        except Exception:
             project_crs_authid = ""
+            try:
+                prj = QgsProject.instance().crs()
+                if prj is not None and prj.isValid():
+                    project_crs_authid = prj.authid()
+            except Exception:
+                project_crs_authid = ""
 
-        action = choose_timeslice_import_action(
-            parent=self,
-            records=records,
-            issue_rows=issue_rows,
-            missing_crs_count=missing_crs_count,
-            mismatch_count=mismatch_count,
-            suspicious_count=suspicious_count,
-            project_crs_authid=project_crs_authid,
-            scope_label=scope_label,
-        )
+            action = choose_timeslice_import_action(
+                parent=self,
+                records=records,
+                issue_rows=issue_rows,
+                missing_crs_count=missing_crs_count,
+                mismatch_count=mismatch_count,
+                suspicious_count=suspicious_count,
+                project_crs_authid=project_crs_authid,
+                import_crs_authid=(self._get_preferred_import_crs().authid()
+                                   if self._get_preferred_import_crs().isValid() else ""),
+                scope_label=scope_label,
+            )
+
+            if action == "set_crs":
+                # Let the user pick the import CRS now, then re-validate.
+                self._choose_default_import_crs()
+                self._reinspect_timeslice_records(records)
+                continue
+            break
 
         if action == "cancel":
             return records, 0, True

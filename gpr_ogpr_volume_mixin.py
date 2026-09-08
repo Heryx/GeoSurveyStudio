@@ -215,7 +215,8 @@ class GprOgprVolumeMixin:
 
             def _toggle(checked: bool):
                 content_widget.setVisible(bool(checked))
-                btn.setText(f"{'\u25bc' if checked else '\u25b6'}  {title}")
+                arrow = "\u25bc" if checked else "\u25b6"
+                btn.setText(f"{arrow}  {title}")
 
             btn.toggled.connect(_toggle)
             return btn, content_widget
@@ -404,7 +405,7 @@ class GprOgprVolumeMixin:
         if not profiles:
             QMessageBox.information(
                 getattr(self, "dlg", None), "Nessun profilo",
-                "Importa almeno un file .ogpr prima di creare le timeslice.",
+                "Importa almeno un profilo (.ogpr o .DT) prima di creare le timeslice.",
             )
             return
         if bool(getattr(self, "_ogpr_slice_task_active", False)):

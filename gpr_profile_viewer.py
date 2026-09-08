@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 GPR Profile Viewer
 ==================
@@ -17,7 +17,7 @@ from typing import Optional
 
 import numpy as np
 
-from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal, QSettings
+from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal, QSettings, QThread, QObject
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QDialog, QMainWindow, QVBoxLayout, QHBoxLayout, QToolBar,
@@ -31,6 +31,7 @@ from qgis.PyQt.QtWidgets import (
     QInputDialog,
     QFileDialog, QMessageBox, QSizePolicy,
     QGroupBox, QFormLayout, QPushButton, QDialogButtonBox, QScrollArea, QDockWidget, QLineEdit,
+    QProgressBar,
 )
 from qgis.core import (
     Qgis,
@@ -60,13 +61,26 @@ except ImportError:
     HAS_MPL = False
 
 from .gpr_ogpr_reader import read_ogpr_cached, OgprProfile, OgprChannel
+from .gpr_raw_format_registry import detect_and_read, sidecar_paths, import_dialog_filter
+from .gpr_manual_positioning_dialog import GprManualPositioningDialog, check_profiles_have_gps
 from .gpr_processing import (
     apply_pipeline,
     DEFAULT_PIPELINE,
     DEFAULT_CHAIN_ORDER,
     FILTER_REGISTRY,
     normalize_display,
+    _normalize_display_vmax,
     manual_gain,
+    auto_tune_params,
+    log_exception,
+    LOG_FILE_PATH,
+)
+from .gpr_npz_io import (
+    save_processed_profile_npz,
+    load_processed_profile_npz,
+    write_variant_manifest,
+    read_variant_manifest,
+    list_variants,
 )
 
 try:
@@ -361,6 +375,42 @@ class _RangeGainCurveDialog(QDialog):
         self._redraw()
 
 
+class _PreviewSliceWorker(QObject):
+    """Esegue compute_timeslice_preview() su un thread separato dalla GUI.
+
+    Evita il blocco del thread principale (che produce il cursore "in
+    caricamento" permanente di Windows/Qt) durante il preview live delle
+    timeslice.
+    """
+
+    finished = pyqtSignal(int, object, object, str)  # request_id, grid, extent, error
+
+    def __init__(self, request_id: int, profiles, z_from, z_to, resolution, chain_order, kwargs):
+        super().__init__()
+        self._request_id = int(request_id)
+        self._profiles = profiles
+        self._z_from = z_from
+        self._z_to = z_to
+        self._resolution = resolution
+        self._chain_order = chain_order
+        self._kwargs = kwargs
+
+    def run(self):
+        try:
+            from .gpr_ogpr_slicer import compute_timeslice_preview
+            grid, extent = compute_timeslice_preview(
+                profiles=self._profiles,
+                z_from=self._z_from,
+                z_to=self._z_to,
+                resolution=self._resolution,
+                chain_order=self._chain_order,
+                **self._kwargs,
+            )
+            self.finished.emit(self._request_id, grid, extent, "")
+        except Exception as exc:
+            self.finished.emit(self._request_id, None, None, str(exc))
+
+
 class GprProfileViewer(QMainWindow):
     cursor_moved = pyqtSignal(float, float, float)  # easting, northing, depth
 
@@ -399,6 +449,7 @@ class GprProfileViewer(QMainWindow):
         self._trim_start_traces = 0
         self._trim_end_traces = 0
         self._trace_source_indices: Optional[np.ndarray] = None
+        self._stage_cache: dict = {}
         self._bp_figure = None
         self._bp_ax = None
         self._bp_canvas = None
@@ -434,6 +485,7 @@ class GprProfileViewer(QMainWindow):
         self._last_pipeline_params: dict = {}
         self._filter_chain_widget = None
         self._filter_chain_blocks: dict[str, object] = {}
+        self._phase1_controls: dict[str, dict] = {}
         self._syncing_filter_chain = False
         self._preview_mode_active: bool = False
         self._preview_slice_grid: Optional[np.ndarray] = None
@@ -441,6 +493,11 @@ class GprProfileViewer(QMainWindow):
         self._preview_slice_z_from: Optional[float] = None
         self._preview_slice_z_to: Optional[float] = None
         self._preview_signature: Optional[tuple] = None
+        self._preview_busy: bool = False
+        self._preview_request_id: int = 0
+        self._preview_thread: Optional[QThread] = None
+        self._preview_worker: Optional[_PreviewSliceWorker] = None
+        self._preview_pending_zwindow: tuple[float, float] = (0.0, 0.0)
         self._profile_view_initialized: bool = True
         self._allow_close: bool = False
 
@@ -635,7 +692,7 @@ class GprProfileViewer(QMainWindow):
         root = QVBoxLayout(central)
 
         tb = QToolBar()
-        act_open = QAction("\U0001f4c2  Importa .ogpr", self)
+        act_open = QAction("\U0001f4c2  Importa profili", self)
         act_open.triggered.connect(self.import_files)
         tb.addAction(act_open)
 
@@ -734,6 +791,15 @@ class GprProfileViewer(QMainWindow):
         act_view3d.setToolTip("Apri il viewer 3D delle timeslice.")
         act_view3d.triggered.connect(self._open_3d_viewer)
         tb.addAction(act_view3d)
+
+        tb.addSeparator()
+        act_manual_pos = QAction("\U0001f4cd Posizionamento Griglia", self)
+        act_manual_pos.setToolTip(
+            "Apri il dialog di posizionamento manuale della griglia di rilievo\n"
+            "(profili senza GPS: assegna coordinate, gestisci zig-zag, rinomina)."
+        )
+        act_manual_pos.triggered.connect(self._open_manual_positioning_dialog)
+        tb.addAction(act_manual_pos)
 
         root.addWidget(tb)
 
@@ -1055,12 +1121,22 @@ class GprProfileViewer(QMainWindow):
             pass
 
         m_file = mb.addMenu("File")
-        act_import = QAction("Importa .ogpr...", self)
+        act_new_proj = QAction("Nuovo progetto GPR...", self)
+        act_new_proj.setShortcut("Ctrl+N")
+        act_new_proj.triggered.connect(self._new_gpr_project)
+        m_file.addAction(act_new_proj)
+
+        act_open_proj = QAction("Apri progetto GPR...", self)
+        act_open_proj.triggered.connect(self._open_gpr_project)
+        m_file.addAction(act_open_proj)
+        m_file.addSeparator()
+
+        act_import = QAction("Importa profili...", self)
         act_import.setShortcut("Ctrl+O")
         act_import.triggered.connect(self.import_files)
         m_file.addAction(act_import)
 
-        act_import_saved = QAction("Importa progetto GPR salvato", self)
+        act_import_saved = QAction("Ricarica ultimo progetto GPR", self)
         act_import_saved.triggered.connect(lambda: self._try_import_saved_gpr_processing_project(force=True))
         m_file.addAction(act_import_saved)
 
@@ -1140,6 +1216,16 @@ class GprProfileViewer(QMainWindow):
         act_gain.triggered.connect(self._apply_gain_only)
         m_proc.addAction(act_gain)
 
+        m_proc.addSeparator()
+        act_save_variant = QAction("Salva variante processata (.npz)...", self)
+        act_save_variant.triggered.connect(self._save_processed_variant)
+        m_proc.addAction(act_save_variant)
+
+        act_slice_variant = QAction("Time-slice da variante processata...", self)
+        act_slice_variant.triggered.connect(self._build_slices_from_variant)
+        m_proc.addAction(act_slice_variant)
+        m_proc.addSeparator()
+
         act_save_preset = QAction("Salva preset gain/hyperbola...", self)
         act_save_preset.triggered.connect(self._save_gain_hyper_preset)
         m_proc.addAction(act_save_preset)
@@ -1182,11 +1268,141 @@ class GprProfileViewer(QMainWindow):
             "dewow": "Rimuove la componente lenta/DC della traccia.",
             "bandpass": "Applica filtro passa-banda in frequenza.",
             "bg_removal": "Sottrae il clutter orizzontale (background).",
+            "migration": "Migrazione 2D F-K (Stolt) per collassare le iperboli di diffrazione.",
             "pre_agc_gain": "Range gain applicato prima dell'AGC.",
             "agc": "Equalizza dinamicamente l'ampiezza con finestra locale.",
             "envelope": "Converte il segnale in inviluppo Hilbert (solo ampiezza).",
+            "dcshift": "Sottrae da ogni traccia la sua media (valore costante, non mobile).",
+            "boxcar": "Lisciatura boxcar 2D (media non pesata) su tracce e/o campioni.",
+            "notch": "Attenua una banda di frequenza stretta centrata su freq (MHz).",
+            "whiten": "Whitening spettrale: |X(f)|=1 nella banda, fase preservata.",
+            "amp_eq": "Equalizzazione d'ampiezza: gain = scala_ref / RMS(finestra mobile).",
+            "rad_threshold": "Azzera i campioni la cui ampiezza sta dentro le soglie.",
+            "power_gain": "Range gain analitico: potenza t^a o esponenziale exp(a*t).",
         }
         return txt.get(str(step_id), "")
+
+    # Spec dei controlli per i filtri Fase 1 (costruiti in modo generico).
+    # Ogni voce: (param_key, etichetta, tipo, *args)
+    #   int   -> (min, max, default)
+    #   float -> (min, max, default, decimali, step)
+    #   choice-> (lista_opzioni, default)
+    _PHASE1_STEP_IDS = (
+        "dcshift", "boxcar", "notch", "whiten", "amp_eq", "rad_threshold", "power_gain",
+    )
+    _PHASE1_SPECS = {
+        "dcshift": [
+            ("dcshift_sample_start", "Da campione:", "int", 0, 99999, 0),
+            ("dcshift_sample_end", "A campione (0=fine):", "int", 0, 99999, 0),
+        ],
+        "boxcar": [
+            ("boxcar_width", "Semi-ampiezza tracce:", "int", 0, 64, 3),
+            ("boxcar_height", "Semi-ampiezza campioni:", "int", 0, 256, 3),
+        ],
+        "notch": [
+            ("notch_freq_mhz", "Freq centrale (MHz):", "float", 0.0, 3000.0, 0.0, 1, 5.0),
+            ("notch_bw_mhz", "Larghezza banda (MHz):", "float", 1.0, 2000.0, 50.0, 1, 5.0),
+        ],
+        "whiten": [
+            ("whiten_low_mhz", "Low (MHz, 0=auto):", "float", 0.0, 3000.0, 0.0, 1, 5.0),
+            ("whiten_high_mhz", "High (MHz, 0=auto):", "float", 0.0, 3000.0, 0.0, 1, 5.0),
+            ("whiten_gain", "Gain (divisore):", "float", 0.1, 1000.0, 20.0, 2, 1.0),
+        ],
+        "amp_eq": [
+            ("amp_eq_window", "Finestra (campioni):", "int", 4, 8192, 120),
+            ("amp_eq_gain", "Gain:", "float", 0.01, 100.0, 1.0, 2, 0.1),
+        ],
+        "rad_threshold": [
+            ("rad_thr_neg", "Soglia neg (0..1):", "float", 0.0, 1.0, 0.0, 3, 0.01),
+            ("rad_thr_pos", "Soglia pos (0..1):", "float", 0.0, 1.0, 0.0, 3, 0.01),
+        ],
+        "power_gain": [
+            ("power_gain_mode", "Modo:", "choice", ["power", "exp"], "power"),
+            ("power_gain_exp", "Esponente a:", "float", -5.0, 5.0, 1.0, 2, 0.1),
+            ("power_gain_t0_ns", "t0 (ns):", "float", 0.0, 5000.0, 0.0, 1, 1.0),
+            ("power_gain_scale", "Scala:", "float", 0.01, 100.0, 1.0, 2, 0.1),
+        ],
+    }
+
+    def _on_phase1_control_changed(self, step_id: str):
+        """Riapplica la pipeline quando cambia un parametro di un filtro Fase 1."""
+        if getattr(self, "_syncing_filter_chain", False):
+            return
+        enabled = {}
+        if self._is_qt_alive(getattr(self, "_filter_chain_widget", None)):
+            try:
+                enabled = dict(self._filter_chain_widget.get_enabled_map() or {})
+            except Exception:
+                enabled = {}
+        if bool(enabled.get(str(step_id), False)) and self._raw_data is not None:
+            self._apply_processing()
+            self._request_preview_update(immediate=False)
+
+    def _build_phase1_step_controls(self, step_id: str):
+        sid = str(step_id or "").strip().lower()
+        spec = self._PHASE1_SPECS.get(sid)
+        host = QWidget()
+        fl = QFormLayout(host)
+        fl.setContentsMargins(0, 0, 0, 0)
+        fl.setSpacing(4)
+        if not spec:
+            fl.addRow(QLabel("Nessun comando disponibile."))
+            return host
+        store = self._phase1_controls.setdefault(sid, {})
+        for row in spec:
+            key, label, kind = row[0], row[1], row[2]
+            w = store.get(key)
+            if w is None or not self._is_qt_alive(w):
+                if kind == "int":
+                    _mn, _mx, _dv = row[3], row[4], row[5]
+                    w = QSpinBox()
+                    w.setRange(int(_mn), int(_mx))
+                    w.setValue(int(_dv))
+                    w.setKeyboardTracking(False)
+                    w.valueChanged.connect(
+                        lambda _v, s=sid: self._on_phase1_control_changed(s)
+                    )
+                elif kind == "float":
+                    _mn, _mx, _dv, _dec, _step = row[3], row[4], row[5], row[6], row[7]
+                    w = QDoubleSpinBox()
+                    w.setRange(float(_mn), float(_mx))
+                    w.setDecimals(int(_dec))
+                    w.setSingleStep(float(_step))
+                    w.setValue(float(_dv))
+                    w.setKeyboardTracking(False)
+                    w.valueChanged.connect(
+                        lambda _v, s=sid: self._on_phase1_control_changed(s)
+                    )
+                elif kind == "choice":
+                    _opts, _dv = row[3], row[4]
+                    w = QComboBox()
+                    for opt in _opts:
+                        w.addItem(str(opt), str(opt))
+                    idx = w.findData(str(_dv))
+                    w.setCurrentIndex(idx if idx >= 0 else 0)
+                    w.currentIndexChanged.connect(
+                        lambda _i, s=sid: self._on_phase1_control_changed(s)
+                    )
+                else:
+                    continue
+                store[key] = w
+            fl.addRow(label, w)
+        return host
+
+    def _phase1_params(self) -> dict:
+        """Valori correnti dei controlli Fase 1 (solo i parametri, non gli enable)."""
+        out: dict = {}
+        for sid, store in self._phase1_controls.items():
+            for key, w in store.items():
+                if not self._is_qt_alive(w):
+                    continue
+                if isinstance(w, QComboBox):
+                    out[key] = str(w.currentData() or w.currentText())
+                elif isinstance(w, QSpinBox):
+                    out[key] = int(w.value())
+                elif isinstance(w, QDoubleSpinBox):
+                    out[key] = float(w.value())
+        return out
 
     def _build_pipeline_step_controls(self, step_id: str):
         sid = str(step_id or "").strip().lower()
@@ -1207,6 +1423,7 @@ class GprProfileViewer(QMainWindow):
             return host
 
         if sid == "bg_removal":
+            fl.addRow("Metodo:", self._cb_bg_method)
             fl.addRow("Modo:", self._cb_bg_mode)
             fl.addRow("Auto:", self._chk_bg_auto)
             fl.addRow("Finestra:", self._spin_bg_window)
@@ -1217,12 +1434,26 @@ class GprProfileViewer(QMainWindow):
         if sid == "bandpass":
             fl.addRow("Low (MHz):", self._spin_bp_lo)
             fl.addRow("High (MHz):", self._spin_bp_hi)
+            fl.addRow("Taper (roll-off):", self._spin_bp_taper)
             if HAS_MPL and self._is_qt_alive(getattr(self, "_bp_canvas", None)):
-                fl.addRow("Spettro:", self._bp_canvas)
+                fl.addRow(QLabel("Spettro:"))
+                fl.addRow(self._bp_canvas)
+            return host
+
+        if sid == "migration":
+            fl.addRow("Velocita' (m/s):", self._spin_mig_vel)
+            fl.addRow("RDP (\u03b5r):", self._spin_mig_rdp)
+            fl.addRow("dx tracce (m):", self._spin_mig_dx)
+            fl.addRow(self._btn_sync_mig_vel)
             return host
 
         if sid == "agc":
             fl.addRow("Finestra:", self._spin_agc)
+            fl.addRow("Max Gain (0=auto):", self._spin_agc_max_gain)
+            agc_s0_row = QHBoxLayout()
+            agc_s0_row.addWidget(self._spin_agc_sample_start)
+            agc_s0_row.addWidget(self._btn_pick_agc_s0)
+            fl.addRow("Da campione:", agc_s0_row)
             return host
 
         if sid == "envelope":
@@ -1244,6 +1475,9 @@ class GprProfileViewer(QMainWindow):
             fl.addRow("Da campione:", self._spin_manual_gain_sample_start)
             fl.addRow("A campione (0=fine):", self._spin_manual_gain_sample_end)
             return host
+
+        if sid in self._PHASE1_SPECS:
+            return self._build_phase1_step_controls(sid)
 
         lbl = QLabel("Nessun comando disponibile.")
         lbl.setWordWrap(True)
@@ -1272,6 +1506,15 @@ class GprProfileViewer(QMainWindow):
                         pass
                 chain.add_block(block)
                 blocks[sid] = block
+            # I filtri Fase 1 partono disattivati: il resto della UI non ha
+            # un _chk_* corrispondente, quindi la casella del blocco stesso e'
+            # l'unica sorgente di verita' del loro stato enable.
+            try:
+                chain.set_enabled_map(
+                    {sid: False for sid in self._PHASE1_STEP_IDS}, emit_signal=False
+                )
+            except Exception:
+                pass
             chain.chain_changed.connect(self._on_filter_chain_widget_changed)
             self._filter_chain_widget = chain
             self._filter_chain_blocks = blocks
@@ -1364,6 +1607,15 @@ class GprProfileViewer(QMainWindow):
         grp = QGroupBox("Processing")
         fl  = QFormLayout(grp)
 
+        # Auto-tune
+        self._btn_auto_tune = QPushButton("Auto-tune parametri")
+        self._btn_auto_tune.setToolTip(
+            "Analizza i profili caricati e suggerisce i parametri ottimali.\n"
+            "Mostra un'anteprima con i valori calcolati prima di applicarli."
+        )
+        self._btn_auto_tune.clicked.connect(self._on_auto_tune)
+        fl.addRow(self._btn_auto_tune)
+
         # Dewow
         self._chk_dewow  = QCheckBox(); self._chk_dewow.setChecked(False)
         self._spin_dewow = QSpinBox();  self._spin_dewow.setRange(4, 256); self._spin_dewow.setValue(16)
@@ -1402,8 +1654,18 @@ class GprProfileViewer(QMainWindow):
         self._chk_bg = QCheckBox()
         self._chk_bg.setChecked(False)
         self._chk_bg.setToolTip(
-            "Background Removal: sottrae la traccia media per eliminare banding orizzontale.\n\n"
+            "Background Removal: sottrae la traccia media o mediana per eliminare banding orizzontale.\n\n"
             "ATTENZIONE: rimuove anche riflessi reali paralleli al profilo."
+        )
+
+        self._cb_bg_method = QComboBox()
+        self._cb_bg_method.addItem("Media (standard)", "mean")
+        self._cb_bg_method.addItem("Mediana (robusta)", "median")
+        self._cb_bg_method.setCurrentIndex(0)
+        self._cb_bg_method.setEnabled(False)
+        self._cb_bg_method.setToolTip(
+            "Media   : sottrae la media aritmetica (standard).\n"
+            "Mediana : sottrae la mediana (robusta: evita ombre scure intorno a forti bersagli)."
         )
 
         self._cb_bg_mode = QComboBox()
@@ -1412,8 +1674,8 @@ class GprProfileViewer(QMainWindow):
         self._cb_bg_mode.setCurrentIndex(0)
         self._cb_bg_mode.setEnabled(False)
         self._cb_bg_mode.setToolTip(
-            "line_by_line : media calcolata su ogni singolo radargram.\n"
-            "grid_by_grid : media calcolata su tutti i radargram del grid\n"
+            "line_by_line : media/mediana calcolata su ogni singolo radargram.\n"
+            "grid_by_grid : media/mediana calcolata su tutti i radargram del grid\n"
             "               (due passate: pre-BG + sottrazione globale)."
         )
 
@@ -1421,7 +1683,7 @@ class GprProfileViewer(QMainWindow):
         self._chk_bg_auto.setChecked(True)
         self._chk_bg_auto.setEnabled(False)
         self._chk_bg_auto.setToolTip(
-            "Auto: sottrae la media dell'intero profilo (filter_length=99000).\n"
+            "Auto: sottrae la media/mediana dell'intero profilo (filter_length=99000).\n"
             "Disabilita per usare una finestra scorrevole personalizzata."
         )
 
@@ -1430,7 +1692,7 @@ class GprProfileViewer(QMainWindow):
         self._spin_bg_window.setValue(200)
         self._spin_bg_window.setEnabled(False)
         self._spin_bg_window.setToolTip(
-            "Lunghezza del filtro in tracce (media scorrevole).\n"
+            "Lunghezza del filtro in tracce (finestra scorrevole).\n"
             "Attivo solo se Auto e' disabilitato."
         )
 
@@ -1460,6 +1722,7 @@ class GprProfileViewer(QMainWindow):
             self._spin_bg_window.setEnabled(not auto_checked)
 
         def _toggle_bg(bg_checked):
+            self._cb_bg_method.setEnabled(bg_checked)
             self._cb_bg_mode.setEnabled(bg_checked)
             self._chk_bg_auto.setEnabled(bg_checked)
             self._spin_bg_sample_start.setEnabled(bg_checked)
@@ -1471,21 +1734,166 @@ class GprProfileViewer(QMainWindow):
 
         self._chk_bg.toggled.connect(_toggle_bg)
         self._chk_bg_auto.toggled.connect(_toggle_bg_auto)
+        self._cb_bg_method.currentIndexChanged.connect(
+            lambda _i: self._apply_processing() if self._chk_bg.isChecked() and self._raw_data is not None else None
+        )
 
+        # ------------------------------------------------------------------
+        # Migration 2D F-K (Stolt)
+        # ------------------------------------------------------------------
+        self._chk_mig = QCheckBox()
+        self._chk_mig.setChecked(False)
+        self._chk_mig.setToolTip("Migrazione 2D F-K (Stolt) per collassare le iperboli di diffrazione.")
+
+        self._spin_mig_vel = QDoubleSpinBox()
+        self._spin_mig_vel.setRange(1e6, 3e8)
+        self._spin_mig_vel.setSingleStep(1e6)
+        self._spin_mig_vel.setValue(1e8)
+        self._spin_mig_vel.setDecimals(0)
+        self._spin_mig_vel.setEnabled(False)
+        self._spin_mig_vel.setToolTip("Velocita' di propagazione nel mezzo in m/s (es. 100,000,000 = 0.10 m/ns).")
+
+        self._spin_mig_rdp = QDoubleSpinBox()
+        self._spin_mig_rdp.setRange(1.0, 81.0)
+        self._spin_mig_rdp.setSingleStep(0.5)
+        self._spin_mig_rdp.setValue(9.0)
+        self._spin_mig_rdp.setDecimals(1)
+        self._spin_mig_rdp.setEnabled(False)
+        self._spin_mig_rdp.setToolTip("Costante dielettrica relativa (RDP \u03b5r). Sincronizzata con la velocita'.")
+
+        self._spin_mig_dx = QDoubleSpinBox()
+        self._spin_mig_dx.setRange(0.001, 10.0)
+        self._spin_mig_dx.setSingleStep(0.01)
+        self._spin_mig_dx.setValue(0.05)
+        self._spin_mig_dx.setDecimals(3)
+        self._spin_mig_dx.setEnabled(False)
+        self._spin_mig_dx.setToolTip("Spaziatura orizzontale media tra le tracce in metri.")
+
+        self._btn_sync_mig_vel = QPushButton("Usa velocita' iperbole")
+        self._btn_sync_mig_vel.setEnabled(False)
+        self._btn_sync_mig_vel.setToolTip("Copia il valore di RDP/velocita' ricavato dal fit iperbolico.")
+
+        def _on_mig_vel_changed(val: float):
+            rdp = (299792458.0 / max(float(val), 1e3)) ** 2
+            self._spin_mig_rdp.blockSignals(True)
+            try:
+                self._spin_mig_rdp.setValue(float(np.clip(rdp, 1.0, 81.0)))
+            finally:
+                self._spin_mig_rdp.blockSignals(False)
+            if self._chk_mig.isChecked() and self._raw_data is not None:
+                self._apply_processing()
+
+        def _on_mig_rdp_changed(val: float):
+            v = 299792458.0 / np.sqrt(max(float(val), 1.0))
+            self._spin_mig_vel.blockSignals(True)
+            try:
+                self._spin_mig_vel.setValue(float(np.clip(v, 1e6, 3e8)))
+            finally:
+                self._spin_mig_vel.blockSignals(False)
+            if self._chk_mig.isChecked() and self._raw_data is not None:
+                self._apply_processing()
+
+        def _sync_mig_vel():
+            try:
+                rdp_fit = float(self._spin_hyperbola_rdp.value())
+                self._spin_mig_rdp.setValue(rdp_fit)
+            except Exception:
+                pass
+
+        def _toggle_mig(mig_checked):
+            self._spin_mig_vel.setEnabled(mig_checked)
+            self._spin_mig_rdp.setEnabled(mig_checked)
+            self._spin_mig_dx.setEnabled(mig_checked)
+            self._btn_sync_mig_vel.setEnabled(mig_checked)
+            if self._raw_data is not None:
+                self._apply_processing()
+
+        self._spin_mig_vel.valueChanged.connect(_on_mig_vel_changed)
+        self._spin_mig_rdp.valueChanged.connect(_on_mig_rdp_changed)
+        self._spin_mig_dx.valueChanged.connect(
+            lambda _v: self._apply_processing() if self._chk_mig.isChecked() and self._raw_data is not None else None
+        )
+        self._btn_sync_mig_vel.clicked.connect(_sync_mig_vel)
+        self._chk_mig.toggled.connect(_toggle_mig)
+
+        # ------------------------------------------------------------------
         # AGC
+        # ------------------------------------------------------------------
         self._chk_agc  = QCheckBox(); self._chk_agc.setChecked(False)
         self._spin_agc = QSpinBox();  self._spin_agc.setRange(8, 512); self._spin_agc.setValue(128)
+        self._spin_agc_max_gain = QDoubleSpinBox()
+        self._spin_agc_max_gain.setRange(0.0, 1000.0)
+        self._spin_agc_max_gain.setValue(0.0)
+        self._spin_agc_max_gain.setSingleStep(5.0)
+        self._spin_agc_max_gain.setEnabled(False)
+        self._spin_agc_max_gain.setToolTip(
+            "Limite massimo fattore di guadagno (0 = illimitato/automatico).\n"
+            "Previene l'amplificazione eccessiva del rumore di fondo nelle zone profonde."
+        )
+        self._spin_agc_sample_start = QSpinBox()
+        self._spin_agc_sample_start.setRange(0, 9999)
+        self._spin_agc_sample_start.setValue(0)
+        self._spin_agc_sample_start.setEnabled(False)
+        self._spin_agc_sample_start.setToolTip(
+            "Primo campione su cui applicare l'AGC (0 = dall'inizio).\n"
+            "I campioni precedenti vengono copiati invariati (gain=1).\n"
+            "Utile per escludere il burst superficiale (coupling antenna)."
+        )
+        # Stato pick-mode: nome del target attivo (es. 'agc_sample_start') o None
+        self._pick_mode_target: str | None = None
+
+        # Bottone pick creato una volta sola come singleton (come gli spinner)
+        self._btn_pick_agc_s0 = QPushButton("Seleziona")
+        self._btn_pick_agc_s0.setCheckable(True)
+        self._btn_pick_agc_s0.setEnabled(False)
+        self._btn_pick_agc_s0.setToolTip(
+            "Clicca qui, poi clicca sul profilo per impostare\n"
+            "il campione di inizio AGC dalla posizione del cursore."
+        )
+        self._btn_pick_agc_s0.toggled.connect(
+            lambda checked: self._set_pick_mode("agc_sample_start" if checked else None,
+                                                self._btn_pick_agc_s0)
+        )
+
+        def _toggle_agc(agc_checked):
+            self._spin_agc.setEnabled(agc_checked)
+            self._spin_agc_max_gain.setEnabled(agc_checked)
+            self._spin_agc_sample_start.setEnabled(agc_checked)
+            if self._is_qt_alive(self._btn_pick_agc_s0):
+                self._btn_pick_agc_s0.setEnabled(agc_checked)
+            if not agc_checked and self._pick_mode_target == "agc_sample_start":
+                self._set_pick_mode(None, None)
+
+        self._chk_agc.toggled.connect(_toggle_agc)
+        self._spin_agc_max_gain.valueChanged.connect(
+            lambda _v: self._apply_processing() if self._chk_agc.isChecked() and self._raw_data is not None else None
+        )
+        self._spin_agc_sample_start.valueChanged.connect(
+            lambda _v: self._apply_processing() if self._chk_agc.isChecked() and self._raw_data is not None else None
+        )
 
         # Bandpass
         self._chk_bp     = QCheckBox(); self._chk_bp.setChecked(False)
         self._spin_bp_lo = QDoubleSpinBox(); self._spin_bp_lo.setRange(1, 3000); self._spin_bp_lo.setValue(200)
         self._spin_bp_hi = QDoubleSpinBox(); self._spin_bp_hi.setRange(1, 3000); self._spin_bp_hi.setValue(1200)
+        self._spin_bp_taper = QDoubleSpinBox()
+        self._spin_bp_taper.setRange(0.0, 50.0)
+        self._spin_bp_taper.setSingleStep(1.0)
+        self._spin_bp_taper.setValue(12.0)
+        self._spin_bp_taper.setSuffix(" %")
+        self._spin_bp_taper.setToolTip(
+            "Roll-off coseno per lato, in % della banda.\n"
+            "0 % = taglio netto (piu' ringing), 12 % = default storico,\n"
+            "50 % = finestra di Hann completa (transizione morbida)."
+        )
         # Avoid transient low/high resets while typing (e.g. "1200" passes through 1->12->120).
         self._spin_bp_lo.setKeyboardTracking(False)
         self._spin_bp_hi.setKeyboardTracking(False)
+        self._spin_bp_taper.setKeyboardTracking(False)
         self._chk_bp.toggled.connect(self._on_bp_controls_changed)
         self._spin_bp_lo.valueChanged.connect(self._on_bp_spin_changed)
         self._spin_bp_hi.valueChanged.connect(self._on_bp_spin_changed)
+        self._spin_bp_taper.valueChanged.connect(self._on_bp_spin_changed)
 
         # Envelope
         self._chk_envelope = QCheckBox()
@@ -1646,7 +2054,21 @@ class GprProfileViewer(QMainWindow):
         self._spin_hyperbola_rdp.setSingleStep(0.1)
         self._spin_hyperbola_rdp.setValue(9.0)
         self._spin_hyperbola_rdp.setEnabled(False)
+        self._spin_hyperbola_txrx = QDoubleSpinBox()
+        self._spin_hyperbola_txrx.setRange(0.0, 3.0)
+        self._spin_hyperbola_txrx.setSingleStep(0.02)
+        self._spin_hyperbola_txrx.setDecimals(3)
+        self._spin_hyperbola_txrx.setValue(0.0)
+        self._spin_hyperbola_txrx.setSuffix(" m")
+        self._spin_hyperbola_txrx.setEnabled(False)
+        self._spin_hyperbola_txrx.setKeyboardTracking(False)
+        self._spin_hyperbola_txrx.setToolTip(
+            "Separazione fissa antenna Tx-Rx (offset bistatico).\n"
+            "0 = antenna monostatica. Migliora la stima di velocita' su\n"
+            "iperboli poco profonde con antenne a offset noto."
+        )
         self._lbl_hyperbola_vel = QLabel("v=n/a")
+        self._lbl_hyperbola_depth = QLabel("d=n/a")
         self._btn_set_hyper_apex = QPushButton("Set apex from cursor")
         self._btn_set_hyper_apex.setEnabled(False)
         self._btn_hyper_auto_fit = QPushButton("Auto-fit RDP")
@@ -1656,6 +2078,7 @@ class GprProfileViewer(QMainWindow):
 
         def _toggle_hyperbola_controls(checked):
             self._spin_hyperbola_rdp.setEnabled(checked)
+            self._spin_hyperbola_txrx.setEnabled(checked)
             self._btn_set_hyper_apex.setEnabled(checked)
             self._btn_hyper_auto_fit.setEnabled(checked)
             self._btn_clear_hyper.setEnabled(checked)
@@ -1663,6 +2086,7 @@ class GprProfileViewer(QMainWindow):
 
         self._chk_hyperbola.toggled.connect(_toggle_hyperbola_controls)
         self._spin_hyperbola_rdp.valueChanged.connect(self._on_hyperbola_rdp_changed)
+        self._spin_hyperbola_txrx.valueChanged.connect(self._on_hyperbola_rdp_changed)
         self._btn_set_hyper_apex.clicked.connect(self._set_hyperbola_apex_from_cursor)
         self._btn_hyper_auto_fit.clicked.connect(self._auto_fit_hyperbola_rdp)
         self._btn_clear_hyper.clicked.connect(self._clear_hyperbola_apex)
@@ -1673,10 +2097,12 @@ class GprProfileViewer(QMainWindow):
         self._btn_load_gain_preset.clicked.connect(self._load_gain_hyper_preset)
 
         if HAS_MPL:
-            self._bp_figure = Figure(figsize=(3.2, 1.8), tight_layout=True)
+            self._bp_figure = Figure(figsize=(5.2, 3.0), tight_layout=True)
             self._bp_ax = self._bp_figure.add_subplot(111)
             self._bp_canvas = FigureCanvasQTAgg(self._bp_figure)
-            self._bp_canvas.setMinimumHeight(170)
+            self._bp_canvas.setMinimumHeight(280)
+            self._bp_canvas.setMinimumWidth(360)
+            self._bp_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self._bp_canvas.setToolTip(
                 "Bandpass spectrum:\n"
                 "click sinistro = low (MHz)\n"
@@ -1719,8 +2145,10 @@ class GprProfileViewer(QMainWindow):
         # Do not duplicate those widgets here, otherwise Qt reparents them and the
         # controls disappear from the pipeline block.
         fl.addRow("Hyperbola fit:",      self._chk_hyperbola)
-        fl.addRow("  RDP:",              self._spin_hyperbola_rdp)
+        fl.addRow("  RDP (εr):",     self._spin_hyperbola_rdp)
+        fl.addRow("  offset Tx-Rx:",     self._spin_hyperbola_txrx)
         fl.addRow("  velocity:",         self._lbl_hyperbola_vel)
+        fl.addRow("  depth target:",     self._lbl_hyperbola_depth)
         fl.addRow("  apex:",             self._btn_set_hyper_apex)
         fl.addRow("  auto-fit:",         self._btn_hyper_auto_fit)
         fl.addRow("  clear apex:",       self._btn_clear_hyper)
@@ -1968,7 +2396,9 @@ class GprProfileViewer(QMainWindow):
         self._spin_slice_blanking_m.setValue(0.30)
         self._spin_slice_blanking_m.setSuffix(" m")
         self._spin_slice_blanking_m.setToolTip(
-            "Celle oltre questa distanza dai dati reali diventano NoData (0=disattiva)."
+            "Celle oltre questa distanza dai dati reali diventano NoData (0=disattiva).\n"
+            "E' indipendente dal Search radius e ha sempre priorita': se e' piu' piccolo\n"
+            "del radius, limita comunque la copertura anche aumentando il radius."
         )
         self._spin_slice_idw_power = QSpinBox()
         self._spin_slice_idw_power.setRange(1, 4)
@@ -2037,6 +2467,11 @@ class GprProfileViewer(QMainWindow):
         self._btn_slice_advanced.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self._btn_slice_advanced.setText("▶ Avanzato")
 
+        # "raggio auto" non ha piu' effetto pratico (il raggio IDW viene gia'
+        # stimato dai dati quando Search radius = 0): widget tenuto in vita per
+        # compatibilita' con i preset, ma non piu' mostrato in UI.
+        self._chk_auto_radius.setVisible(False)
+
         self._slice_advanced_host = QWidget()
         fl_slice_adv = QFormLayout(self._slice_advanced_host)
         fl_slice_adv.setContentsMargins(0, 0, 0, 0)
@@ -2046,37 +2481,65 @@ class GprProfileViewer(QMainWindow):
         fl_slice_adv.addRow("Slice colormap:",     self._cb_slice_cmap)
         fl_slice_adv.addRow("Slice clip min %:",   self._spin_slice_vmin_pct)
         fl_slice_adv.addRow("Slice clip max %:",   self._spin_slice_vmax_pct)
-        fl_slice_adv.addRow("Estrazione:",         self._cb_slice_extraction)
-        fl_slice_adv.addRow("Usa Hilbert:",        self._chk_slice_use_hilbert)
-        fl_slice_adv.addRow("Processing pre-slice:", self._chk_slice_use_processing)
-        fl_slice_adv.addRow("BG pre-slice:",       self._chk_slice_bg)
-        fl_slice_adv.addRow("  modo BG:",          self._cb_slice_bg_mode)
-        fl_slice_adv.addRow("  auto BG:",          self._chk_slice_bg_auto)
-        fl_slice_adv.addRow("  finestra BG:",      self._spin_slice_bg_window)
-        fl_slice_adv.addRow("  BG da campione:",   self._spin_slice_bg_sample_start)
-        fl_slice_adv.addRow("  BG a campione:",    self._spin_slice_bg_sample_end)
-        fl_slice_adv.addRow("Trace stacking:",     self._spin_slice_stack_n)
-        fl_slice_adv.addRow("  kernel:",           self._cb_slice_stack_kernel)
-        fl_slice_adv.addRow("Flip pre-slice:",     self._cb_slice_flip_mode)
-        fl_slice_adv.addRow("Topographic corr.:",  self._chk_slice_topographic)
-        fl_slice_adv.addRow("  topo reference:",   self._cb_slice_topo_ref_mode)
-        fl_slice_adv.addRow("  custom elev:",      self._spin_slice_topo_ref_custom)
-        fl_slice_adv.addRow("Normalizza canali:",  self._chk_normalize_ch)
-        fl_slice_adv.addRow("Filtro ampiezza:",    self._chk_amplitude_filter)
-        fl_slice_adv.addRow("  sigma:",            self._spin_amplitude_sigma)
         fl_slice_adv.addRow("Potenza IDW (p):",    self._spin_slice_idw_power)
         fl_slice_adv.addRow("Overlap slice:",      self._spin_slice_overlap_pct)
         fl_slice_adv.addRow("Blanking (m):",       self._spin_slice_blanking_m)
-        fl_slice_adv.addRow("IDW anisotropo:",     self._chk_anisotropic_idw)
-        fl_slice_adv.addRow("  raggio auto:",      self._chk_auto_radius)
+        fl_slice_adv.addRow("BG pre-slice:",       self._chk_slice_bg)
         fl_slice_adv.addRow("Bilancia profili:",   self._chk_slice_balance_profiles)
-        fl_slice_adv.addRow("Raggio vs profondita':", self._spin_slice_depth_radius_factor)
-        fl_slice_adv.addRow("  min points:",       self._spin_slice_min_points)
-        fl_slice_adv.addRow("Profili paralleli:",  self._chk_slice_parallel_profiles)
-        fl_slice_adv.addRow("  workers (0=auto):", self._spin_slice_profile_workers)
         fl_slice_adv.addRow("Fill NoData:",        self._chk_fill_nodata)
         fl_slice_adv.addRow("Smooth gaussiano:",   self._chk_smooth)
         fl_slice_adv.addRow("  sigma:",            self._spin_smooth_sigma)
+
+        # --- Esperto: parametri di fine-tuning usati raramente. Restano allo
+        # stesso valore di default (= comportamento attuale) finche' questa
+        # sezione non viene esplicitamente abilitata; i preset "Qualita'" e
+        # "Aggressivo" la abilitano automaticamente perche' la richiedono.
+        self._btn_slice_expert = QToolButton()
+        self._btn_slice_expert.setCheckable(True)
+        self._btn_slice_expert.setChecked(False)
+        self._btn_slice_expert.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self._btn_slice_expert.setText("▶ Esperto")
+        self._btn_slice_expert.setToolTip(
+            "Parametri di fine-tuning raramente necessari.\n"
+            "Finche' non e' attivo, questi campi vengono ignorati e si usa il\n"
+            "comportamento di default (= come se questa sezione non esistesse)."
+        )
+
+        self._slice_expert_host = QWidget()
+        fl_slice_expert = QFormLayout(self._slice_expert_host)
+        fl_slice_expert.setContentsMargins(0, 0, 0, 0)
+        fl_slice_expert.setSpacing(4)
+        fl_slice_expert.addRow("Estrazione:",         self._cb_slice_extraction)
+        fl_slice_expert.addRow("Usa Hilbert:",        self._chk_slice_use_hilbert)
+        fl_slice_expert.addRow("Processing pre-slice:", self._chk_slice_use_processing)
+        fl_slice_expert.addRow("  modo BG:",          self._cb_slice_bg_mode)
+        fl_slice_expert.addRow("  auto BG:",          self._chk_slice_bg_auto)
+        fl_slice_expert.addRow("  finestra BG:",      self._spin_slice_bg_window)
+        fl_slice_expert.addRow("  BG da campione:",   self._spin_slice_bg_sample_start)
+        fl_slice_expert.addRow("  BG a campione:",    self._spin_slice_bg_sample_end)
+        fl_slice_expert.addRow("Trace stacking:",     self._spin_slice_stack_n)
+        fl_slice_expert.addRow("  kernel:",           self._cb_slice_stack_kernel)
+        fl_slice_expert.addRow("Flip pre-slice:",     self._cb_slice_flip_mode)
+        fl_slice_expert.addRow("Topographic corr.:",  self._chk_slice_topographic)
+        fl_slice_expert.addRow("  topo reference:",   self._cb_slice_topo_ref_mode)
+        fl_slice_expert.addRow("  custom elev:",      self._spin_slice_topo_ref_custom)
+        fl_slice_expert.addRow("Normalizza canali:",  self._chk_normalize_ch)
+        fl_slice_expert.addRow("Filtro ampiezza:",    self._chk_amplitude_filter)
+        fl_slice_expert.addRow("  sigma:",            self._spin_amplitude_sigma)
+        fl_slice_expert.addRow("IDW anisotropo:",     self._chk_anisotropic_idw)
+        fl_slice_expert.addRow("Raggio vs profondita':", self._spin_slice_depth_radius_factor)
+        fl_slice_expert.addRow("  min points:",       self._spin_slice_min_points)
+        fl_slice_expert.addRow("Profili paralleli:",  self._chk_slice_parallel_profiles)
+        fl_slice_expert.addRow("  workers (0=auto):", self._spin_slice_profile_workers)
+        self._slice_expert_host.setVisible(False)
+
+        def _toggle_slice_expert(checked: bool):
+            self._slice_expert_host.setVisible(bool(checked))
+            self._btn_slice_expert.setText(("▼ Esperto" if checked else "▶ Esperto"))
+
+        self._btn_slice_expert.toggled.connect(_toggle_slice_expert)
+        fl_slice_adv.addRow(self._btn_slice_expert)
+        fl_slice_adv.addRow(self._slice_expert_host)
         self._slice_advanced_host.setVisible(False)
 
         def _toggle_slice_advanced(checked: bool):
@@ -2086,6 +2549,32 @@ class GprProfileViewer(QMainWindow):
         self._btn_slice_advanced.toggled.connect(_toggle_slice_advanced)
         fl_slice.addRow(self._btn_slice_advanced)
         fl_slice.addRow(self._slice_advanced_host)
+
+        # Ogni controllo che influenza il calcolo della timeslice deve
+        # aggiornare il preview live: senza questo, cambiare es. Blanking o
+        # Search radius non ha alcun effetto visibile finche' non si
+        # disattiva/riattiva il Preview a mano.
+        _preview_value_widgets = (
+            self._cb_slice_idw_mode, self._spin_slice_search_radius, self._cb_slice_pipeline_source,
+            self._spin_slice_idw_power, self._spin_slice_blanking_m,
+            self._chk_slice_bg, self._chk_slice_balance_profiles, self._chk_fill_nodata,
+            self._chk_smooth, self._spin_smooth_sigma, self._btn_slice_expert,
+            self._cb_slice_extraction, self._chk_slice_use_hilbert, self._chk_slice_use_processing,
+            self._cb_slice_bg_mode, self._chk_slice_bg_auto, self._spin_slice_bg_window,
+            self._spin_slice_bg_sample_start, self._spin_slice_bg_sample_end,
+            self._spin_slice_stack_n, self._cb_slice_stack_kernel, self._cb_slice_flip_mode,
+            self._chk_slice_topographic, self._cb_slice_topo_ref_mode, self._spin_slice_topo_ref_custom,
+            self._chk_normalize_ch, self._chk_amplitude_filter, self._spin_amplitude_sigma,
+            self._chk_anisotropic_idw, self._spin_slice_depth_radius_factor, self._spin_slice_min_points,
+            self._chk_slice_parallel_profiles, self._spin_slice_profile_workers,
+        )
+        for _w in _preview_value_widgets:
+            if isinstance(_w, (QSpinBox, QDoubleSpinBox)):
+                _w.valueChanged.connect(lambda _v: self._request_preview_update(immediate=False))
+            elif isinstance(_w, QComboBox):
+                _w.currentIndexChanged.connect(lambda _v: self._request_preview_update(immediate=False))
+            elif isinstance(_w, (QCheckBox, QToolButton)):
+                _w.toggled.connect(lambda _v: self._request_preview_update(immediate=False))
 
         self._cb_preview_quality = QComboBox()
         self._cb_preview_quality.addItem("Bassa", "low")
@@ -2107,6 +2596,16 @@ class GprProfileViewer(QMainWindow):
         btn_preview.toggled.connect(self._on_toggle_preview_mode)
         self._btn_preview_slice = btn_preview
         fl_slice.addRow(btn_preview)
+
+        self._lbl_preview_status = QLabel("")
+        self._lbl_preview_status.setVisible(False)
+        self._progress_preview = QProgressBar()
+        self._progress_preview.setRange(0, 0)  # indeterminato: nessuna % reale disponibile
+        self._progress_preview.setMaximumHeight(10)
+        self._progress_preview.setTextVisible(False)
+        self._progress_preview.setVisible(False)
+        fl_slice.addRow(self._lbl_preview_status)
+        fl_slice.addRow(self._progress_preview)
 
         btn_slice = QPushButton("Salva gruppo")
         btn_slice.setToolTip(
@@ -2191,7 +2690,6 @@ class GprProfileViewer(QMainWindow):
         processing_scroll.setWidgetResizable(True)
         processing_scroll.setWidget(proc_content)
         processing_scroll.setMinimumWidth(250)
-        processing_scroll.setMaximumWidth(420)
 
         slice_content = QWidget()
         slice_layout = QVBoxLayout(slice_content)
@@ -2203,7 +2701,6 @@ class GprProfileViewer(QMainWindow):
         timeslice_scroll.setWidgetResizable(True)
         timeslice_scroll.setWidget(slice_content)
         timeslice_scroll.setMinimumWidth(270)
-        timeslice_scroll.setMaximumWidth(460)
 
         # Unified right panel: Process + Slicing tabs in a single dock.
         tabs = QTabWidget()
@@ -2410,29 +2907,97 @@ class GprProfileViewer(QMainWindow):
     # Import
     # ------------------------------------------------------------------
 
+    def _prompt_workspace_dir(self) -> None:
+        """Chiede all'utente dove salvare il workspace GPR (raw/processed/timeslices).
+
+        Imposta self._gpr_workspace_override sulla cartella scelta. Se l'utente
+        annulla, mantiene l'eventuale workspace precedente (o il default
+        automatico sotto il progetto attivo).
+        """
+        start = str(getattr(self, "_gpr_workspace_override", "") or "").strip()
+        if not start:
+            root = self._active_project_root()
+            start = (
+                os.path.join(root, "GPR_Processing") if root else os.path.expanduser("~")
+            )
+        folder = QFileDialog.getExistingDirectory(
+            self, "Cartella di lavoro GPR (dove salvare raw/processed/timeslices)", start
+        )
+        if folder:
+            self._set_active_workspace(folder)
+
+    def _new_gpr_project(self):
+        """Crea un nuovo progetto GPR in una cartella scelta e azzera la sessione."""
+        start = str(getattr(self, "_gpr_workspace_override", "") or "").strip() \
+            or os.path.expanduser("~")
+        folder = QFileDialog.getExistingDirectory(
+            self, "Nuovo progetto GPR — scegli la cartella", start
+        )
+        if not folder:
+            return
+        self._set_active_workspace(folder)
+        self._reset_session_state()
+        self._ensure_gpr_processing_layout()
+        try:
+            self._save_gpr_processing_project_meta()
+        except Exception:
+            pass
+        self._safe_set_text(
+            self._lbl_status,
+            f"Nuovo progetto GPR: {os.path.normpath(folder)}. Importa i .ogpr per iniziare.",
+        )
+
+    def _open_gpr_project(self):
+        """Apre un progetto GPR esistente da una cartella scelta."""
+        start = str(getattr(self, "_gpr_workspace_override", "") or "").strip() \
+            or os.path.expanduser("~")
+        folder = QFileDialog.getExistingDirectory(
+            self, "Apri progetto GPR — scegli la cartella del progetto", start
+        )
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        # Accetta sia la cartella-progetto (contiene GPR_Processing) sia la
+        # cartella GPR_Processing stessa (in tal caso usa la cartella superiore).
+        if (not os.path.isfile(os.path.join(folder, "GPR_Processing", "project.json"))
+                and os.path.isfile(os.path.join(folder, "project.json"))):
+            folder = os.path.dirname(folder)
+        self._set_active_workspace(folder)
+        if not self._try_import_saved_gpr_processing_project(force=True):
+            QMessageBox.information(
+                self, "Apri progetto GPR",
+                "Nessun profilo trovato nel progetto selezionato.\n"
+                "Verifica che la cartella contenga GPR_Processing/project.json.",
+            )
+
     def import_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Importa profili GPR", "",
-            "OGPR files (*.ogpr);;All files (*)",
+            import_dialog_filter(),
         )
         if not paths:
             return
+        # L'utente sceglie dove salvare i file di lavoro a ogni import.
+        self._prompt_workspace_dir()
         staged_paths = [self._stage_profile_in_project_raw(p) for p in paths]
         # Nuova sessione import: reset completo stato+UI per evitare riferimenti stale a widget Qt.
         self._reset_session_state()
         errors = []
         imported_warnings = []
+        newly_imported = []
         for p in staged_paths:
             md5_failed = False
             try:
-                prof = read_ogpr_cached(p, verify_md5=True)
+                prof = detect_and_read(p, verify_md5=True)
                 self._profiles.append(prof)
+                newly_imported.append(prof)
             except Exception as e:
                 msg = str(e)
                 if "MD5" in msg:
                     try:
-                        prof = read_ogpr_cached(p, verify_md5=False)
+                        prof = detect_and_read(p, verify_md5=False)
                         self._profiles.append(prof)
+                        newly_imported.append(prof)
                         md5_failed = True
                         imported_warnings.append(
                             f"{os.path.basename(p)}: verifica MD5 fallita, importato comunque "
@@ -2467,6 +3032,105 @@ class GprProfileViewer(QMainWindow):
             self._prof_idx = len(self._profiles) - 1
             self._load_current_profile()
             self._save_gpr_processing_project_meta()
+        # --- Rilevamento assenza GPS: proponi posizionamento manuale ---
+        if newly_imported and not check_profiles_have_gps(newly_imported):
+            ret = QMessageBox.question(
+                self,
+                "Profili senza GPS rilevati",
+                f"<b>{len(newly_imported)} profilo/i importato/i non contiene coordinate GPS/GEC.</b><br><br>"
+                "I dati verranno trattati come acquisiti senza georeferenziazione GPS.<br>"
+                "Puoi assegnare manualmente la geometria della griglia di rilievo adesso.<br><br>"
+                "<b>Aprire ora il dialog di Posizionamento Griglia Manuale?</b>",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if ret == QMessageBox.Yes:
+                self._open_manual_positioning_dialog(profiles_override=newly_imported)
+
+
+    # ------------------------------------------------------------------
+    # Posizionamento Manuale Griglia (Profili senza GPS)
+    # ------------------------------------------------------------------
+
+    def _open_manual_positioning_dialog(self, profiles_override: list | None = None):
+        """Apre il dialog di posizionamento manuale della griglia GPR.
+
+        Può essere chiamato:
+        - Automaticamente dopo l'import di profili privi di GPS.
+        - Manualmente dall'utente tramite il pulsante toolbar '📍 Posizionamento Griglia'.
+        """
+        profiles = list(profiles_override or self._profiles or [])
+        if not profiles:
+            QMessageBox.information(
+                self,
+                "Posizionamento Griglia",
+                "Importa almeno un profilo .ogpr prima di aprire il posizionamento manuale.",
+            )
+            return
+
+        # Recupera parametri salvati in precedenza (se disponibili) dal progetto
+        saved_params = getattr(self, "_grid_positioning_params", None)
+        if saved_params is None:
+            try:
+                meta = self._load_gpr_processing_project_meta()
+                saved_params = meta.get("grid_positioning")
+            except Exception:
+                saved_params = None
+
+        # Ottieni il canvas QGIS per la funzione "punta su mappa"
+        canvas = None
+        try:
+            from qgis.utils import iface
+            canvas = iface.mapCanvas() if iface else None
+        except Exception:
+            pass
+
+        dlg = GprManualPositioningDialog(
+            profiles=profiles,
+            project_crs=None,
+            canvas=canvas,
+            parent=self,
+        )
+
+        # Pre-popola con i parametri salvati in precedenza
+        if isinstance(saved_params, dict):
+            try:
+                gb = saved_params.get("grid_bounds", {})
+                if gb:
+                    dlg._spin_x0.setValue(float(gb.get("x0", 0.0)))
+                    dlg._spin_x1.setValue(float(gb.get("x1", 10.0)))
+                    dlg._spin_y0.setValue(float(gb.get("y0", 0.0)))
+                    dlg._spin_y1.setValue(float(gb.get("y1", 10.0)))
+                gr = saved_params.get("georef", {})
+                if gr and gr.get("enabled"):
+                    dlg._grp_geo.setChecked(True)
+                    dlg._spin_e0.setValue(float(gr.get("origin_e", 0.0)))
+                    dlg._spin_n0.setValue(float(gr.get("origin_n", 0.0)))
+                    dlg._spin_azimuth.setValue(float(gr.get("azimuth_deg", 0.0)))
+            except Exception:
+                pass
+
+        def _on_positioning_applied(result: dict):
+            # Salva parametri per il progetto
+            self._grid_positioning_params = result
+            try:
+                self._save_gpr_processing_project_meta()
+            except Exception:
+                pass
+            # Ricarica il profilo corrente per aggiornare le coordinate nel viewer
+            try:
+                self._load_current_profile()
+                self._update_slice_profile_info()
+            except Exception:
+                pass
+            self._safe_set_text(
+                self._lbl_status,
+                f"Posizionamento manuale applicato a {len(result.get('profiles', []))} profilo/i. "
+                "Le coordinate sono ora disponibili per il viewer e lo slicing 3D.",
+            )
+
+        dlg.positioning_applied.connect(_on_positioning_applied)
+        dlg.exec_()
 
     # ------------------------------------------------------------------
     # Navigazione
@@ -2637,6 +3301,7 @@ class GprProfileViewer(QMainWindow):
             self._raw_data = full.copy()
         self._trace_source_indices = idx.astype(np.int64, copy=False)
         self._proc_data = None
+        self._stage_cache = {}
         self._hyper_apex_x = None
         self._hyper_apex_depth = None
         self._apply_processing()
@@ -2656,7 +3321,19 @@ class GprProfileViewer(QMainWindow):
             bg_sample_end = 0
         bp_lo, bp_hi = self._bandpass_limits()
         rg_points = self._sanitize_range_gain_breakpoints(self._range_gain_breakpoints)
+        # Filtri Fase 1: enable dalla casella del blocco chain, valori dai
+        # controlli generici. Assenti -> restano ai default (OFF) di DEFAULT_PIPELINE.
+        chain_enabled: dict = {}
+        if self._is_qt_alive(getattr(self, "_filter_chain_widget", None)):
+            try:
+                chain_enabled = dict(self._filter_chain_widget.get_enabled_map() or {})
+            except Exception:
+                chain_enabled = {}
+        phase1: dict = dict(self._phase1_params())
+        for _sid in self._PHASE1_STEP_IDS:
+            phase1[_sid] = bool(chain_enabled.get(_sid, False))
         return {
+            **phase1,
             "dewow": bool(self._chk_dewow.isChecked()),
             "dewow_win": int(self._spin_dewow.value()),
             "timezero": bool(self._chk_timezero.isChecked()),
@@ -2666,11 +3343,17 @@ class GprProfileViewer(QMainWindow):
             "tz_backup_nsamp": int(self._spin_tz_backup.value()),
             "bg_removal": bool(self._chk_bg.isChecked()),
             "bg_mode": str(self._cb_bg_mode.currentData() or "line_by_line"),
+            "bg_method": str(self._cb_bg_method.currentData() or "mean") if hasattr(self, "_cb_bg_method") else "mean",
             "bg_window": int(bg_window),
             "bg_sample_start": int(bg_sample_start),
             "bg_sample_end": int(bg_sample_end),
+            "migration": bool(getattr(self, "_chk_mig", None) and self._chk_mig.isChecked()),
+            "mig_velocity_m_s": float(self._spin_mig_vel.value()) if hasattr(self, "_spin_mig_vel") else 1e8,
+            "mig_dx_m": float(self._spin_mig_dx.value()) if hasattr(self, "_spin_mig_dx") else 0.05,
             "agc": bool(self._chk_agc.isChecked()),
             "agc_win": int(self._spin_agc.value()),
+            "agc_max_gain": float(self._spin_agc_max_gain.value()) if hasattr(self, "_spin_agc_max_gain") else 0.0,
+            "agc_sample_start": int(self._spin_agc_sample_start.value()) if getattr(self, "_spin_agc_sample_start", None) else 0,
             "pre_agc_gain": bool(self._chk_range_gain.isChecked()),
             "pre_agc_surface_gain": float(self._spin_gain_surface.value()),
             "pre_agc_deep_gain": float(self._spin_gain_deep.value()),
@@ -2679,6 +3362,10 @@ class GprProfileViewer(QMainWindow):
             "envelope": bool(getattr(self, "_chk_envelope", None) and self._chk_envelope.isChecked()),
             "bp_low_mhz": float(bp_lo),
             "bp_high_mhz": float(bp_hi),
+            "bp_taper_frac": (
+                float(self._spin_bp_taper.value()) / 100.0
+                if self._is_qt_alive(getattr(self, "_spin_bp_taper", None)) else 0.12
+            ),
             # manual_gain is a display-only step applied in _compose_display_data,
             # not in the processing pipeline. Keep the key so has_active_filters
             # can trigger a pipeline re-run when manual_gain is the only active control.
@@ -2696,6 +3383,7 @@ class GprProfileViewer(QMainWindow):
             getattr(self, "_spin_dewow", None),
             getattr(self, "_chk_timezero", None),
             getattr(self, "_chk_bg", None),
+            getattr(self, "_chk_mig", None),
             getattr(self, "_chk_agc", None),
             getattr(self, "_spin_agc", None),
             getattr(self, "_chk_envelope", None),
@@ -2711,10 +3399,18 @@ class GprProfileViewer(QMainWindow):
                 "dewow",
                 "bg_removal",
                 "bandpass",
+                "migration",
                 "agc",
                 "envelope",
                 "pre_agc_gain",
                 "manual_gain",
+                "dcshift",
+                "boxcar",
+                "notch",
+                "whiten",
+                "amp_eq",
+                "rad_threshold",
+                "power_gain",
             )
         )
         if not has_active_filters:
@@ -2727,17 +3423,25 @@ class GprProfileViewer(QMainWindow):
             )
             self._request_preview_update(immediate=False)
             return
+        if not self._profiles or self._prof_idx < 0 or self._prof_idx >= len(self._profiles):
+            return
         prof = self._profiles[self._prof_idx]
+        dt_ns_val = float(getattr(prof, "dt_ns", 0.117) or 0.117)
         try:
             self._proc_data = apply_pipeline(
                 self._raw_data,
                 params,
-                dt_ns=prof.dt_ns,
+                dt_ns=dt_ns_val,
                 normalize_output=False,
                 chain_order=params.get("chain_order"),
+                stage_cache=self._stage_cache,
             )
         except Exception as e:
-            QMessageBox.critical(self, "Errore processing", str(e))
+            log_exception("apply_pipeline", e)
+            QMessageBox.critical(
+                self, "Errore processing",
+                f"{e}\n\nDettagli in: {LOG_FILE_PATH}",
+            )
             return
 
         # Fallback robusto: evita profilo "vuoto" quando il risultato e' quasi nullo o non finito.
@@ -2745,29 +3449,257 @@ class GprProfileViewer(QMainWindow):
         finite = np.isfinite(proc)
         finite_ratio = float(finite.mean()) if proc.size else 0.0
         spread = float(np.nanmax(proc) - np.nanmin(proc)) if finite.any() else 0.0
+        fallback_msg = None
         if finite_ratio < 0.5 or spread < 1e-6:
             try:
                 self._proc_data = np.asarray(self._raw_data, dtype=np.float32)
-                msg = (
+                fallback_msg = (
                     f"Processing inconcludente "
                     f"(finite={finite_ratio:.0%}, spread={spread:.2e}): "
                     "visualizzazione fallback su dato grezzo."
                 )
-                self._safe_set_text(self._lbl_status, msg)
                 try:
                     QgsMessageLog.logMessage(
-                        f"[GPR] _apply_processing fallback: {msg}",
+                        f"[GPR] _apply_processing fallback: {fallback_msg}",
                         "RasterLinker",
                         Qgis.Warning,
                     )
                 except Exception:
-                    print(f"[GPR] _apply_processing fallback: {msg}")
+                    print(f"[GPR] _apply_processing fallback: {fallback_msg}")
             except Exception:
                 pass
 
         self._refresh_bp_histogram()
         self._apply_gain_only()
+        if fallback_msg:
+            # _apply_gain_only() ha appena sovrascritto lo stato con le
+            # statistiche "proc: min/max..."; senza questo, l'avviso che la
+            # pipeline e' stata scartata (fallback su dato grezzo) sparisce
+            # subito e diventa impossibile capire perche' un filtro non ha
+            # alcun effetto visibile.
+            self._safe_set_text(self._lbl_status, fallback_msg)
         self._request_preview_update(immediate=False)
+
+    # ------------------------------------------------------------------
+    # Auto-tune
+    # ------------------------------------------------------------------
+
+    def _on_auto_tune(self):
+        """Calcola i parametri ottimali e mostra il dialog di anteprima."""
+        if not self._profiles:
+            QMessageBox.information(self, "Auto-tune", "Nessun profilo caricato.")
+            return
+
+        # Raccoglie i raw data di tutti i profili caricati
+        # (usa il profilo corrente come unico raw_data disponibile in memoria;
+        #  i restanti vengono letti direttamente dal file .ogpr se necessario)
+        from PyQt5.QtWidgets import QProgressDialog
+        from PyQt5.QtCore import Qt as _Qt
+
+        n_profs = len(self._profiles)
+        raw_list = []
+        dt_list = []
+        freq_list = []
+
+        prog = QProgressDialog("Analisi profili in corso...", "Annulla", 0, n_profs, self)
+        prog.setWindowModality(_Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+
+        for i, prof in enumerate(self._profiles):
+            if prog.wasCanceled():
+                break
+            prog.setValue(i)
+            try:
+                if i == self._prof_idx and self._raw_data is not None:
+                    raw_list.append(np.asarray(self._raw_data, dtype=np.float32))
+                else:
+                    ch_idx = min(self._ch_idx, len(prof.channels) - 1) if prof.channels else 0
+                    cached = detect_and_read(prof.path)
+                    if cached and cached.channels and ch_idx < len(cached.channels):
+                        raw_list.append(np.asarray(cached.channels[ch_idx].data, dtype=np.float32))
+                    else:
+                        log_exception(
+                            "auto_tune raccolta profili",
+                            RuntimeError(f"profilo {prof.path!r} senza canali validi (ch_idx={ch_idx})"),
+                        )
+                        continue
+                dt_list.append(float(getattr(prof, "dt_ns", 0.117) or 0.117))
+                freq_list.append(float(getattr(prof, "frequency_mhz", 0.0) or 0.0))
+            except Exception as e:
+                log_exception(f"auto_tune raccolta profilo {getattr(prof, 'path', i)!r}", e)
+                continue
+        prog.setValue(n_profs)
+
+        if not raw_list:
+            QMessageBox.warning(
+                self, "Auto-tune",
+                f"Nessun dato disponibile per l'analisi.\n\nDettagli in: {LOG_FILE_PATH}",
+            )
+            return
+
+        # Frequenza nominale antenna (mediana dei profili campionati): usata
+        # come "prior" per ancorare la stima automatica del bandpass, cosi'
+        # che rumore a banda larga non finisca per dominare la stima su
+        # antenne a bassa frequenza (es. 100 MHz).
+        valid_freqs = [f for f in freq_list if f > 10.0]
+        antenna_freq_mhz = float(np.median(valid_freqs)) if valid_freqs else 0.0
+
+        try:
+            suggested = auto_tune_params(raw_list, dt_list, antenna_freq_mhz=antenna_freq_mhz)
+        except Exception as e:
+            log_exception("auto_tune_params", e)
+            QMessageBox.critical(
+                self, "Auto-tune",
+                f"Errore nel calcolo dei parametri:\n{e}\n\nDettagli in: {LOG_FILE_PATH}",
+            )
+            return
+
+        self._show_auto_tune_preview(suggested)
+
+    def _show_auto_tune_preview(self, suggested: dict):
+        """Mostra il dialog di anteprima con i parametri suggeriti."""
+        from PyQt5.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QDialogButtonBox,
+            QGroupBox, QFormLayout, QSpinBox as _QSpinBox,
+            QDoubleSpinBox as _QDoubleSpinBox, QCheckBox as _QCheckBox,
+            QLabel as _QLabel,
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Auto-tune — Anteprima parametri suggeriti")
+        dlg.setMinimumWidth(380)
+        vlay = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "Parametri calcolati automaticamente sui profili caricati.\n"
+            "Modifica i valori se necessario, poi clicca Applica."
+        )
+        info.setWordWrap(True)
+        vlay.addWidget(info)
+
+        grp = QGroupBox("Parametri suggeriti")
+        fl = QFormLayout(grp)
+
+        def _spin(val, lo, hi, step=1):
+            w = QSpinBox()
+            w.setRange(lo, hi)
+            w.setValue(int(val))
+            w.setSingleStep(step)
+            return w
+
+        def _dspin(val, lo, hi, step=1.0, dec=1):
+            w = QDoubleSpinBox()
+            w.setRange(lo, hi)
+            w.setValue(float(val))
+            w.setSingleStep(step)
+            w.setDecimals(dec)
+            return w
+
+        def _chk(val, label=""):
+            w = QCheckBox(label)
+            w.setChecked(bool(val))
+            return w
+
+        chk_dewow   = _chk(suggested.get("dewow", True), "Abilitato")
+        spin_dewow  = _spin(suggested.get("dewow_win", 16), 4, 256)
+        chk_tz      = _chk(suggested.get("timezero", True), "Abilitato")
+        chk_bg      = _chk(suggested.get("bg_removal", True), "Abilitato")
+        spin_bg_s0  = _spin(suggested.get("bg_sample_start", 0), 0, 9999)
+        chk_agc     = _chk(suggested.get("agc", True), "Abilitato")
+        spin_agc_w  = _spin(suggested.get("agc_win", 128), 8, 512)
+        spin_agc_s0 = _spin(suggested.get("agc_sample_start", 0), 0, 9999)
+        chk_bp      = _chk(suggested.get("bandpass", False), "Abilitato")
+        spin_bp_lo  = _dspin(suggested.get("bp_low_mhz", 100.0), 1, 3000, 10.0)
+        spin_bp_hi  = _dspin(suggested.get("bp_high_mhz", 1200.0), 1, 3000, 10.0)
+
+        fl.addRow("Dewow:", chk_dewow)
+        fl.addRow("  Finestra:", spin_dewow)
+        fl.addRow("Time-zero:", chk_tz)
+        fl.addRow("BG removal:", chk_bg)
+        fl.addRow("  Da campione:", spin_bg_s0)
+        fl.addRow("AGC:", chk_agc)
+        fl.addRow("  Finestra:", spin_agc_w)
+        fl.addRow("  Da campione:", spin_agc_s0)
+        fl.addRow("Bandpass:", chk_bp)
+        fl.addRow("  Low (MHz):", spin_bp_lo)
+        fl.addRow("  High (MHz):", spin_bp_hi)
+
+        vlay.addWidget(grp)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Cancel)
+        btn_apply = btn_box.button(QDialogButtonBox.Apply)
+        btn_apply.setText("Applica")
+        btn_box.rejected.connect(dlg.reject)
+
+        def _do_apply():
+            params = {
+                "dewow":            chk_dewow.isChecked(),
+                "dewow_win":        spin_dewow.value(),
+                "timezero":         chk_tz.isChecked(),
+                "bg_removal":       chk_bg.isChecked(),
+                "bg_sample_start":  spin_bg_s0.value(),
+                "agc":              chk_agc.isChecked(),
+                "agc_win":          spin_agc_w.value(),
+                "agc_sample_start": spin_agc_s0.value(),
+                "bandpass":         chk_bp.isChecked(),
+                "bp_low_mhz":       spin_bp_lo.value(),
+                "bp_high_mhz":      spin_bp_hi.value(),
+            }
+            self._apply_auto_tune_params(params)
+            dlg.accept()
+
+        btn_apply.clicked.connect(_do_apply)
+        vlay.addWidget(btn_box)
+        dlg.exec_()
+
+    def _apply_auto_tune_params(self, params: dict):
+        """Applica i parametri auto-tune ai widget del pannello processing."""
+        def _safe_set_spin(attr, val):
+            w = getattr(self, attr, None)
+            if w is not None and self._is_qt_alive(w):
+                was_enabled = w.isEnabled()
+                w.setEnabled(True)   # force-enable so setValue works even if disabled
+                w.blockSignals(True)
+                w.setValue(val)
+                w.blockSignals(False)
+                if not was_enabled:
+                    w.setEnabled(False)  # restore disabled state
+
+        # Setta i valori degli spinner prima (con segnali bloccati)
+        _safe_set_spin("_spin_dewow",            params.get("dewow_win", 16))
+        _safe_set_spin("_spin_bg_sample_start",  params.get("bg_sample_start", 0))
+        _safe_set_spin("_spin_agc",              params.get("agc_win", 128))
+        _safe_set_spin("_spin_agc_sample_start", params.get("agc_sample_start", 0))
+        _safe_set_spin("_spin_bp_lo",            params.get("bp_low_mhz", 100.0))
+        _safe_set_spin("_spin_bp_hi",            params.get("bp_high_mhz", 1200.0))
+
+        # Aggiorna i breakpoints del range gain (TVG) se forniti dall'auto-tune
+        bkpts = params.get("pre_agc_breakpoints")
+        if bkpts is not None:
+            bkpts_arr = np.asarray(bkpts, dtype=np.float64).reshape(-1, 2)
+            if bkpts_arr.shape[0] >= 2:
+                self._range_gain_breakpoints = bkpts_arr
+                self._sync_range_gain_spins_from_breakpoints()
+
+        # Setta i checkbox emettendo i segnali — così i toggle abilitano/disabilitano
+        # gli spinner dipendenti e sincronizzano la filter chain.
+        for attr, val in (
+            ("_chk_dewow",      params.get("dewow",      True)),
+            ("_chk_timezero",   params.get("timezero",   True)),
+            ("_chk_bg",         params.get("bg_removal", True)),
+            ("_chk_range_gain", params.get("pre_agc_gain", False)),
+            ("_chk_agc",        params.get("agc",        True)),
+            ("_chk_bp",         params.get("bandpass",   False)),
+        ):
+            w = getattr(self, attr, None)
+            if w is not None and self._is_qt_alive(w):
+                w.setChecked(bool(val))
+
+        self._sync_filter_chain_from_controls()
+        if self._raw_data is not None:
+            self._apply_processing()
+            self._request_preview_update(immediate=False)
 
     def _sanitize_range_gain_breakpoints(self, points):
         arr = np.asarray(points if points is not None else [], dtype=np.float64).reshape(-1, 2)
@@ -2919,9 +3851,53 @@ class GprProfileViewer(QMainWindow):
             v = self._rdp_to_velocity_m_s(9.0)
         return float(v)
 
-    def _on_hyperbola_rdp_changed(self, value: float):
-        v = self._rdp_to_velocity_m_s(float(value))
-        self._safe_set_text(self._lbl_hyperbola_vel, f"v={v:.3e} m/s")
+    def _hyperbola_txrx_offset(self) -> float:
+        w = getattr(self, "_spin_hyperbola_txrx", None)
+        if self._is_qt_alive(w):
+            try:
+                return max(0.0, float(w.value()))
+            except Exception:
+                return 0.0
+        return 0.0
+
+    def _hyperbola_curve_depth(self, x_rel, t0, v_fit, v_ref, s):
+        """Profondita' display della curva iperbolica per offset orizzontale `x_rel`.
+
+        Modello bistatico: riflettore puntiforme a profondita' d_fit (nel mezzo
+        a velocita' v_fit), antenne Tx-Rx separate da `s`. Con s=0 collassa
+        nella forma monostatica t=sqrt(t0^2+(2*dx/v)^2).
+        """
+        x_rel = np.asarray(x_rel, dtype=np.float64)
+        d_fit = np.sqrt(max(0.0, (0.5 * float(v_fit) * float(t0)) ** 2 - (0.5 * float(s)) ** 2))
+        half_s = 0.5 * float(s)
+        t = (
+            np.hypot(x_rel - half_s, d_fit) + np.hypot(x_rel + half_s, d_fit)
+        ) / max(float(v_fit), 1e-9)
+        return 0.5 * float(v_ref) * t
+
+    def _update_hyperbola_readout(self):
+        rdp = float(self._spin_hyperbola_rdp.value())
+        v = self._rdp_to_velocity_m_s(rdp)
+        v_cmns = v * 1e-7  # m/s -> cm/ns
+        self._safe_set_text(
+            self._lbl_hyperbola_vel,
+            f"v={v:.3e} m/s  ({v_cmns:.2f} cm/ns)  εr={rdp:.2f}",
+        )
+        s = self._hyperbola_txrx_offset()
+        depth_txt = "d=n/a (imposta apice)"
+        if self._hyper_apex_depth is not None and self._profiles:
+            try:
+                prof = self._profiles[self._prof_idx]
+                v_ref = self._profile_reference_velocity(prof)
+                t0 = (2.0 * float(self._hyper_apex_depth)) / max(v_ref, 1e-9)
+                d = np.sqrt(max(0.0, (0.5 * v * t0) ** 2 - (0.5 * s) ** 2))
+                depth_txt = f"d={d:.3f} m  (t0={t0 * 1e9:.2f} ns)"
+            except Exception:
+                pass
+        self._safe_set_text(self._lbl_hyperbola_depth, depth_txt)
+
+    def _on_hyperbola_rdp_changed(self, _value: float):
+        self._update_hyperbola_readout()
         if self._chk_hyperbola.isChecked():
             self._redraw()
 
@@ -2931,12 +3907,14 @@ class GprProfileViewer(QMainWindow):
             return
         self._hyper_apex_x = float(self._cursor_x)
         self._hyper_apex_depth = float(self._cursor_z)
+        self._update_hyperbola_readout()
         if self._chk_hyperbola.isChecked():
             self._redraw()
 
     def _clear_hyperbola_apex(self):
         self._hyper_apex_x = None
         self._hyper_apex_depth = None
+        self._update_hyperbola_readout()
         if self._chk_hyperbola.isChecked():
             self._redraw()
 
@@ -3059,6 +4037,7 @@ class GprProfileViewer(QMainWindow):
 
         corridor = max(1, int(round(0.006 * n_s)))
         candidates = np.linspace(1.0, 40.0, 157, dtype=np.float64)
+        s_txrx = self._hyperbola_txrx_offset()
         best_rdp = None
         best_score = -np.inf
         best_count = 0
@@ -3066,8 +4045,7 @@ class GprProfileViewer(QMainWindow):
         for rdp in candidates:
             v_fit = self._rdp_to_velocity_m_s(float(rdp))
             dx = distances - x0
-            t = np.sqrt(np.maximum(0.0, t0 * t0 + (2.0 * dx / max(v_fit, 1e-9)) ** 2))
-            z_disp = 0.5 * v_ref * t
+            z_disp = self._hyperbola_curve_depth(dx, t0, v_fit, v_ref, s_txrx)
             idx_f = (z_disp / max(depth_max, 1e-9)) * max(0, n_s - 1)
             valid = near & np.isfinite(idx_f) & (idx_f >= 0.0) & (idx_f <= (n_s - 1))
             count = int(np.count_nonzero(valid))
@@ -3141,6 +4119,7 @@ class GprProfileViewer(QMainWindow):
             "hyperbola": {
                 "enabled": bool(self._chk_hyperbola.isChecked()),
                 "rdp": float(self._spin_hyperbola_rdp.value()),
+                "txrx_offset_m": self._hyperbola_txrx_offset(),
                 "apex_x": (float(self._hyper_apex_x) if self._hyper_apex_x is not None else None),
                 "apex_depth": (float(self._hyper_apex_depth) if self._hyper_apex_depth is not None else None),
             },
@@ -3212,11 +4191,16 @@ class GprProfileViewer(QMainWindow):
 
         # Hyperbola.
         self._spin_hyperbola_rdp.setValue(float(hy.get("rdp", self._spin_hyperbola_rdp.value())))
+        if self._is_qt_alive(getattr(self, "_spin_hyperbola_txrx", None)):
+            self._spin_hyperbola_txrx.setValue(
+                float(hy.get("txrx_offset_m", self._spin_hyperbola_txrx.value()))
+            )
         self._chk_hyperbola.setChecked(bool(hy.get("enabled", self._chk_hyperbola.isChecked())))
         apex_x = hy.get("apex_x")
         apex_d = hy.get("apex_depth")
         self._hyper_apex_x = float(apex_x) if apex_x is not None else None
         self._hyper_apex_depth = float(apex_d) if apex_d is not None else None
+        self._update_hyperbola_readout()
 
         if self._is_qt_alive(self._filter_chain_widget):
             order = chain_cfg.get("order")
@@ -3305,13 +4289,13 @@ class GprProfileViewer(QMainWindow):
         v_ref = self._profile_reference_velocity(prof)
         rdp = float(self._spin_hyperbola_rdp.value())
         v_fit = self._rdp_to_velocity_m_s(rdp)
+        s = self._hyperbola_txrx_offset()
         # Apex sample time from current displayed depth scale.
         t0 = (2.0 * z0_disp) / max(v_ref, 1e-9)
         x = np.linspace(0.0, float(dist_max), 600, dtype=np.float64)
         dx = x - x0
-        # t(x)=sqrt(t0^2 + (2*dx/v)^2), then mapped back to display-depth with v_ref.
-        t = np.sqrt(np.maximum(0.0, t0 * t0 + (2.0 * dx / max(v_fit, 1e-9)) ** 2))
-        z_disp = 0.5 * v_ref * t
+        # Bistatic model (s=0 -> monostatico), poi rimappato in profondita' display.
+        z_disp = self._hyperbola_curve_depth(dx, t0, v_fit, v_ref, s)
         finite = np.isfinite(z_disp) & (z_disp >= 0.0) & (z_disp <= (depth_max * 1.02))
         if not finite.any():
             return
@@ -3370,6 +4354,10 @@ class GprProfileViewer(QMainWindow):
         # normalize_display does not cancel them.  Values that exceed ±1 after
         # the gains are intentionally saturated by the final clip — this is the
         # correct visual behaviour (deep samples clamp to full black/white).
+        #
+        # The burst zone is now attenuated by pre_agc_gain (TVG) before AGC,
+        # so the amplitude is already uniform across the full profile here.
+        # No special zeroing of the burst zone is needed.
         base = normalize_display(proc_disp).astype(np.float32, copy=False)
 
         # Scalar display gain (brightness knob).
@@ -4056,6 +5044,54 @@ class GprProfileViewer(QMainWindow):
     # Cursore
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Pick-mode: click sul profilo → imposta un campo sample
+    # ------------------------------------------------------------------
+
+    def _set_pick_mode(self, target: str | None, source_btn=None):
+        """Attiva/disattiva la modalità pick-from-profile.
+
+        target: nome logico del campo da popolare ('agc_sample_start', ...).
+                None = disattiva.
+        source_btn: il QPushButton che ha scatenato l'azione (per sincronizzare
+                    lo stato checked se la disattivazione arriva dall'esterno).
+        """
+        self._pick_mode_target = target
+        # Deseleziona tutti i bottoni pick tranne quello sorgente
+        for btn_name in ("_btn_pick_agc_s0",):
+            btn = getattr(self, btn_name, None)
+            if btn is not None and self._is_qt_alive(btn) and btn is not source_btn:
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+        # Cambia il cursore del canvas per dare feedback visivo
+        if HAS_MPL and getattr(self, "_canvas_mpl", None) and self._is_qt_alive(self._canvas_mpl):
+            if target is not None:
+                self._canvas_mpl.setCursor(Qt.CrossCursor)
+            else:
+                self._canvas_mpl.unsetCursor()
+
+    def _sample_from_ydata(self, ydata: float) -> int | None:
+        """Converte la coordinata Y del canvas (profondita') in indice sample."""
+        if self._disp_data is None:
+            return None
+        n_s = int(self._disp_data.shape[0])
+        if n_s <= 0:
+            return None
+        prof = self._profiles[self._prof_idx] if self._profiles else None
+        if prof is None:
+            return None
+        try:
+            depth_max = float(getattr(prof, "depth_m", None) or 0.0)
+            if depth_max <= 0.0:
+                return None
+            # ydata è in metri; convertiamo in indice sample
+            frac = float(ydata) / depth_max
+            idx = int(round(frac * (n_s - 1)))
+            return max(0, min(n_s - 1, idx))
+        except Exception:
+            return None
+
     def _on_mouse_move(self, event):
         if event.inaxes != self._ax or self._disp_data is None:
             return
@@ -4070,6 +5106,18 @@ class GprProfileViewer(QMainWindow):
         if event.inaxes == self._ax and event.button == 1:
             self._cursor_x = event.xdata
             self._cursor_z = event.ydata
+
+            # Pick-mode: popola il campo target e disattiva la modalità
+            if self._pick_mode_target is not None and event.ydata is not None:
+                sample_idx = self._sample_from_ydata(float(event.ydata))
+                if sample_idx is not None:
+                    if self._pick_mode_target == "agc_sample_start":
+                        if getattr(self, "_spin_agc_sample_start", None) and self._is_qt_alive(self._spin_agc_sample_start):
+                            self._spin_agc_sample_start.setValue(sample_idx)
+                    # Disattiva pick-mode dopo la selezione
+                    self._set_pick_mode(None, None)
+                return
+
             self._update_wiggle_plot(draw=False)
             if bool(getattr(event, "dblclick", False)) and bool(self._chk_hyperbola.isChecked()):
                 self._set_hyperbola_apex_from_cursor()
@@ -4486,8 +5534,30 @@ class GprProfileViewer(QMainWindow):
                 return ""
         return ""
 
+    def _set_active_workspace(self, root: str) -> None:
+        """Imposta la cartella-progetto attiva (dove vive GPR_Processing).
+
+        Aggiorna sia l'override locale del viewer sia il setting del plugin,
+        cosi' viewer e plugin (slicer/catalogo) puntano allo stesso progetto.
+        Il valore persiste tra sessioni tramite le impostazioni del plugin.
+        """
+        root = os.path.normpath(str(root or "").strip())
+        if not root:
+            return
+        self._gpr_workspace_override = root
+        try:
+            settings = getattr(self.plugin, "settings", None)
+            key = getattr(self.plugin, "settings_key_active_project", None)
+            if settings is not None and key:
+                settings.setValue(key, root)
+        except Exception:
+            pass
+
     def _gpr_processing_paths(self) -> dict:
-        root = self._active_project_root()
+        # Workspace scelto dall'utente (Nuovo/Apri/import): priorita' sul setting.
+        root = str(getattr(self, "_gpr_workspace_override", "") or "").strip()
+        if not root:
+            root = self._active_project_root()
         if not root:
             return {}
         base = os.path.normpath(os.path.join(root, "GPR_Processing"))
@@ -4621,6 +5691,8 @@ class GprProfileViewer(QMainWindow):
                 else meta.get("last_timeslice")
             ),
             "ui_state": ui_state,
+            # Preserve manual grid positioning params across sessions
+            "grid_positioning": getattr(self, "_grid_positioning_params", None) or meta.get("grid_positioning"),
         }
         try:
             with open(paths["project_json"], "w", encoding="utf-8") as fh:
@@ -4660,17 +5732,40 @@ class GprProfileViewer(QMainWindow):
                 break
 
         # Prefer lightweight link, fallback to real copy.
+        staged = None
         try:
             rel_src = os.path.relpath(p_src, raw_dir)
             os.symlink(rel_src, candidate)
-            return candidate
+            staged = candidate
         except Exception:
             pass
+        if staged is None:
+            try:
+                shutil.copy2(p_src, candidate)
+                staged = candidate
+            except Exception:
+                return p_src
+
+        # Alcuni formati (es. .DT) hanno file sidecar (.gec/.gps/.gps.sav)
+        # indispensabili per il posizionamento GNSS: li porta con se' nella
+        # stessa cartella raw, accanto al file principale.
         try:
-            shutil.copy2(p_src, candidate)
-            return candidate
+            for sc_src in sidecar_paths(p_src):
+                sc_name = os.path.basename(sc_src)
+                sc_dst = os.path.join(raw_dir, sc_name)
+                if os.path.exists(sc_dst):
+                    continue
+                try:
+                    rel_sc = os.path.relpath(sc_src, raw_dir)
+                    os.symlink(rel_sc, sc_dst)
+                except Exception:
+                    try:
+                        shutil.copy2(sc_src, sc_dst)
+                    except Exception:
+                        pass
         except Exception:
-            return p_src
+            pass
+        return staged
 
     def _apply_gpr_processing_ui_state(self, ui_state: dict) -> None:
         if not isinstance(ui_state, dict):
@@ -4729,10 +5824,10 @@ class GprProfileViewer(QMainWindow):
         errors = []
         for p in paths:
             try:
-                self._profiles.append(read_ogpr_cached(p, verify_md5=True))
+                self._profiles.append(detect_and_read(p, verify_md5=True))
             except Exception:
                 try:
-                    self._profiles.append(read_ogpr_cached(p, verify_md5=False))
+                    self._profiles.append(detect_and_read(p, verify_md5=False))
                 except Exception as exc:
                     errors.append(f"{os.path.basename(p)}: {exc}")
         if not self._profiles:
@@ -4939,6 +6034,8 @@ class GprProfileViewer(QMainWindow):
                 self._preview_timer.stop()
             except Exception:
                 pass
+            self._preview_request_id += 1  # scarta un eventuale risultato ancora in volo
+            self._set_preview_busy(False)
             self._preview_slice_grid = None
             self._preview_slice_extent = None
             self._preview_slice_z_from = None
@@ -4970,39 +6067,71 @@ class GprProfileViewer(QMainWindow):
         except Exception:
             pass
 
+    def _stop_preview_worker_blocking(self, timeout_ms: int = 3000):
+        """Attende la fine di un eventuale thread di preview in corso.
+
+        Chiamato solo alla chiusura reale della finestra, per evitare di
+        distruggere il QThread mentre e' ancora attivo.
+        """
+        self._preview_request_id += 1  # scarta comunque il risultato
+        thread = getattr(self, "_preview_thread", None)
+        if self._is_qt_alive(thread) and thread.isRunning():
+            try:
+                thread.quit()
+                thread.wait(int(timeout_ms))
+            except Exception:
+                pass
+
+    def _set_preview_busy(self, busy: bool, message: str = ""):
+        """Mostra/nasconde l'indicatore di avanzamento del preview.
+
+        Non esiste una % reale (compute_timeslice_preview non riporta stati
+        intermedi), quindi la QProgressBar resta in modalita' indeterminata
+        (range 0,0): comunica "sta lavorando" senza promettere una % finta.
+        """
+        self._preview_busy = bool(busy)
+        if self._is_qt_alive(getattr(self, "_progress_preview", None)):
+            self._progress_preview.setVisible(bool(busy))
+        if self._is_qt_alive(getattr(self, "_lbl_preview_status", None)):
+            if busy:
+                self._lbl_preview_status.setText(message or "Preview: elaborazione in corso...")
+                self._lbl_preview_status.setVisible(True)
+            elif message:
+                self._lbl_preview_status.setText(message)
+                self._lbl_preview_status.setVisible(True)
+            else:
+                self._lbl_preview_status.setVisible(False)
+
+    @staticmethod
+    def _stable_preview_signature(value):
+        """Converte ricorsivamente un valore (dict/list/float inclusi) in una
+        tupla hashabile e stabile, usata per capire se i parametri di preview
+        sono davvero cambiati rispetto all'ultimo calcolo."""
+        if isinstance(value, float):
+            return round(value, 6)
+        if isinstance(value, dict):
+            return tuple(sorted(
+                (k, GprProfileViewer._stable_preview_signature(v)) for k, v in value.items()
+            ))
+        if isinstance(value, (list, tuple)):
+            return tuple(GprProfileViewer._stable_preview_signature(v) for v in value)
+        return value
+
     def _compute_and_show_preview(self):
         if not bool(getattr(self, "_preview_mode_active", False)):
             return
         if not self._profiles:
             return
         try:
-            from .gpr_ogpr_slicer import compute_timeslice_preview
+            from .gpr_ogpr_slicer import compute_timeslice_preview  # noqa: F401 (verifica disponibilita')
         except Exception as exc:
-            self._safe_set_text(self._lbl_status, f"Preview non disponibile: {exc}")
+            self._set_preview_busy(False, f"Preview non disponibile: {exc}")
             return
 
         z_from, z_to = self._preview_depth_window()
         res = self._preview_resolution_m()
         slice_params = dict(self.get_slice_params() or {})
         chain_order = list(self._current_chain_order() or [])
-        sig = (
-            round(float(z_from), 4),
-            round(float(z_to), 4),
-            round(float(res), 4),
-            int(self._ch_idx),
-            tuple(chain_order),
-            bool(slice_params.get("use_processing", False)),
-            str(slice_params.get("extraction_mode", "las_like") or "las_like"),
-            bool(slice_params.get("use_hilbert", True)),
-            bool(slice_params.get("use_anisotropic_idw", False)),
-            str(slice_params.get("idw_mode", "quality") or "quality"),
-            (None if slice_params.get("search_radius") is None else round(float(slice_params.get("search_radius")), 4)),
-            float(slice_params.get("idw_power", 2) or 2.0),
-            int(slice_params.get("min_points", 1) or 1),
-            str(slice_params.get("slice_source", "auto") or "auto"),
-        )
-        if sig == self._preview_signature:
-            return
 
         kwargs = {
             "channel": int(self._ch_idx),
@@ -5039,30 +6168,62 @@ class GprProfileViewer(QMainWindow):
             "parallel_profiles": bool(slice_params.get("parallel_profiles", False)),
             "profile_workers": int(slice_params.get("profile_workers", 0) or 0),
         }
-        try:
-            grid, extent = compute_timeslice_preview(
-                profiles=self._profiles,
-                z_from=float(z_from),
-                z_to=float(z_to),
-                resolution=float(res),
-                chain_order=chain_order,
-                **kwargs,
-            )
-        except MemoryError:
-            self._safe_set_text(
-                self._lbl_status,
-                "Preview non eseguibile: memoria insufficiente. Aumenta risoluzione preview.",
-            )
-            return
-        except Exception as exc:
-            self._safe_set_text(self._lbl_status, f"Preview errore: {exc}")
+
+        # La firma di cache e' derivata direttamente da kwargs (invece di una
+        # lista di campi mantenuta a mano): cosi' un parametro come Blanking
+        # o Search radius che cambia non puo' piu' passare inosservato e
+        # lasciare il preview "congelato" sul risultato precedente.
+        sig = (
+            round(float(z_from), 4),
+            round(float(z_to), 4),
+            round(float(res), 4),
+            tuple(chain_order),
+            self._stable_preview_signature(kwargs),
+        )
+        if sig == self._preview_signature:
             return
 
+        # Calcolo su thread separato: il thread GUI resta reattivo e Windows
+        # non mostra piu' il cursore "in caricamento" per l'intera durata.
+        self._preview_request_id += 1
+        request_id = self._preview_request_id
         self._preview_signature = sig
+        self._preview_pending_zwindow = (float(z_from), float(z_to))
+        self._set_preview_busy(True)
+
+        old_thread = getattr(self, "_preview_thread", None)
+        if self._is_qt_alive(old_thread):
+            try:
+                old_thread.finished.disconnect()
+            except Exception:
+                pass
+
+        thread = QThread(self)
+        worker = _PreviewSliceWorker(
+            request_id, self._profiles, float(z_from), float(z_to), float(res), chain_order, kwargs
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_preview_worker_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._preview_thread = thread
+        self._preview_worker = worker
+        thread.start()
+
+    def _on_preview_worker_finished(self, request_id: int, grid, extent, error: str):
+        if int(request_id) != int(self._preview_request_id):
+            return  # superato da una richiesta di preview piu' recente
+        self._set_preview_busy(False)
+        if error:
+            self._safe_set_text(self._lbl_status, f"Preview errore: {error}")
+            return
         if grid is None or extent is None:
             self._safe_set_text(self._lbl_status, "Preview: nessun dato nella finestra selezionata.")
             return
 
+        z_from, z_to = getattr(self, "_preview_pending_zwindow", (0.0, 0.0))
         self._preview_slice_grid = np.asarray(grid, dtype=np.float32)
         self._preview_slice_extent = tuple(float(v) for v in extent)
         self._preview_slice_z_from = float(z_from)
@@ -5962,6 +7123,166 @@ class GprProfileViewer(QMainWindow):
         if idx >= 0:
             combo.setCurrentIndex(idx)
 
+    def _save_processed_variant(self):
+        """Applica la pipeline corrente a TUTTI i profili/canali dal grezzo e
+        salva i radargrammi processati come .npz in processed/<nome variante>.
+
+        A differenza di _apply_processing (solo RAM/anteprima), questo scrive
+        davvero i dati filtrati su disco, cosi' da poterli riusare per le
+        time-slice e confrontare varianti diverse.
+        """
+        if not self._profiles:
+            QMessageBox.information(
+                self, "Salva variante", "Importa almeno un profilo .ogpr prima."
+            )
+            return
+        paths = self._ensure_gpr_processing_layout()
+        if not paths:
+            QMessageBox.warning(
+                self, "Salva variante",
+                "Nessun workspace disponibile. Reimporta scegliendo una cartella di lavoro.",
+            )
+            return
+
+        name, ok = QInputDialog.getText(
+            self, "Salva variante processata",
+            "Nome variante (es. bp_bg, solo_bg):",
+        )
+        if not ok:
+            return
+        variant = "".join(
+            c if c.isalnum() or c in "_-" else "_" for c in str(name).strip()
+        ).strip("_")
+        if not variant:
+            QMessageBox.warning(self, "Salva variante", "Nome variante non valido.")
+            return
+
+        params = self._current_processing_params()
+        chain = params.get("chain_order")
+        variant_dir = os.path.join(paths["processed"], variant)
+        if os.path.isdir(variant_dir) and any(
+            f.lower().endswith(".npz") for f in os.listdir(variant_dir)
+        ):
+            ans = QMessageBox.question(
+                self, "Variante esistente",
+                f"La variante '{variant}' esiste gia'. Sovrascrivere i file processati?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
+        os.makedirs(variant_dir, exist_ok=True)
+
+        from PyQt5.QtWidgets import QProgressDialog
+        from PyQt5.QtCore import Qt as _Qt
+
+        n = len(self._profiles)
+        prog = QProgressDialog("Salvataggio variante in corso...", "Annulla", 0, n, self)
+        prog.setWindowModality(_Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+
+        files = []
+        errors = []
+        for i, prof in enumerate(self._profiles):
+            if prog.wasCanceled():
+                break
+            try:
+                proc_by_ch = []
+                for ci in range(int(getattr(prof, "n_channels", 0) or 0)):
+                    raw = np.asarray(prof.channel(ci).data, dtype=np.float32)
+                    out = apply_pipeline(
+                        raw, params, dt_ns=prof.dt_ns,
+                        normalize_output=False, chain_order=chain,
+                    )
+                    proc_by_ch.append(out)
+                if proc_by_ch:
+                    fp = save_processed_profile_npz(
+                        variant_dir, prof, proc_by_ch, params, chain
+                    )
+                    files.append(fp)
+            except Exception as e:
+                errors.append(f"{os.path.basename(getattr(prof, 'path', '?'))}: {e}")
+            prog.setValue(i + 1)
+        prog.setValue(n)
+
+        if files:
+            try:
+                write_variant_manifest(variant_dir, variant, params, chain, files)
+            except Exception:
+                pass
+        if errors:
+            QMessageBox.warning(
+                self, "Salva variante",
+                f"Salvati {len(files)}/{n} profili.\nErrori:\n" + "\n".join(errors[:8]),
+            )
+        elif files:
+            QMessageBox.information(
+                self, "Salva variante",
+                f"Variante '{variant}' salvata: {len(files)} profili in\n{variant_dir}",
+            )
+        else:
+            QMessageBox.warning(self, "Salva variante", "Nessun profilo salvato.")
+        try:
+            self._save_gpr_processing_project_meta(
+                last_processing=self._path_to_gpr_processing_store(variant_dir)
+            )
+        except Exception:
+            pass
+
+    def _build_slices_from_variant(self):
+        """Genera time-slice a partire da una variante di radargrammi gia'
+        processati (.npz), senza riapplicare la pipeline."""
+        paths = self._gpr_processing_paths()
+        start = paths.get("processed", "") if paths else ""
+        if not start or not os.path.isdir(start):
+            start = (paths.get("base", "") if paths else "") or os.path.expanduser("~")
+        folder = QFileDialog.getExistingDirectory(
+            self, "Seleziona cartella variante processata (.npz)", start
+        )
+        if not folder:
+            return
+        npzs = sorted(glob.glob(os.path.join(folder, "*.npz")))
+        if not npzs:
+            QMessageBox.warning(
+                self, "Time-slice da variante",
+                "Nessun file .npz nella cartella selezionata.",
+            )
+            return
+        try:
+            profiles = [load_processed_profile_npz(p) for p in npzs]
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Time-slice da variante", f"Errore lettura .npz: {e}"
+            )
+            return
+        if self.plugin is None or not hasattr(self.plugin, "import_ogpr_as_slices"):
+            QMessageBox.information(
+                self, "Time-slice da variante",
+                "Funzione disponibile dal plugin principale.",
+            )
+            return
+        try:
+            dz = float(self._spin_slice_thickness.value())
+        except Exception:
+            dz = 0.10
+        slice_params = self.get_slice_params()
+        # I dati sono gia' filtrati su disco: nessun ri-processing pipeline.
+        slice_params["use_processing"] = False
+        slice_params["pipeline_params"] = {}
+        slice_params["pre_slice_bg_removal"] = False
+        slice_params["z_step_override"] = float(dz)
+        slice_params["thickness_m"] = float(dz)
+        variant_name = os.path.basename(os.path.normpath(folder)) or "variante"
+        if paths.get("timeslices"):
+            slice_params["output_dir"] = os.path.join(paths["timeslices"], variant_name)
+        try:
+            self.plugin.import_ogpr_as_slices(
+                profiles, slice_params=slice_params,
+                completion_callback=self._on_timeslice_build_finished,
+            )
+        except TypeError:
+            self.plugin.import_ogpr_as_slices(profiles, slice_params=slice_params)
+
     def _slice_pipeline_enabled_map(self) -> dict:
         enabled = dict(self._pipeline_enabled_map_from_controls() or {})
         if self._is_qt_alive(self._filter_chain_widget):
@@ -6223,20 +7544,38 @@ class GprProfileViewer(QMainWindow):
         self._spin_smooth_sigma.setEnabled(bool(self._chk_smooth.isChecked()))
         self._spin_slice_profile_workers.setEnabled(bool(self._chk_slice_parallel_profiles.isChecked()))
         self._sync_slice_source_mode()
+
+        # I preset "Qualita'"/"Aggressivo" impostano parametri della sezione
+        # Esperto: senza abilitarla esplicitamente quei valori verrebbero
+        # ignorati da get_slice_params(). "Base" li riporta ai default e
+        # ricollassa la sezione per tornare alla vista semplice.
+        if self._is_qt_alive(getattr(self, "_btn_slice_expert", None)):
+            self._btn_slice_expert.setChecked(key != "base")
+
         self._safe_set_text(self._lbl_status, lbl)
 
     def get_slice_params(self) -> dict:
-        slice_bg_auto = bool(self._chk_slice_bg_auto.isChecked())
-        topo_mode = str(self._cb_slice_topo_ref_mode.currentData() or "median")
+        # "Esperto" e' un flag: finche' non e' esplicitamente abilitato, questi
+        # campi vengono ignorati e si usa il comportamento di default, anche
+        # se i widget (nascosti) contengono un valore diverso.
+        expert_on = bool(
+            self._is_qt_alive(getattr(self, "_btn_slice_expert", None))
+            and self._btn_slice_expert.isChecked()
+        )
+        slice_bg_auto = bool(self._chk_slice_bg_auto.isChecked()) if expert_on else True
+        topo_mode = str(self._cb_slice_topo_ref_mode.currentData() or "median") if expert_on else "median"
+        topo_on = bool(self._chk_slice_topographic.isChecked()) if expert_on else False
         topo_custom = None
-        if topo_mode == "custom":
+        if expert_on and topo_mode == "custom":
             topo_custom = float(self._spin_slice_topo_ref_custom.value())
         proc_params = dict(self._current_processing_params() or {})
         proc_params, use_processing, extraction_mode, use_hilbert, source_step = self._resolve_slice_source(
             proc_params,
-            extraction_mode_manual=str(self._cb_slice_extraction.currentData() or "las_like"),
-            use_hilbert_manual=bool(self._chk_slice_use_hilbert.isChecked()),
-            use_processing_manual=bool(self._chk_slice_use_processing.isChecked()),
+            extraction_mode_manual=(
+                str(self._cb_slice_extraction.currentData() or "las_like") if expert_on else "las_like"
+            ),
+            use_hilbert_manual=(bool(self._chk_slice_use_hilbert.isChecked()) if expert_on else True),
+            use_processing_manual=(bool(self._chk_slice_use_processing.isChecked()) if expert_on else True),
         )
         # For timeslice pre-processing, avoid surface over-saturation with conservative defaults
         # when the panel is still using broad generic values.
@@ -6260,30 +7599,30 @@ class GprProfileViewer(QMainWindow):
         radius_override = None
         if np.isfinite(search_radius) and search_radius > 0.0:
             radius_override = float(search_radius)
-        auto_radius = bool(self._chk_auto_radius.isChecked())
-        if radius_override is not None:
-            auto_radius = False
+        auto_radius = radius_override is None
         return {
-            "normalize_channels":  self._chk_normalize_ch.isChecked(),
+            "normalize_channels":  (self._chk_normalize_ch.isChecked() if expert_on else False),
             "slice_source":        str(source_step or "auto"),
             "extraction_mode":     str(extraction_mode or "las_like"),
             "use_hilbert":         bool(use_hilbert),
             "use_processing":      bool(use_processing),
             "pre_slice_bg_removal": self._chk_slice_bg.isChecked(),
-            "pre_slice_bg_mode": str(self._cb_slice_bg_mode.currentData() or "line_by_line"),
+            "pre_slice_bg_mode": (
+                str(self._cb_slice_bg_mode.currentData() or "line_by_line") if expert_on else "line_by_line"
+            ),
             "pre_slice_bg_window": (0 if slice_bg_auto else int(self._spin_slice_bg_window.value())),
-            "pre_slice_bg_sample_start": int(self._spin_slice_bg_sample_start.value()),
-            "pre_slice_bg_sample_end": int(self._spin_slice_bg_sample_end.value()),
-            "stack_n": int(self._spin_slice_stack_n.value()),
-            "stack_kernel": str(self._cb_slice_stack_kernel.currentData() or "boxcar"),
-            "flip_traces_mode": str(self._cb_slice_flip_mode.currentData() or "none"),
+            "pre_slice_bg_sample_start": (int(self._spin_slice_bg_sample_start.value()) if expert_on else 0),
+            "pre_slice_bg_sample_end": (int(self._spin_slice_bg_sample_end.value()) if expert_on else 0),
+            "stack_n": (int(self._spin_slice_stack_n.value()) if expert_on else 1),
+            "stack_kernel": (str(self._cb_slice_stack_kernel.currentData() or "boxcar") if expert_on else "boxcar"),
+            "flip_traces_mode": (str(self._cb_slice_flip_mode.currentData() or "none") if expert_on else "none"),
             "pipeline_params": proc_params,
-            "topographic_correction": bool(self._chk_slice_topographic.isChecked()),
+            "topographic_correction": topo_on,
             "topo_reference_mode": topo_mode,
             "topo_reference_elevation": topo_custom,
             "amplitude_sigma":     (
                 float(self._spin_amplitude_sigma.value())
-                if self._chk_amplitude_filter.isChecked() else None
+                if (expert_on and self._chk_amplitude_filter.isChecked()) else None
             ),
             "idw_mode":            str(self._cb_slice_idw_mode.currentData() or "quality"),
             "radius":              radius_override,
@@ -6291,13 +7630,13 @@ class GprProfileViewer(QMainWindow):
             "idw_power":           int(self._spin_slice_idw_power.value()),
             "overlap_fraction":    float(self._spin_slice_overlap_pct.value()) / 100.0,
             "blanking_distance":   float(self._spin_slice_blanking_m.value()),
-            "use_anisotropic_idw": self._chk_anisotropic_idw.isChecked(),
+            "use_anisotropic_idw": (self._chk_anisotropic_idw.isChecked() if expert_on else False),
             "auto_radius":         bool(auto_radius),
             "balance_profiles":    self._chk_slice_balance_profiles.isChecked(),
-            "depth_radius_factor": float(self._spin_slice_depth_radius_factor.value()),
-            "min_points":          int(self._spin_slice_min_points.value()),
-            "parallel_profiles":   self._chk_slice_parallel_profiles.isChecked(),
-            "profile_workers":     int(self._spin_slice_profile_workers.value()),
+            "depth_radius_factor": (float(self._spin_slice_depth_radius_factor.value()) if expert_on else 0.6),
+            "min_points":          (int(self._spin_slice_min_points.value()) if expert_on else 1),
+            "parallel_profiles":   (self._chk_slice_parallel_profiles.isChecked() if expert_on else True),
+            "profile_workers":     (int(self._spin_slice_profile_workers.value()) if expert_on else 0),
             "fill_nodata":         self._chk_fill_nodata.isChecked(),
             "smooth_sigma":        (
                 float(self._spin_smooth_sigma.value())
@@ -6593,6 +7932,7 @@ class GprProfileViewer(QMainWindow):
             return
 
         # Real close path (plugin unload).
+        self._stop_preview_worker_blocking()
         try:
             self._save_gpr_processing_project_meta()
         except Exception:

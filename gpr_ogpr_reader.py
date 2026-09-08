@@ -225,10 +225,12 @@ def _decode_radar_volume(
             arr = np.frombuffer(radar_raw, dtype=dtype)
             if arr.size != exp_count:
                 continue
-            arr_f32 = arr.astype(np.float32, copy=False)
-            suspicious = _radar_data_is_suspicious(arr_f32, base.kind)
+            # Plausibility check on raw-typed view — avoids allocating a float32
+            # copy (up to 1 GiB) for every candidate on large files.  The
+            # float32 conversion happens only once, on the winning candidate.
+            suspicious = _radar_data_is_suspicious(arr, base.kind)
             candidates.append({
-                "arr": arr_f32,
+                "arr": arr,          # raw dtype; converted to float32 at return time
                 "raw_dtype": dtype.str,
                 "byte_order": byte_order,
                 "base": base,
@@ -244,7 +246,7 @@ def _decode_radar_volume(
     # 1) preferisci il tipo dichiarato little-endian se plausibile
     for cand in candidates:
         if cand["base"] == base_dtype and cand["byte_order"] == "<" and not cand["suspicious"]:
-            return cand["arr"], value_type_norm, cand["raw_dtype"], cand["byte_order"], warnings
+            return cand["arr"].astype(np.float32), value_type_norm, cand["raw_dtype"], cand["byte_order"], warnings
 
     # 2) altrimenti prova tipo dichiarato big-endian se è l'unico plausibile
     little_declared = None
@@ -261,7 +263,7 @@ def _decode_radar_volume(
             f"Endian fallback applicato per Radar Volume: valueType='{value_type_raw}' letto come big-endian."
         )
         return (
-            big_declared["arr"],
+            big_declared["arr"].astype(np.float32),
             value_type_norm,
             big_declared["raw_dtype"],
             big_declared["byte_order"],
@@ -275,7 +277,7 @@ def _decode_radar_volume(
                 warnings.append(
                     f"valueType='{value_type_raw}' non coerente; usato fallback dtype {cand['raw_dtype']}."
                 )
-            return cand["arr"], value_type_norm, cand["raw_dtype"], cand["byte_order"], warnings
+            return cand["arr"].astype(np.float32), value_type_norm, cand["raw_dtype"], cand["byte_order"], warnings
 
     # 4) ultimo fallback: tipo dichiarato little-endian (comportamento storico)
     if little_declared is not None:
@@ -286,7 +288,7 @@ def _decode_radar_volume(
                 f"Controllo plausibilita' radar inconclusivo; mantenuta lettura dichiarata {little_declared['raw_dtype']}."
             )
         return (
-            little_declared["arr"],
+            little_declared["arr"].astype(np.float32),
             value_type_norm,
             little_declared["raw_dtype"],
             little_declared["byte_order"],
@@ -297,7 +299,7 @@ def _decode_radar_volume(
     warnings.append(
         f"Dati radar plausibilita' bassa; usato fallback dtype {first['raw_dtype']}."
     )
-    return first["arr"], value_type_norm, first["raw_dtype"], first["byte_order"], warnings
+    return first["arr"].astype(np.float32), value_type_norm, first["raw_dtype"], first["byte_order"], warnings
 
 
 def _is_valid_md5_hex(txt: str) -> bool:
@@ -577,11 +579,19 @@ def read_ogpr(path: str, verify_md5: bool = False) -> OgprProfile:
             radar_raw = raw[r_offset: r_offset + r_bytesize]
 
             exp = n_samples * n_channels * n_slices
-            radar_flat, value_type, raw_dtype, byte_order, radar_warnings = _decode_radar_volume(
-                radar_raw=radar_raw,
-                exp_count=exp,
-                value_type_raw=value_type_raw,
-            )
+            needed_gib = exp * 4 / 1024 ** 3
+            try:
+                radar_flat, value_type, raw_dtype, byte_order, radar_warnings = _decode_radar_volume(
+                    radar_raw=radar_raw,
+                    exp_count=exp,
+                    value_type_raw=value_type_raw,
+                )
+            except MemoryError:
+                raise OgprReadError(
+                    f"Memoria insufficiente per caricare il Radar Volume "
+                    f"({n_slices} slice × {n_channels} ch × {n_samples} campioni = "
+                    f"{needed_gib:.2f} GiB float32 richiesti)."
+                )
             parse_warnings.extend(radar_warnings)
             radar_3d = radar_flat.reshape((n_slices, n_channels, n_samples))
 
@@ -600,6 +610,16 @@ def read_ogpr(path: str, verify_md5: bool = False) -> OgprProfile:
                 md5_candidates: dict[str, str] = {}
 
                 ordered_checks = [
+                    # Schema IDS GeoRadar (Aladdin/Stream): l'MD5 e' calcolato su
+                    # tutto il file ESCLUSI il magic, i 32 char dell'MD5 di header
+                    # e i 32 char dell'MD5 replicato in coda. I newline restano
+                    # inclusi. Verificato su file .ogpr v1.0 int16 multi-canale.
+                    (
+                        "ids_payload_excl_md5",
+                        lambda: _md5_hexdigest_range(
+                            raw, start=pos_after_magic + 32, end=file_size - 32
+                        ),
+                    ),
                     ("payload_after_json", lambda: _md5_hexdigest_range(raw, start=pos, end=file_size)),
                     ("full_file", lambda: _md5_hexdigest_range(raw, start=0, end=file_size)),
                     ("after_magic", lambda: _md5_hexdigest_range(raw, start=pos_after_magic, end=file_size)),
@@ -660,7 +680,7 @@ def read_ogpr(path: str, verify_md5: bool = False) -> OgprProfile:
                             md5_scope = "all_blocks_sorted"
 
                 if md5_verified:
-                    if md5_scope != "payload_after_json":
+                    if md5_scope not in ("payload_after_json", "ids_payload_excl_md5"):
                         parse_warnings.append(
                             f"MD5 verificato con scope '{md5_scope}' (non payload_after_json)."
                         )

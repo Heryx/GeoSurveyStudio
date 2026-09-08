@@ -6,12 +6,15 @@ from qgis.PyQt.QtWidgets import (
     QScrollArea,
     QWidget,
     QTabWidget,
+    QDockWidget,
     QGridLayout,
     QVBoxLayout,
     QHBoxLayout,
     QComboBox,
     QDoubleSpinBox,
     QPushButton,
+    QToolButton,
+    QMenu,
     QGroupBox,
     QRadioButton,
     QSpinBox,
@@ -75,6 +78,7 @@ class UiLayoutMixin:
         self.tools_tabs = None
         self.tools_panel_widget = None
         self.tools_panel_layout = None
+        self.tools_dock_widget = None
         self.bottom_controls_widget = None
         self.left_nav_widget = None
         self.raster_lock_flag_checkbox = None
@@ -190,6 +194,13 @@ class UiLayoutMixin:
         if self.dlg is None or self.tools_tabs is not None:
             return
 
+        if getattr(self, "tools_dock_widget", None) is not None:
+            try:
+                self.iface.removeDockWidget(self.tools_dock_widget)
+                self.tools_dock_widget.deleteLater()
+            except Exception:
+                pass
+            self.tools_dock_widget = None
         if hasattr(self, "tools_panel_widget") and self.tools_panel_widget is not None:
             try:
                 self.tools_panel_widget.deleteLater()
@@ -371,6 +382,8 @@ class UiLayoutMixin:
         export_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         export_scroll.setFrameShape(QScrollArea.NoFrame)
         export_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Keep an expanded Export section from blowing out the accordion height.
+        export_scroll.setMaximumHeight(340)
         export_tab_outer.addWidget(export_scroll)
 
         export_inner = QWidget()
@@ -457,13 +470,64 @@ class UiLayoutMixin:
         export_layout.setColumnStretch(1, 1)
         export_layout.setRowStretch(12, 1)
 
+        # ── Assemble as a vertical (left-side) tab widget ────────────
+        # "Drawing Options" page: scrollable, holds the snap/ortho options
+        # (self.dlg.widget) plus the grid-definition controls
+        # (self.bottom_controls_widget), both moved in by
+        # _swap_drawing_and_navigation_sections().
+        drawing_tab = QWidget(tabs)
+        drawing_tab_outer = QVBoxLayout(drawing_tab)
+        drawing_tab_outer.setContentsMargins(0, 0, 0, 0)
+        drawing_tab_outer.setSpacing(0)
+        drawing_scroll = QScrollArea(drawing_tab)
+        drawing_scroll.setObjectName("drawingScrollArea")
+        drawing_scroll.setWidgetResizable(True)
+        drawing_scroll.setFrameShape(QScrollArea.NoFrame)
+        drawing_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        drawing_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        drawing_tab_outer.addWidget(drawing_scroll)
+        drawing_inner = QWidget()
+        drawing_inner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        drawing_scroll.setWidget(drawing_inner)
+        drawing_tab_layout = QVBoxLayout(drawing_inner)
+        drawing_tab_layout.setContentsMargins(4, 4, 4, 4)
+        drawing_tab_layout.setSpacing(6)
+        self.tools_drawing_tab_layout = drawing_tab_layout
+
+        tabs.addTab(drawing_tab, "Drawing Options")
         tabs.addTab(group_tab, "Groups")
         tabs.addTab(image_tab, "Images")
         tabs.addTab(export_tab, "Export")
+        tabs.setTabPosition(QTabWidget.West)
         tabs.tabBar().setExpanding(False)
         tabs.tabBar().setElideMode(Qt.ElideRight)
+        tabs.setUsesScrollButtons(False)
         tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         tabs.setMinimumHeight(148)
+
+        # Icon-only vertical tabs: rotated text breaks when the dock is
+        # narrowed, so show a compact icon + tooltip instead of the label.
+        _tab_specs = [
+            (0, "Drawing Options", ("mActionCapturePolygon.svg", "mActionAddPolygon.svg", "mActionEditNodesItem.svg")),
+            (1, "Groups", ("mActionAddGroup.svg", "mActionFolder.svg", "mIconFolder.svg")),
+            (2, "Images", ("mActionAddRasterLayer.svg", "mIconRaster.svg")),
+            (3, "Export", ("mActionSaveMapAsImage.svg", "mActionFileSave.svg", "mActionSaveAsPDF.svg")),
+        ]
+        for _idx, _name, _icon_names in _tab_specs:
+            tabs.setTabToolTip(_idx, _name)
+            _ic = None
+            for _icon_name in _icon_names:
+                try:
+                    _cand = QgsApplication.getThemeIcon(_icon_name)
+                except Exception:
+                    _cand = None
+                if _cand is not None and not _cand.isNull():
+                    _ic = _cand
+                    break
+            if _ic is not None:
+                tabs.setTabIcon(_idx, _ic)
+                tabs.setTabText(_idx, "")
+        tabs.setIconSize(QSize(18, 18))
 
         if self.group_tools_label is not None:
             self.group_tools_label.hide()
@@ -472,15 +536,80 @@ class UiLayoutMixin:
             self.image_tools_label.hide()
             self.dlg.gridLayout.removeWidget(self.image_tools_label)
 
-        tools_panel = QWidget(self.dlg.layoutWidget)
-        tools_layout = QVBoxLayout(tools_panel)
-        tools_layout.setContentsMargins(12, 0, 0, 0)
-        tools_layout.setSpacing(6)
-        tools_layout.addWidget(tabs, 1)
-        self.tools_panel_layout = tools_layout
+        # ── Tools panel: lives in its own dockable/floatable QDockWidget ──
+        # (tabified with the main plugin dock by default). A full-width bar
+        # button in the main dialog shows/hides it. Hidden by default; persisted.
+        tabs.tabBar().setVisible(True)
+
+        tools_body = QWidget()
+        tools_body.setObjectName("toolsBody")
+        body_layout = QVBoxLayout(tools_body)
+        body_layout.setContentsMargins(4, 0, 4, 0)
+        body_layout.setSpacing(4)
+        body_layout.addWidget(tabs, 1)
+        tools_body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.tools_body_widget = tools_body
+
+        # This button opens/closes the separate tools dock. It is placed in the
+        # main dialog (gridLayout_3 row 2) by the layout methods.
+        self.tools_collapse_button = QToolButton(self.dlg.layoutWidget)
+        self.tools_collapse_button.setObjectName("toolsCollapseButton")
+        self.tools_collapse_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.tools_collapse_button.setToolTip("Show / hide the Drawing / Groups / Images / Export tools panel")
+        self.tools_collapse_button.setFixedHeight(22)
+        self.tools_collapse_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.tools_collapse_button.setStyleSheet(
+            "QToolButton { border: 1px solid palette(mid); border-radius: 3px; "
+            "font-size: 9pt; padding: 0 8px; background: palette(button); } "
+            "QToolButton:hover { background: palette(midlight); }"
+        )
+        self.tools_collapse_button.clicked.connect(self._toggle_tools_dock)
+
+        tools_panel = QWidget()
+        outer_layout = QVBoxLayout(tools_panel)
+        outer_layout.setContentsMargins(2, 2, 2, 2)
+        outer_layout.setSpacing(3)
+        outer_layout.addWidget(tools_body, 1)
+        self.tools_panel_layout = body_layout
         tools_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.tools_panel_widget = tools_panel
         self.tools_tabs = tabs
+
+        # Host the panel in its own dock widget.
+        main_window = self.iface.mainWindow() if self.iface is not None else None
+        dock = QDockWidget(self.tr(u"GeoSurvey Studio – Tools") if hasattr(self, "tr") else "GeoSurvey Studio – Tools", main_window)
+        dock.setObjectName("GeoSurveyStudioToolsDock")
+        dock.setFeatures(
+            QDockWidget.DockWidgetMovable
+            | QDockWidget.DockWidgetFloatable
+            | QDockWidget.DockWidgetClosable
+        )
+        dock.setAllowedAreas(
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea
+        )
+        dock.setWidget(tools_panel)
+        dock.setMinimumHeight(180)
+        self.tools_dock_widget = dock
+        if main_window is not None and self.iface is not None:
+            try:
+                self.iface.addDockWidget(Qt.RightDockWidgetArea, dock)
+                if self.dock_widget is not None:
+                    main_window.tabifyDockWidget(self.dock_widget, dock)
+            except Exception:
+                pass
+        dock.visibilityChanged.connect(self._on_tools_dock_visibility_changed)
+
+        _collapsed = True
+        try:
+            _collapsed = bool(
+                self.settings.value(
+                    self._settings_key("ui/tools_panel_collapsed"), True, type=bool
+                )
+            )
+        except Exception:
+            _collapsed = True
+        self._tools_panel_collapsed = _collapsed
+        self._apply_tools_panel_collapsed(_collapsed, persist=False)
 
         if self.export_page_size_combo is not None:
             self.export_page_size_combo.currentTextChanged.connect(self._on_export_page_size_changed)
@@ -497,6 +626,61 @@ class UiLayoutMixin:
                 sc = float(self.iface.mapCanvas().scale())
                 if sc > 0:
                     self.export_scale_spin.setValue(sc)
+        except Exception:
+            pass
+
+    def _update_tools_button_text(self, collapsed):
+        btn = getattr(self, "tools_collapse_button", None)
+        if btn is not None:
+            btn.setText("≡  Open tools panel" if collapsed else "≡  Hide tools panel")
+
+    def _toggle_tools_dock(self):
+        """Bar-button handler: flip the tools dock between shown and hidden."""
+        self._apply_tools_panel_collapsed(not bool(getattr(self, "_tools_panel_collapsed", True)))
+
+    def _apply_tools_panel_collapsed(self, collapsed, persist=True):
+        """Show or hide the separate tools dock. `collapsed=True` means hidden."""
+        collapsed = bool(collapsed)
+        self._tools_panel_collapsed = collapsed
+        dock = getattr(self, "tools_dock_widget", None)
+
+        self._update_tools_button_text(collapsed)
+
+        if dock is not None and self._qt_widget_alive(dock):
+            want_visible = not collapsed
+            if dock.isVisible() != want_visible:
+                dock.blockSignals(True)
+                dock.setVisible(want_visible)
+                dock.blockSignals(False)
+            if want_visible:
+                dock.raise_()
+
+        # Row 0 (lists) keeps the vertical growth; row 2 only holds the opener.
+        if self.dlg is not None and hasattr(self.dlg, "gridLayout_3"):
+            gl3 = self.dlg.gridLayout_3
+            gl3.setRowStretch(0, 3)
+            gl3.setRowStretch(1, 1)
+            gl3.setRowStretch(2, 0)
+            gl3.setRowStretch(3, 0)
+
+        if persist:
+            try:
+                self.settings.setValue(
+                    self._settings_key("ui/tools_panel_collapsed"), collapsed
+                )
+            except Exception:
+                pass
+
+    def _on_tools_dock_visibility_changed(self, visible):
+        """Keep button text / persisted state in sync when the dock is closed
+        via its own title-bar X (or raised/hidden by tab switching)."""
+        collapsed = not bool(visible)
+        self._tools_panel_collapsed = collapsed
+        self._update_tools_button_text(collapsed)
+        try:
+            self.settings.setValue(
+                self._settings_key("ui/tools_panel_collapsed"), collapsed
+            )
         except Exception:
             pass
 
@@ -558,9 +742,8 @@ class UiLayoutMixin:
 
         panel = QWidget(self.dlg)
         panel.setObjectName("gridDefinitionPanel")
-        panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        panel.setMinimumHeight(128)
-        panel.setMaximumHeight(176)
+        panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        panel.setMinimumHeight(0)
         panel_layout = QGridLayout(panel)
         panel_layout.setContentsMargins(4, 4, 4, 4)
         panel_layout.setHorizontalSpacing(8)
@@ -654,18 +837,15 @@ class UiLayoutMixin:
         drawing_layout.addWidget(self.dlg.lineEditDistanceX, 5, 0, 1, 1)
         drawing_layout.addWidget(self.dlg.lineEditDistanceY, 5, 1, 1, 1)
 
+        # Stacked vertically so the block fits the narrow tools sidebar.
         panel_layout.addWidget(orientation_block, 0, 0, 1, 1, Qt.AlignTop)
-        panel_layout.addWidget(drawing_block, 0, 1, 1, 1, Qt.AlignTop)
-        right_spacer = QWidget(panel)
-        right_spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-        panel_layout.addWidget(right_spacer, 0, 2, 1, 1)
-        panel_layout.setColumnStretch(0, 0)
-        panel_layout.setColumnStretch(1, 0)
-        panel_layout.setColumnStretch(2, 1)
-        panel_layout.setRowStretch(0, 0)
+        panel_layout.addWidget(drawing_block, 1, 0, 1, 1, Qt.AlignTop)
+        panel_layout.setColumnStretch(0, 1)
+        panel_layout.setRowStretch(2, 1)
 
         self.bottom_controls_widget = panel
-        self.dlg.gridLayout_3.addWidget(panel, 2, 0, 1, 4)
+        # Placed into the "Drawing Options" tab by
+        # _swap_drawing_and_navigation_sections(); no longer a bottom bar.
 
     def _swap_drawing_and_navigation_sections(self):
         if self.dlg is None:
@@ -691,16 +871,48 @@ class UiLayoutMixin:
             vl.removeWidget(self.left_nav_widget)
             vl.addWidget(self.left_nav_widget)
 
-        if hasattr(self.dlg, "gridLayout_3") and getattr(self, "tools_panel_widget", None) is not None:
-            self.dlg.gridLayout_3.addWidget(self.tools_panel_widget, 0, 2, 1, 2)
-        if getattr(self, "tools_panel_layout", None) is not None and hasattr(self.dlg, "widget"):
-            self.dlg.widget.setParent(self.tools_panel_widget)
+        if hasattr(self.dlg, "gridLayout_3") and getattr(self, "tools_collapse_button", None) is not None:
+            self.dlg.gridLayout_3.addWidget(self.tools_collapse_button, 2, 0, 1, 4)
+        if getattr(self, "tools_drawing_tab_layout", None) is not None and hasattr(self.dlg, "widget"):
             self.dlg.widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
             self.dlg.widget.setMinimumWidth(170)
-            self.dlg.widget.setMinimumHeight(170)
-            self.dlg.widget.setMaximumHeight(250)
-            self.tools_panel_layout.removeWidget(self.dlg.widget)
-            self.tools_panel_layout.addWidget(self.dlg.widget, 0, Qt.AlignTop)
+            self.dlg.widget.setMinimumHeight(0)
+            self.dlg.widget.setMaximumHeight(16777215)
+            self.tools_drawing_tab_layout.removeWidget(self.dlg.widget)
+            self.tools_drawing_tab_layout.addWidget(self.dlg.widget, 0, Qt.AlignTop)
+
+        bcw = getattr(self, "bottom_controls_widget", None)
+        if getattr(self, "tools_drawing_tab_layout", None) is not None and bcw is not None:
+            if hasattr(self.dlg, "gridLayout_3"):
+                self.dlg.gridLayout_3.removeWidget(bcw)
+            bcw.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+            bcw.setMinimumHeight(0)
+            bcw.setMaximumHeight(16777215)
+            self.tools_drawing_tab_layout.removeWidget(bcw)
+            self.tools_drawing_tab_layout.addWidget(bcw, 0, Qt.AlignTop)
+
+    def _distribute_left_column_stretch(self):
+        """Give the raster/group lists the vertical stretch in the left column
+        so they expand toward the bottom; keep labels and the dial block fixed."""
+        if self.dlg is None or not hasattr(self.dlg, "verticalLayout_3"):
+            return
+        vl = self.dlg.verticalLayout_3
+        raster = getattr(self.dlg, "rasterListWidget", None)
+        group = getattr(self.dlg, "groupListWidget", None)
+        for idx in range(vl.count()):
+            item = vl.itemAt(idx)
+            if item is None:
+                continue
+            w = item.widget()
+            if w is not None and w is raster:
+                vl.setStretch(idx, 3)
+            elif w is not None and w is group:
+                vl.setStretch(idx, 2)
+            else:
+                try:
+                    vl.setStretch(idx, 0)
+                except Exception:
+                    pass
 
     def _tune_visual_layout(self):
         button_style = "font-size: 9pt; padding: 4px 8px;"
@@ -715,16 +927,18 @@ class UiLayoutMixin:
 
         if hasattr(self.dlg, "rasterListWidget"):
             self.dlg.rasterListWidget.setMinimumWidth(140)
-            self.dlg.rasterListWidget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-            self.dlg.rasterListWidget.setMinimumHeight(60)
-            self.dlg.rasterListWidget.setMaximumHeight(108)
+            # Vertically Expanding + stretch (set on verticalLayout_3 below) so
+            # the list grows toward the bottom when the dialog is enlarged.
+            self.dlg.rasterListWidget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.dlg.rasterListWidget.setMinimumHeight(80)
+            self.dlg.rasterListWidget.setMaximumHeight(16777215)
             self.dlg.rasterListWidget.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
             self.dlg.rasterListWidget.setStyleSheet("font-size: 9pt;")
         if hasattr(self.dlg, "groupListWidget"):
             self.dlg.groupListWidget.setMinimumWidth(140)
-            self.dlg.groupListWidget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-            self.dlg.groupListWidget.setMinimumHeight(52)
-            self.dlg.groupListWidget.setMaximumHeight(92)
+            self.dlg.groupListWidget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.dlg.groupListWidget.setMinimumHeight(70)
+            self.dlg.groupListWidget.setMaximumHeight(16777215)
             self.dlg.groupListWidget.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
             # Delegate controls selected/non-selected rendering; avoid CSS font quirks.
             self.dlg.groupListWidget.setStyleSheet("")
@@ -791,8 +1005,10 @@ class UiLayoutMixin:
         )
 
         if self.tools_tabs is not None:
+            # Vertical (West) tab bar, icon-only: keep the strip narrow so it
+            # never overflows when the dock is shrunk.
             self.tools_tabs.setStyleSheet(
-                "QTabBar::tab { font-size: 9pt; padding: 2px 6px; min-width: 52px; }"
+                "QTabBar::tab { padding: 7px 3px; margin: 0; }"
             )
 
         for checkbox in (self.snap_checkbox, self.ortho_checkbox,
@@ -885,29 +1101,33 @@ class UiLayoutMixin:
         if hasattr(self.dlg, "gridLayout_3"):
             self.dlg.gridLayout_3.setHorizontalSpacing(10)
             self.dlg.gridLayout_3.setVerticalSpacing(8)
-            self.dlg.gridLayout_3.setColumnStretch(0, 4)
+            # Single-column stacked layout: lists on top (row 0), a small elastic
+            # gap (row 1), and the "open tools panel" bar button (row 2).
+            self.dlg.gridLayout_3.setColumnStretch(0, 1)
             self.dlg.gridLayout_3.setColumnStretch(1, 0)
-            self.dlg.gridLayout_3.setColumnStretch(2, 3)
+            self.dlg.gridLayout_3.setColumnStretch(2, 0)
             self.dlg.gridLayout_3.setColumnStretch(3, 0)
-            if getattr(self, "tools_panel_widget", None) is not None:
-                self.dlg.gridLayout_3.addWidget(self.tools_panel_widget, 0, 2, 1, 2)
-            self.dlg.gridLayout_3.setRowStretch(0, 1)
-            self.dlg.gridLayout_3.setRowStretch(1, 0)
+            if hasattr(self.dlg, "verticalLayout_3"):
+                self.dlg.gridLayout_3.addLayout(self.dlg.verticalLayout_3, 0, 0, 1, 4)
+            if getattr(self, "tools_collapse_button", None) is not None:
+                self.dlg.gridLayout_3.addWidget(self.tools_collapse_button, 2, 0, 1, 4)
+            if hasattr(self.dlg, "line"):
+                self.dlg.line.hide()
+            # Row 0 (raster/group lists + dial) claims the vertical growth so the
+            # lists expand toward the bottom; row 1 stays a small elastic gap.
+            self.dlg.gridLayout_3.setRowStretch(0, 3)
+            self.dlg.gridLayout_3.setRowStretch(1, 1)
             self.dlg.gridLayout_3.setRowStretch(2, 0)
             self.dlg.gridLayout_3.setRowStretch(3, 0)
 
         if hasattr(self.dlg, "verticalLayout_3"):
             self.dlg.verticalLayout_3.setContentsMargins(0, 0, 6, 0)
             self.dlg.verticalLayout_3.setSpacing(2)
-            for idx in range(self.dlg.verticalLayout_3.count()):
-                try:
-                    self.dlg.verticalLayout_3.setStretch(idx, 0)
-                except Exception:
-                    pass
+            self._distribute_left_column_stretch()
 
         if hasattr(self.dlg, "widget"):
-            self.dlg.widget.setMinimumHeight(170)
-            self.dlg.widget.setMaximumHeight(250)
+            self.dlg.widget.setMinimumHeight(0)
+            self.dlg.widget.setMaximumHeight(16777215)
             self.dlg.widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 
         if self.left_nav_widget is not None:
@@ -923,6 +1143,13 @@ class UiLayoutMixin:
 
         if self.bottom_controls_widget is None:
             self._build_bottom_controls_layout()
+
+        # Re-assert the collapsed/expanded state: the column-stretch tweaks
+        # above would otherwise re-expand a collapsed panel.
+        if hasattr(self, "_apply_tools_panel_collapsed"):
+            self._apply_tools_panel_collapsed(
+                getattr(self, "_tools_panel_collapsed", True), persist=False
+            )
 
     def _init_name_raster_panel(self):
         if self.name_raster_panel is not None or self.dlg is None:

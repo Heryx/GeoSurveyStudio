@@ -3,6 +3,8 @@
 Project-folder and catalog helpers for 2D/3D geophysics workflows.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -219,6 +221,75 @@ def _write_catalog_file(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=True)
     return path
+
+
+# Path fields that should be stored as relative paths in the catalog JSON.
+_PATH_FIELDS_PER_COLLECTION = {
+    "timeslices":     ("project_path", "source_path", "z_grid_project_path", "z_grid_source_path"),
+    "radargrams":     ("project_path", "source_path"),
+    "models_3d":      ("project_path", "source_path"),
+    "vector_layers":  ("project_path", "source_path"),
+    "raster_groups":  ("style_qml_path",),
+}
+
+
+def _to_relative_path(project_root, path):
+    """Return a posix-style relative path when *path* is inside *project_root*, else return it unchanged."""
+    if not path or not project_root:
+        return path
+    try:
+        abs_path = os.path.abspath(path)
+        abs_root = os.path.abspath(project_root)
+        # Case-insensitive containment check (Windows), case-sensitive relpath.
+        if os.path.normcase(abs_path).startswith(os.path.normcase(abs_root) + os.sep) \
+                or os.path.normcase(abs_path) == os.path.normcase(abs_root):
+            rel = os.path.relpath(abs_path, abs_root)
+            return rel.replace("\\", "/")
+    except Exception:
+        pass
+    return path
+
+
+def _to_absolute_path(project_root, path):
+    """Resolve a catalog path (relative or absolute) to an absolute path."""
+    if not path or not project_root:
+        return path
+    try:
+        if not os.path.isabs(path):
+            return os.path.normpath(os.path.join(project_root, path))
+    except Exception:
+        pass
+    return path
+
+
+def _make_catalog_paths_relative(project_root, data):
+    """Return a shallow copy of *data* with all project-internal paths stored as relative."""
+    import copy
+    data = copy.deepcopy(data)
+    for collection, fields in _PATH_FIELDS_PER_COLLECTION.items():
+        for rec in data.get(collection) or []:
+            if not isinstance(rec, dict):
+                continue
+            for field in fields:
+                val = rec.get(field)
+                if val:
+                    rec[field] = _to_relative_path(project_root, val)
+    return data
+
+
+def _resolve_catalog_paths(project_root, data):
+    """Return a shallow copy of *data* with all relative paths resolved to absolute."""
+    import copy
+    data = copy.deepcopy(data)
+    for collection, fields in _PATH_FIELDS_PER_COLLECTION.items():
+        for rec in data.get(collection) or []:
+            if not isinstance(rec, dict):
+                continue
+            for field in fields:
+                val = rec.get(field)
+                if val:
+                    rec[field] = _to_absolute_path(project_root, val)
+    return data
 
 
 def _backup_catalog_file(path, suffix="migration"):
@@ -447,6 +518,7 @@ def load_catalog_with_info(project_root, plugin_version=None, create_backup_on_m
     with open(path, "r", encoding="utf-8") as f:
         loaded = json.load(f)
 
+    loaded = _resolve_catalog_paths(project_root, loaded)
     normalized, info = ensure_catalog_schema(project_root, loaded, return_info=True)
     info = dict(info or {})
     info.setdefault("backup_path", None)
@@ -487,7 +559,7 @@ def save_catalog(project_root, data):
     data = ensure_catalog_schema(project_root, data)
     data["updated_at"] = utc_now_iso()
     path = catalog_path(project_root)
-    return _write_catalog_file(path, data)
+    return _write_catalog_file(path, _make_catalog_paths_relative(project_root, data))
 
 
 def register_model_3d(project_root, model_record):
@@ -1078,6 +1150,37 @@ def _unique_destination_path(directory, filename):
         i += 1
 
 
+# Sidecar files that carry georeferencing / metadata next to a raster and must
+# travel with it when the raster is copied (and renamed) into the project.
+_RASTER_SIDECAR_SUFFIXES = (
+    ".tfw", ".tifw", ".jgw", ".jpgw", ".pgw", ".pngw", ".bpw", ".bmpw",
+    ".wld", ".prj", ".aux.xml", ".tab", ".ovr",
+)
+
+
+def _copy_raster_sidecars(source_path, destination_path):
+    """
+    Copy known georeference sidecars (world file, .prj, .aux.xml, ...) that sit
+    beside ``source_path`` to match the (possibly renamed) ``destination_path``.
+    """
+    src_stem, src_ext = os.path.splitext(source_path)
+    dst_stem, _dst_ext = os.path.splitext(destination_path)
+    for sfx in _RASTER_SIDECAR_SUFFIXES:
+        # Suffixes like ".aux.xml" / ".ovr" are appended to the full file name;
+        # world files replace the extension of the stem.
+        if sfx in (".aux.xml", ".ovr"):
+            src_sidecar = source_path + sfx
+            dst_sidecar = destination_path + sfx
+        else:
+            src_sidecar = src_stem + sfx
+            dst_sidecar = dst_stem + sfx
+        try:
+            if os.path.isfile(src_sidecar) and not os.path.exists(dst_sidecar):
+                shutil.copy2(src_sidecar, dst_sidecar)
+        except Exception:
+            pass
+
+
 def normalize_copy_into_project(project_root, subfolder, source_path):
     """
     Copy source file to a canonical project subfolder with sanitized unique name.
@@ -1090,6 +1193,7 @@ def normalize_copy_into_project(project_root, subfolder, source_path):
     destination_dir = os.path.join(project_root, subfolder)
     destination_path = _unique_destination_path(destination_dir, normalized_name)
     shutil.copy2(source_path, destination_path)
+    _copy_raster_sidecars(source_path, destination_path)
     return destination_path, os.path.basename(destination_path)
 
 
