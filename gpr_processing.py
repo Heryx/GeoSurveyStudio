@@ -1333,6 +1333,231 @@ def kirchhoff_migration_2d(
     return out.astype(np.float32)
 
 
+# ---------------------------------------------------------------------------
+# Fase 6 — attributi istantanei, NMO / analisi velocità CMP, blending multi-freq
+# ---------------------------------------------------------------------------
+
+def _analytic_signal(arr64: np.ndarray) -> np.ndarray:
+    """Segnale analitico complesso lungo l'asse campioni (axis 0), a blocchi."""
+    n_s, n_t = arr64.shape
+    h = np.zeros(n_s, dtype=np.float64)
+    if n_s % 2 == 0:
+        h[0] = h[n_s // 2] = 1.0
+        h[1:n_s // 2] = 2.0
+    else:
+        h[0] = 1.0
+        h[1:(n_s + 1) // 2] = 2.0
+    out = np.empty((n_s, n_t), dtype=np.complex128)
+    cols = max(1, min(n_t, int((64 * 1024 * 1024) // max(1, 3 * 16 * n_s))))
+    for a in range(0, n_t, cols):
+        b = min(n_t, a + cols)
+        blk = np.ascontiguousarray(arr64[:, a:b].T, dtype=np.float64)
+        Xf = np.fft.fft(blk, axis=1)
+        out[:, a:b] = np.fft.ifft(Xf * h.reshape(1, -1), axis=1).T
+    return out
+
+
+def instantaneous_attributes(
+    data: np.ndarray,
+    dt_ns: float,
+    kind: str = "phase",
+) -> np.ndarray:
+    """Attributi complessi dal segnale analitico (Hilbert).
+
+    ``kind`` :
+      * ``envelope``   → |z|  (come `hilbert_envelope`)
+      * ``phase``      → fase istantanea avvolta [rad]
+      * ``cos_phase``  → cos(fase): normalizza l'ampiezza, evidenzia la
+                         continuità dei riflettori
+      * ``frequency``  → frequenza istantanea [MHz] da d(fase)/dt (unwrap)
+
+    Adattato concettualmente dagli attributi complessi (Taner et al.) e da RGPR
+    ``Hilbert``, GPL (>= 2) — reimplementato con FFT numpy.
+    """
+    if data is None:
+        return np.zeros((0, 0), dtype=np.float32)
+    arr = np.asarray(data, dtype=np.float64)
+    if arr.ndim != 2 or arr.size == 0:
+        return arr.astype(np.float32, copy=True)
+    arr = np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    n_s, n_t = arr.shape
+    if n_s <= 2 or n_t <= 0:
+        return arr.astype(np.float32, copy=True)
+    k = str(kind).strip().lower()
+    z = _analytic_signal(arr)
+    if k == "envelope":
+        out = np.abs(z)
+    elif k == "cos_phase":
+        out = np.cos(np.angle(z))
+    elif k == "frequency":
+        ph = np.unwrap(np.angle(z), axis=0)
+        dt_s = float(dt_ns) * 1e-9
+        if not np.isfinite(dt_s) or dt_s <= 0.0:
+            dt_s = 1.0
+        dphi = np.gradient(ph, axis=0)
+        out = dphi / (2.0 * np.pi * dt_s) / 1e6           # MHz
+        out = np.clip(out, 0.0, None)
+    else:  # phase
+        out = np.angle(z)
+    _log_gpr(f"[GPR] instantaneous_attributes: kind={k}  shape={arr.shape}")
+    return out.astype(np.float32)
+
+
+def nmo_correction(
+    data: np.ndarray,
+    dt_ns: float,
+    offsets_m,
+    velocity_m_s: float,
+    stretch_mute: float = 1.5,
+) -> np.ndarray:
+    """Correzione normal-moveout di un CMP/WARR gather.
+
+    ``data`` : (n_samples, n_traces) con tracce a offset Tx-Rx crescente.
+    ``offsets_m`` : scalare (incremento per traccia, offset[j] = j*val) oppure
+                    array lungo n_traces.
+    Per ogni campione di uscita ``t0`` si prende l'ampiezza in ingresso a
+    ``t = sqrt(t0^2 + (x/v)^2)`` (interpolazione lineare). ``stretch_mute``
+    azzera i campioni con stiramento ``(t - t0)/t0 > stretch_mute``.
+    """
+    if data is None:
+        return np.zeros((0, 0), dtype=np.float32)
+    arr = np.asarray(data, dtype=np.float64)
+    if arr.ndim != 2 or arr.size == 0:
+        return arr.astype(np.float32, copy=True)
+    arr = np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    n_s, n_t = arr.shape
+    dt = float(dt_ns) * 1e-9
+    v = max(float(velocity_m_s), 1e3)
+    if n_s < 2 or n_t < 1 or not np.isfinite(dt) or dt <= 0.0:
+        return arr.astype(np.float32)
+    off = np.asarray(offsets_m, dtype=np.float64)
+    if off.ndim == 0:
+        off = np.arange(n_t, dtype=np.float64) * float(off)
+    elif off.size != n_t:
+        off = np.resize(off, n_t)
+    t0 = np.arange(n_s, dtype=np.float64) * dt
+    out = np.zeros_like(arr)
+    src_grid = np.arange(n_s, dtype=np.float64)
+    for j in range(n_t):
+        x = off[j]
+        t = np.sqrt(t0 ** 2 + (x / v) ** 2)
+        s = t / dt
+        vals = np.interp(s, src_grid, arr[:, j], left=0.0, right=0.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            stretch = np.where(t0 > 0.0, (t - t0) / t0, 0.0)
+        vals[stretch > float(stretch_mute)] = 0.0
+        out[:, j] = vals
+    _log_gpr(
+        f"[GPR] nmo_correction: v={v:.3e} n_traces={n_t} "
+        f"off=[{off.min():.3g},{off.max():.3g}]m  shape={arr.shape}"
+    )
+    return out.astype(np.float32)
+
+
+def cmp_semblance(
+    gather: np.ndarray,
+    dt_ns: float,
+    offsets_m,
+    v_min: float = 3.0e7,
+    v_max: float = 1.5e8,
+    n_v: int = 60,
+    win_samples: int = 7,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pannello di semblance per l'analisi di velocità di un CMP gather.
+
+    Ritorna ``(semblance, v_axis)`` con ``semblance`` di shape (n_samples, n_v):
+    per ogni velocità candidata si applica la NMO e si misura la coerenza
+    (semblance normalizzata) su una finestra di ``win_samples`` campioni.
+    Il massimo lungo ``v`` a un dato ``t0`` stima la velocità RMS a quel tempo.
+    """
+    g = np.asarray(gather, dtype=np.float64)
+    if g.ndim != 2 or g.size == 0:
+        return np.zeros((0, 0), dtype=np.float32), np.zeros(0, dtype=np.float64)
+    g = np.nan_to_num(g, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    n_s, n_t = g.shape
+    v_axis = np.linspace(float(v_min), float(v_max), max(2, int(n_v)))
+    half = max(1, int(win_samples) // 2)
+    kern = np.ones(2 * half + 1, dtype=np.float64)
+    sem = np.zeros((n_s, v_axis.size), dtype=np.float64)
+    for iv, v in enumerate(v_axis):
+        nmo = np.asarray(
+            nmo_correction(g, dt_ns, offsets_m, float(v), stretch_mute=1.0),
+            dtype=np.float64,
+        )
+        num = np.convolve(np.sum(nmo, axis=1) ** 2, kern, mode="same")
+        den = np.convolve(np.sum(nmo ** 2, axis=1), kern, mode="same") * max(n_t, 1)
+        sem[:, iv] = np.divide(num, den, out=np.zeros(n_s), where=den > 1e-20)
+    _log_gpr(
+        f"[GPR] cmp_semblance: n_v={v_axis.size} v=[{v_min:.2e},{v_max:.2e}] "
+        f"win={2 * half + 1}  shape={g.shape}"
+    )
+    return sem.astype(np.float32), v_axis
+
+
+def multifreq_blend(
+    radargrams: list,
+    weights=None,
+    dt_ns_list=None,
+    t0_shift_samples=None,
+    target: int = 0,
+) -> np.ndarray:
+    """Fonde radargrammi di antenne a frequenza diversa in un'unica sezione.
+
+    Ogni radargramma viene ricampionato sull'asse tempi del ``target`` (indice
+    nella lista), shiftato di ``t0_shift_samples[i]`` campioni per allineare il
+    tempo 0, quindi sommato con ``weights[i]`` (default: pesi uguali che sommano
+    a 1). Le tracce devono avere lo stesso ``n_traces``.
+    """
+    rgs = [np.asarray(r, dtype=np.float64) for r in (radargrams or [])]
+    rgs = [np.nan_to_num(r) for r in rgs if r.ndim == 2 and r.size > 0]
+    if not rgs:
+        return np.zeros((0, 0), dtype=np.float32)
+    ti = int(target) if 0 <= int(target) < len(rgs) else 0
+    n_s_t, n_t = rgs[ti].shape
+    n_r = len(rgs)
+    if weights is None:
+        weights = np.full(n_r, 1.0 / n_r)
+    w = np.asarray(weights, dtype=np.float64)
+    if w.size != n_r:
+        w = np.resize(w, n_r)
+    dts = (
+        np.asarray(dt_ns_list, dtype=np.float64)
+        if dt_ns_list is not None else np.full(n_r, 1.0)
+    )
+    if dts.size != n_r:
+        dts = np.resize(dts, n_r)
+    shifts = (
+        np.asarray(t0_shift_samples, dtype=np.int64)
+        if t0_shift_samples is not None else np.zeros(n_r, dtype=np.int64)
+    )
+    if shifts.size != n_r:
+        shifts = np.resize(shifts, n_r)
+
+    dt_target = float(dts[ti]) if float(dts[ti]) > 0 else 1.0
+    out = np.zeros((n_s_t, n_t), dtype=np.float64)
+    t_target = np.arange(n_s_t, dtype=np.float64) * dt_target
+    for i, r in enumerate(rgs):
+        n_si = r.shape[0]
+        if r.shape[1] != n_t:
+            r = r[:, :n_t] if r.shape[1] > n_t else np.pad(r, ((0, 0), (0, n_t - r.shape[1])))
+        dti = float(dts[i]) if float(dts[i]) > 0 else 1.0
+        src_t = np.arange(n_si, dtype=np.float64) * dti
+        res = np.empty((n_s_t, n_t), dtype=np.float64)
+        for j in range(n_t):
+            res[:, j] = np.interp(t_target, src_t, r[:, j], left=0.0, right=0.0)
+        sh = int(shifts[i])
+        if sh > 0:
+            res = np.vstack([res[sh:, :], np.zeros((sh, n_t))])
+        elif sh < 0:
+            res = np.vstack([np.zeros((-sh, n_t)), res[:sh, :]])
+        out += w[i] * res
+    _log_gpr(
+        f"[GPR] multifreq_blend: {n_r} radargrammi  weights={np.round(w, 3).tolist()}  "
+        f"target={ti}  shape={out.shape}"
+    )
+    return out.astype(np.float32)
+
+
 def normalize_display(data: np.ndarray) -> np.ndarray:
     if data is None:
         return np.zeros((0, 0), dtype=np.float32)
@@ -1451,6 +1676,9 @@ DEFAULT_PIPELINE = {
     "kirchhoff_dx_m":       0.05,
     "kirchhoff_aperture_m": 0.0,          # 0 = auto (mezza traccia)
     "kirchhoff_txrx_m":     0.0,
+    # --- Filtri Fase 6 (disattivi di default) ---------------------------
+    "inst_attr":            False,
+    "inst_attr_kind":       "phase",      # phase | cos_phase | frequency | envelope
     "chain_order":          None,
 }
 
@@ -1532,6 +1760,10 @@ FILTER_REGISTRY = {
         "label": "Migrazione Kirchhoff 2D",
         "param_key": "kirchhoff",
     },
+    "inst_attr": {
+        "label": "Attributo istantaneo (Hilbert)",
+        "param_key": "inst_attr",
+    },
 }
 
 DEFAULT_CHAIN_ORDER = [
@@ -1554,6 +1786,7 @@ DEFAULT_CHAIN_ORDER = [
     "amp_eq",
     "rad_threshold",
     "envelope",
+    "inst_attr",
 ]
 
 
@@ -1684,6 +1917,11 @@ def _step_fingerprint(
             float(p.get("kirchhoff_dx_m", 0.05)),
             float(p.get("kirchhoff_aperture_m", 0.0)),
             float(p.get("kirchhoff_txrx_m", 0.0)), dt_ns, input_shape
+        )
+    elif step == "inst_attr":
+        return (
+            "inst_attr", bool(p.get("inst_attr")),
+            str(p.get("inst_attr_kind", "phase")), dt_ns, input_shape
         )
     return (step, bool(p.get(step)), input_shape)
 
@@ -2052,6 +2290,13 @@ def apply_pipeline(
                     f"dx={p.get('kirchhoff_dx_m', 0.05)})",
                     out,
                 )
+
+        elif step == "inst_attr":
+            if bool(p.get("inst_attr", False)):
+                out = instantaneous_attributes(
+                    out, dt_ns, str(p.get("inst_attr_kind", "phase"))
+                )
+                _log(f"inst_attr(kind={p.get('inst_attr_kind', 'phase')})", out)
 
         if can_use_cache:
             stage_cache[idx] = (fp, out.copy())

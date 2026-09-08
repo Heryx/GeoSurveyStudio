@@ -407,8 +407,27 @@ va con la Fase 5 navigazione/topografia).
   (georef-coupled → vanno con la Fase E del timeslice). `migration_kirchhoff_topo`
   usa `line_plan_coords` + elevazione per traccia — resta da cablare nel viewer.
 
-**Fase 6 — avanzato/opzionale.**
-`cmp_velocity` / `nmo`, `multifreq_blend` (DAG), attributi istantanei.
+**Fase 6 — avanzato/opzionale. ✅ FATTA (2026-09).**
+Funzioni pure numpy in `gpr_processing.py`:
+- `instantaneous_attributes(data, dt_ns, kind)` — dal segnale analitico
+  (`_analytic_signal`): `phase` / `cos_phase` / `frequency` [MHz, da d(fase)/dt
+  unwrap] / `envelope`. Wired come step pipeline `inst_attr` (registry, chain
+  in coda dopo `envelope`, fingerprint, apply, factory UI con choice-param).
+  Testato: la freq. istantanea di un tono a 300 MHz ≈ 300 MHz.
+- `nmo_correction(data, dt_ns, offsets_m, velocity_m_s, stretch_mute)` — NMO su
+  CMP/WARR gather; `offsets_m` scalare (incremento) o array; stretch mute.
+  Standalone (non in pipeline: opera su gather multi-offset). Testato:
+  appiattisce un'iperbole sintetica alla riga corretta.
+- `cmp_semblance(gather, dt_ns, offsets_m, v_min, v_max, n_v, win_samples)` →
+  `(pannello semblance (n_s, n_v), v_axis)`. Standalone. Testato: il picco di
+  semblance a t0 cade sulla velocità vera (±0.6e7).
+- `multifreq_blend(radargrams, weights, dt_ns_list, t0_shift_samples, target)` —
+  ricampiona ogni radargramma sull'asse tempi del `target`, shift t0, somma
+  pesata. Standalone (multi-input → serve variant-graph DAG o azione dedicata
+  per il wiring). Testato: blend di input identici ≈ identità.
+6 test nuovi in `test/test_gpr_processing_adv.py` (33 tot). Suite: 203 pass,
+i 3 errori qgis preesistenti. `cmp_velocity`/`nmo` e `multifreq_blend` non hanno
+ancora UI (servono un dialog CMP e un'azione blending — fase UI successiva).
 
 ---
 

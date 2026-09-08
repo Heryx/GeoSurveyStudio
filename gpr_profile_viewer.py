@@ -1299,6 +1299,7 @@ class GprProfileViewer(QMainWindow):
             "median2d": "Mediana 2D scorrevole: elimina spike isolati preservando i bordi.",
             "fk_dip": "Filtro FK a ventaglio: rimuove/isola eventi per velocita' apparente (dip).",
             "kirchhoff": "Migrazione Kirchhoff 2D (diffraction stack) con obliquita' + spreading.",
+            "inst_attr": "Attributo istantaneo dal segnale analitico: fase / cos(fase) / frequenza / inviluppo.",
         }
         return txt.get(str(step_id), "")
 
@@ -1309,7 +1310,7 @@ class GprProfileViewer(QMainWindow):
     #   choice-> (lista_opzioni, default)
     _PHASE1_STEP_IDS = (
         "dcshift", "boxcar", "notch", "whiten", "amp_eq", "rad_threshold", "power_gain",
-        "eigen_filter", "median2d", "fk_dip", "kirchhoff",
+        "eigen_filter", "median2d", "fk_dip", "kirchhoff", "inst_attr",
     )
     _PHASE1_SPECS = {
         "dcshift": [
@@ -1363,6 +1364,10 @@ class GprProfileViewer(QMainWindow):
             ("kirchhoff_dx_m", "dx tracce (m):", "float", 0.001, 10.0, 0.05, 3, 0.01),
             ("kirchhoff_aperture_m", "Apertura (m, 0=auto):", "float", 0.0, 200.0, 0.0, 2, 0.5),
             ("kirchhoff_txrx_m", "Offset Tx-Rx (m):", "float", 0.0, 3.0, 0.0, 3, 0.02),
+        ],
+        "inst_attr": [
+            ("inst_attr_kind", "Attributo:", "choice",
+             ["phase", "cos_phase", "frequency", "envelope"], "phase"),
         ],
     }
 
@@ -3487,6 +3492,7 @@ class GprProfileViewer(QMainWindow):
                 "median2d",
                 "fk_dip",
                 "kirchhoff",
+                "inst_attr",
             )
         )
         if not has_active_filters:

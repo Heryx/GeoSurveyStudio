@@ -23,6 +23,10 @@ from gpr_processing import (
     fk_filter,
     fk_dip_filter,
     kirchhoff_migration_2d,
+    instantaneous_attributes,
+    nmo_correction,
+    cmp_semblance,
+    multifreq_blend,
 )
 
 
@@ -376,6 +380,99 @@ class TestPhase4Filters(unittest.TestCase):
         on = apply_pipeline(data, p, dt_ns=0.4, normalize_output=False)
         self.assertFalse(np.allclose(on, data))
         p["median2d"] = False
+        off = apply_pipeline(data, p, dt_ns=0.4, normalize_output=False)
+        np.testing.assert_allclose(off, data, rtol=1e-5, atol=1e-4)
+
+
+class TestPhase6Filters(unittest.TestCase):
+
+    def _synth(self, n_s=200, n_t=32, seed=0):
+        rng = np.random.default_rng(seed)
+        return (rng.standard_normal((n_s, n_t)) * 2.0).astype(np.float32)
+
+    def test_instantaneous_attributes_kinds(self):
+        d = self._synth(seed=1)
+        ph = instantaneous_attributes(d, 0.4, "phase")
+        self.assertEqual(ph.shape, d.shape)
+        self.assertTrue(np.all(ph >= -np.pi - 1e-3) and np.all(ph <= np.pi + 1e-3))
+        cp = instantaneous_attributes(d, 0.4, "cos_phase")
+        self.assertTrue(np.all(np.abs(cp) <= 1.0 + 1e-5))
+        fr = instantaneous_attributes(d, 0.4, "frequency")
+        self.assertTrue(np.all(fr >= 0.0) and np.isfinite(fr).all())
+        env = instantaneous_attributes(d, 0.4, "envelope")
+        self.assertTrue(np.all(env >= 0.0))
+
+    def test_instantaneous_frequency_of_tone(self):
+        # pure tone at f0 -> instantaneous frequency ~ f0 (away from edges)
+        n_s = 512
+        dt_ns = 0.2
+        f0_hz = 300e6
+        t = np.arange(n_s) * dt_ns * 1e-9
+        tone = np.sin(2 * np.pi * f0_hz * t).astype(np.float32)[:, None] * np.ones((1, 4), np.float32)
+        fr = instantaneous_attributes(tone, dt_ns, "frequency")
+        mid = fr[100:400, 0]
+        self.assertAlmostEqual(float(np.median(mid)), 300.0, delta=15.0)  # MHz
+
+    def test_nmo_flattens_gather(self):
+        n_s, n_t = 400, 24
+        dt_ns, v, t0_ns = 0.4, 8e7, 100.0
+        dt = dt_ns * 1e-9
+        t0 = t0_ns * 1e-9
+        off = np.arange(n_t) * 0.1
+        g = np.zeros((n_s, n_t), dtype=np.float32)
+        for j in range(n_t):
+            s = int(round(np.sqrt(t0 ** 2 + (off[j] / v) ** 2) / dt))
+            if s < n_s:
+                g[s, j] = 1.0
+        nmo = nmo_correction(g, dt_ns, 0.1, v)
+        self.assertEqual(nmo.shape, g.shape)
+        self.assertEqual(int(np.argmax(nmo.sum(axis=1))), int(round(t0 / dt)))
+        # a wrong (too low) velocity does NOT flatten -> lower peak coherence
+        bad = nmo_correction(g, dt_ns, 0.1, v * 0.5)
+        self.assertGreater(nmo.sum(axis=1).max(), bad.sum(axis=1).max())
+
+    def test_cmp_semblance_peaks_at_true_velocity(self):
+        n_s, n_t = 400, 24
+        dt_ns, v_true, t0_ns = 0.4, 8e7, 100.0
+        dt, t0 = dt_ns * 1e-9, t0_ns * 1e-9
+        off = np.arange(n_t) * 0.1
+        g = np.zeros((n_s, n_t), dtype=np.float32)
+        for j in range(n_t):
+            s = int(round(np.sqrt(t0 ** 2 + (off[j] / v_true) ** 2) / dt))
+            if s < n_s:
+                g[max(s - 1, 0):s + 2, j] = 1.0
+        sem, v_axis = cmp_semblance(g, dt_ns, 0.1, v_min=4e7, v_max=1.2e8, n_v=40)
+        self.assertEqual(sem.shape, (n_s, v_axis.size))
+        row = int(round(t0 / dt))
+        v_best = v_axis[int(np.argmax(sem[row]))]
+        self.assertAlmostEqual(v_best / 1e7, v_true / 1e7, delta=0.6)
+
+    def test_multifreq_blend_identity_and_weights(self):
+        d = self._synth(seed=4)
+        b = multifreq_blend([d, d], [0.5, 0.5], [0.4, 0.4])
+        np.testing.assert_allclose(b, d, rtol=1e-4, atol=1e-3)
+        # single input -> itself
+        np.testing.assert_allclose(multifreq_blend([d], [1.0], [0.4]), d, atol=1e-4)
+        # resample: coarse dt array upsampled onto fine target keeps shape of target
+        coarse = d[::2, :]
+        out = multifreq_blend([d, coarse], [0.5, 0.5], [0.4, 0.8], target=0)
+        self.assertEqual(out.shape, d.shape)
+
+    def test_inst_attr_registered_and_pipeline(self):
+        self.assertIn("inst_attr", FILTER_REGISTRY)
+        self.assertIn("inst_attr", DEFAULT_CHAIN_ORDER)
+        self.assertFalse(DEFAULT_PIPELINE["inst_attr"])
+        data = self._synth(n_s=128, n_t=20)
+        p = dict(DEFAULT_PIPELINE)
+        for k in ("dewow", "bg_removal", "agc"):
+            p[k] = False
+        p["inst_attr"] = True
+        p["inst_attr_kind"] = "cos_phase"
+        p["chain_order"] = ["inst_attr"]
+        out = apply_pipeline(data, p, dt_ns=0.4, normalize_output=False)
+        self.assertEqual(out.shape, data.shape)
+        self.assertTrue(np.all(np.abs(out) <= 1.0 + 1e-4))   # cos_phase range
+        p["inst_attr"] = False
         off = apply_pipeline(data, p, dt_ns=0.4, normalize_output=False)
         np.testing.assert_allclose(off, data, rtol=1e-5, atol=1e-4)
 
