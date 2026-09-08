@@ -249,7 +249,7 @@ class SliceSpec:
 
 
 def _auto_interline_radius(profiles: list) -> float | None:
-    """Rough auto search radius: ~1.2x the median inter-profile spacing.
+    """Rough auto search radius: ~1.5x the median inter-profile spacing.
 
     Falls back to a small multiple of the along-trace spacing for a single
     profile, or ``None`` when no geometry is available (caller keeps
@@ -281,7 +281,9 @@ def _auto_interline_radius(profiles: list) -> float | None:
             nn.append(float(dd.min()))
         spacing = float(np.median(nn))
         if np.isfinite(spacing) and spacing > 0:
-            return round(spacing * 1.2, 4)
+            # 1.5x so every grid cell blends at least two survey lines even
+            # when the line spacing equals the nominal radius (e.g. 2 m lines).
+            return round(spacing * 1.5, 4)
 
     if along:
         return round(float(np.median(along)) * 8.0, 4)

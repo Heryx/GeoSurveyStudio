@@ -385,7 +385,8 @@ class _PreviewSliceWorker(QObject):
 
     finished = pyqtSignal(int, object, object, str)  # request_id, grid, extent, error
 
-    def __init__(self, request_id: int, profiles, z_from, z_to, resolution, chain_order, kwargs):
+    def __init__(self, request_id: int, profiles, z_from, z_to, resolution, chain_order, kwargs,
+                 spec=None):
         super().__init__()
         self._request_id = int(request_id)
         self._profiles = profiles
@@ -394,18 +395,28 @@ class _PreviewSliceWorker(QObject):
         self._resolution = resolution
         self._chain_order = chain_order
         self._kwargs = kwargs
+        self._spec = spec
 
     def run(self):
         try:
-            from .gpr_ogpr_slicer import compute_timeslice_preview
-            grid, extent = compute_timeslice_preview(
-                profiles=self._profiles,
-                z_from=self._z_from,
-                z_to=self._z_to,
-                resolution=self._resolution,
-                chain_order=self._chain_order,
-                **self._kwargs,
-            )
+            if self._spec is not None:
+                # Fase D: spec-native preview (single window), same code path
+                # as the final generation.
+                from .gpr_ogpr_slicer import compute_slice_preview
+                grid, extent = compute_slice_preview(
+                    self._profiles, self._spec, self._z_from, self._z_to,
+                    resolution=self._resolution,
+                )
+            else:
+                from .gpr_ogpr_slicer import compute_timeslice_preview
+                grid, extent = compute_timeslice_preview(
+                    profiles=self._profiles,
+                    z_from=self._z_from,
+                    z_to=self._z_to,
+                    resolution=self._resolution,
+                    chain_order=self._chain_order,
+                    **self._kwargs,
+                )
             self.finished.emit(self._request_id, grid, extent, "")
         except Exception as exc:
             self.finished.emit(self._request_id, None, None, str(exc))
@@ -2705,6 +2716,36 @@ class GprProfileViewer(QMainWindow):
 
         fl_slice.addRow("Sync timeslice canvas:", self._chk_timeslice_sync)
         fl_slice.addRow("  crosshair size (m):", self._spin_crosshair_size)
+
+        # --- Fase D: single SliceSpec form ---------------------------------
+        # One always-visible form (slice_spec_panel.SliceSpecPanel) drives every
+        # generation parameter. The scattered legacy knobs stay constructed (so
+        # presets / persistence keep working) but are hidden; get_slice_params()
+        # now reads the panel. Remove the hidden rows once the migration settles.
+        self._slice_spec_panel = None
+        try:
+            from .slice_spec_panel import SliceSpecPanel
+
+            self._slice_spec_panel = SliceSpecPanel()
+            self._slice_spec_panel.spec_changed.connect(
+                lambda: self._request_preview_update(immediate=False)
+            )
+            fl_slice.insertRow(2, "Parametri slice:", self._slice_spec_panel)
+            for _w in (
+                self._spin_slice_thickness, self._chk_slice_thickness_locked,
+                self._cb_slice_idw_mode, self._spin_slice_search_radius,
+                self._cb_slice_pipeline_source, self._btn_slice_advanced,
+                self._slice_advanced_host,
+            ):
+                if _w is None:
+                    continue
+                _lbl = fl_slice.labelForField(_w)
+                if _lbl is not None:
+                    _lbl.hide()
+                _w.hide()
+        except Exception as _exc:
+            self._slice_spec_panel = None
+            print(f"[GPR viewer][WARN] SliceSpecPanel non inizializzato: {_exc}")
 
         proc_content = QWidget()
         proc_layout = QVBoxLayout(proc_content)
@@ -5698,6 +5739,13 @@ class GprProfileViewer(QMainWindow):
                 else self._show_wiggle
             ),
         }
+        # Fase D: persist the SliceSpec form verbatim.
+        _panel = getattr(self, "_slice_spec_panel", None)
+        if _panel is not None and self._is_qt_alive(_panel):
+            try:
+                ui_state["slice_spec"] = _panel.get_spec().to_dict()
+            except Exception:
+                pass
         if last_timeslice is None:
             try:
                 outdir = str(self._le_slice_outdir.text() or "").strip()
@@ -5822,6 +5870,14 @@ class GprProfileViewer(QMainWindow):
                 self._chk_show_wiggle.setChecked(bool(ui_state.get("show_wiggle", self._chk_show_wiggle.isChecked())))
         except Exception:
             pass
+        try:
+            spec_d = ui_state.get("slice_spec")
+            panel = getattr(self, "_slice_spec_panel", None)
+            if isinstance(spec_d, dict) and panel is not None and self._is_qt_alive(panel):
+                from .slice_spec import SliceSpec
+                panel.set_spec(SliceSpec.from_dict(spec_d))
+        except Exception as exc:
+            print(f"[GPR viewer][WARN] ripristino SliceSpec fallito: {exc}")
 
     def _try_import_saved_gpr_processing_project(self, force: bool = False) -> bool:
         if self._profiles and (not bool(force)):
@@ -6163,6 +6219,16 @@ class GprProfileViewer(QMainWindow):
         slice_params = dict(self.get_slice_params() or {})
         chain_order = list(self._current_chain_order() or [])
 
+        # Fase D: spec-native preview when the SliceSpec panel is active.
+        preview_spec = None
+        _panel = getattr(self, "_slice_spec_panel", None)
+        if _panel is not None and self._is_qt_alive(_panel):
+            try:
+                preview_spec = _panel.get_spec().resolve(self._profiles)
+            except Exception as exc:
+                self._set_preview_busy(False, f"Parametri slice non validi: {exc}")
+                return
+
         kwargs = {
             "channel": int(self._ch_idx),
             "combine_method": "mean",
@@ -6208,7 +6274,9 @@ class GprProfileViewer(QMainWindow):
             round(float(z_to), 4),
             round(float(res), 4),
             tuple(chain_order),
-            self._stable_preview_signature(kwargs),
+            (self._stable_preview_signature(preview_spec.to_dict())
+             if preview_spec is not None
+             else self._stable_preview_signature(kwargs)),
         )
         if sig == self._preview_signature:
             return
@@ -6230,7 +6298,8 @@ class GprProfileViewer(QMainWindow):
 
         thread = QThread(self)
         worker = _PreviewSliceWorker(
-            request_id, self._profiles, float(z_from), float(z_to), float(res), chain_order, kwargs
+            request_id, self._profiles, float(z_from), float(z_to), float(res), chain_order, kwargs,
+            spec=preview_spec,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -7585,6 +7654,33 @@ class GprProfileViewer(QMainWindow):
         self._safe_set_text(self._lbl_status, lbl)
 
     def get_slice_params(self) -> dict:
+        # Fase D: quando il pannello SliceSpec e' attivo e' l'unica sorgente
+        # dei parametri di generazione. Il dict restituito ha la stessa forma
+        # legacy (piu' la chiave "_spec") cosi' il resto della pipeline non
+        # cambia; il ramo Esperto sotto resta solo come fallback.
+        panel = getattr(self, "_slice_spec_panel", None)
+        if panel is not None and self._is_qt_alive(panel):
+            try:
+                from .slice_params_compat import spec_to_legacy_params
+
+                spec = panel.get_spec()
+                if self._profiles:
+                    spec = spec.resolve(self._profiles)
+                elif spec.z_max_m is None:
+                    from dataclasses import replace as _replace
+                    spec = _replace(spec, z_max_m=5.0)  # placeholder finche' non ci sono profili
+                open_3d = bool(
+                    self._is_qt_alive(getattr(self, "_chk_slice_open_3d_on_complete", None))
+                    and self._chk_slice_open_3d_on_complete.isChecked()
+                )
+                out = spec_to_legacy_params(
+                    spec, channel=-1, combine_method="mean",
+                    open_3d_on_complete=open_3d,
+                )
+                return out
+            except Exception as exc:
+                print(f"[GPR viewer][WARN] get_slice_params via SliceSpec fallito: {exc}")
+
         # "Esperto" e' un flag: finche' non e' esplicitamente abilitato, questi
         # campi vengono ignorati e si usa il comportamento di default, anche
         # se i widget (nascosti) contengono un valore diverso.
@@ -7683,14 +7779,21 @@ class GprProfileViewer(QMainWindow):
             QMessageBox.information(self, "Nessun profilo",
                                     "Importa almeno un file .ogpr prima.")
             return
-        try:
-            dz = float(self._spin_slice_thickness.value())
-        except Exception:
-            dz = 0.10
+        slice_params = self.get_slice_params()
+        panel = getattr(self, "_slice_spec_panel", None)
+        if panel is not None and self._is_qt_alive(panel):
+            try:
+                dz = float(panel.get_spec().thickness_m)
+            except Exception:
+                dz = float(slice_params.get("z_step", 0.10) or 0.10)
+        else:
+            try:
+                dz = float(self._spin_slice_thickness.value())
+            except Exception:
+                dz = 0.10
         if (not np.isfinite(dz)) or dz <= 0.0:
             QMessageBox.warning(self, "Timeslice", "Spessore slice non valido.")
             return
-        slice_params = self.get_slice_params()
         slice_params["z_step_override"] = float(dz)
         slice_params["thickness_m"] = float(dz)
         outdir = str(getattr(self, "_le_slice_outdir", None).text() if hasattr(self, "_le_slice_outdir") else "").strip()
@@ -7735,89 +7838,108 @@ class GprProfileViewer(QMainWindow):
         depth_max = max(float(getattr(p, "depth_max_m", 0.0) or 0.0) for p in self._profiles)
         n_channels = max(int(getattr(p, "n_channels", 1) or 1) for p in self._profiles)
 
-        params = None
-        if self.plugin is not None and hasattr(self.plugin, "_ask_ogpr_slice_params"):
+        extra = self.get_slice_params()
+        # Fase D: spec-native path - one SliceSpec drives the whole volume, no dialog.
+        _panel = getattr(self, "_slice_spec_panel", None)
+        _use_spec = _panel is not None and self._is_qt_alive(_panel)
+
+        if _use_spec:
             try:
-                params = self.plugin._ask_ogpr_slice_params(
-                    profiles=self._profiles,
-                    n_channels=n_channels,
-                    depth_max_m=depth_max,
-                    default_group="gpr_volume3d_preview",
-                    saved=None,
-                    slice_params=self.get_slice_params(),
+                from .slice_params_compat import spec_to_build_params
+                spec = _panel.get_spec().resolve(self._profiles)
+                params = spec_to_build_params(
+                    spec, channel=-1, combine_method="mean",
+                    group_name="gpr_volume3d_preview",
+                )
+                grids, meta = compute_ogpr_slice_grids(
+                    profiles=self._profiles, channel=-1, combine_method="mean",
+                    spec=spec, emit_diagnostics=True,
                 )
             except Exception as exc:
-                QMessageBox.warning(
-                    self,
-                    "Viewer 3D",
-                    f"Errore nel dialog parametri 3D:\n{exc}",
+                QMessageBox.critical(
+                    self, "Viewer 3D",
+                    f"Errore durante il calcolo volume 3D:\n{exc}",
                 )
                 return
-            if params is None:
-                return
         else:
-            # Fallback sicuro quando il plugin principale non e' disponibile.
-            params = {
-                "channel": int(self._ch_idx),
-                "combine_method": "mean",
-                "z_min": 0.0,
-                "z_max": max(depth_max, 0.1),
-                "z_step": 0.05,
-                "resolution": 0.10,
-                "radius": 0.10 * (2.0 ** 0.5),
-                "group_name": "gpr_volume3d_preview",
-            }
-
-        extra = self.get_slice_params()
-        try:
-            grids, meta = compute_ogpr_slice_grids(
-                profiles=self._profiles,
-                channel=int(params["channel"]),
-                combine_method=str(params["combine_method"]),
-                resolution=float(params["resolution"]),
-                z_step=float(params["z_step"]),
-                z_min=float(params["z_min"]),
-                z_max=float(params["z_max"]),
-                radius=float(params["radius"]),
-                pipeline_params=extra.get("pipeline_params"),
-                normalize_channels=bool(extra.get("normalize_channels", False)),
-                extraction_mode=str(extra.get("extraction_mode", "las_like") or "las_like"),
-                use_hilbert=bool(extra.get("use_hilbert", True)),
-                use_processing=bool(extra.get("use_processing", False)),
-                amplitude_sigma=extra.get("amplitude_sigma"),
-                use_anisotropic_idw=bool(extra.get("use_anisotropic_idw", False)),
-                idw_mode=str(extra.get("idw_mode", "quality") or "quality"),
-                idw_power=float(extra.get("idw_power", 2.0) or 2.0),
-                auto_radius=bool(extra.get("auto_radius", True)),
-                min_points=int(extra.get("min_points", 1) or 1),
-                fill_nodata=bool(extra.get("fill_nodata", True)),
-                overlap_fraction=float(extra.get("overlap_fraction", 0.5) or 0.0),
-                blanking_distance=float(extra.get("blanking_distance", 0.0) or 0.0),
-                smooth_sigma=float(extra.get("smooth_sigma", 0.8) or 0.0),
-                depth_radius_factor=float(extra.get("depth_radius_factor", 0.6) or 0.0),
-                balance_profiles=bool(extra.get("balance_profiles", True)),
-                pre_slice_bg_removal=bool(extra.get("pre_slice_bg_removal", False)),
-                pre_slice_bg_mode=str(extra.get("pre_slice_bg_mode", "line_by_line") or "line_by_line"),
-                pre_slice_bg_window=int(extra.get("pre_slice_bg_window", 0) or 0),
-                pre_slice_bg_sample_start=int(extra.get("pre_slice_bg_sample_start", 0) or 0),
-                pre_slice_bg_sample_end=int(extra.get("pre_slice_bg_sample_end", 0) or 0),
-                stack_n=int(extra.get("stack_n", 1) or 1),
-                stack_kernel=str(extra.get("stack_kernel", "boxcar") or "boxcar"),
-                flip_traces_mode=str(extra.get("flip_traces_mode", "none") or "none"),
-                topographic_correction=bool(extra.get("topographic_correction", False)),
-                topo_reference_mode=str(extra.get("topo_reference_mode", "median") or "median"),
-                topo_reference_elevation=extra.get("topo_reference_elevation"),
-                parallel_profiles=bool(extra.get("parallel_profiles", True)),
-                profile_workers=int(extra.get("profile_workers", 0) or 0),
-                emit_diagnostics=True,
-            )
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Viewer 3D",
-                f"Errore durante il calcolo volume 3D:\n{exc}",
-            )
-            return
+            params = None
+            if self.plugin is not None and hasattr(self.plugin, "_ask_ogpr_slice_params"):
+                try:
+                    params = self.plugin._ask_ogpr_slice_params(
+                        profiles=self._profiles,
+                        n_channels=n_channels,
+                        depth_max_m=depth_max,
+                        default_group="gpr_volume3d_preview",
+                        saved=None,
+                        slice_params=self.get_slice_params(),
+                    )
+                except Exception as exc:
+                    QMessageBox.warning(
+                        self, "Viewer 3D",
+                        f"Errore nel dialog parametri 3D:\n{exc}",
+                    )
+                    return
+                if params is None:
+                    return
+            else:
+                params = {
+                    "channel": int(self._ch_idx),
+                    "combine_method": "mean",
+                    "z_min": 0.0,
+                    "z_max": max(depth_max, 0.1),
+                    "z_step": 0.05,
+                    "resolution": 0.10,
+                    "radius": 0.10 * (2.0 ** 0.5),
+                    "group_name": "gpr_volume3d_preview",
+                }
+            try:
+                grids, meta = compute_ogpr_slice_grids(
+                    profiles=self._profiles,
+                    channel=int(params["channel"]),
+                    combine_method=str(params["combine_method"]),
+                    resolution=float(params["resolution"]),
+                    z_step=float(params["z_step"]),
+                    z_min=float(params["z_min"]),
+                    z_max=float(params["z_max"]),
+                    radius=float(params["radius"]),
+                    pipeline_params=extra.get("pipeline_params"),
+                    normalize_channels=bool(extra.get("normalize_channels", False)),
+                    extraction_mode=str(extra.get("extraction_mode", "las_like") or "las_like"),
+                    use_hilbert=bool(extra.get("use_hilbert", True)),
+                    use_processing=bool(extra.get("use_processing", False)),
+                    amplitude_sigma=extra.get("amplitude_sigma"),
+                    use_anisotropic_idw=bool(extra.get("use_anisotropic_idw", False)),
+                    idw_mode=str(extra.get("idw_mode", "quality") or "quality"),
+                    idw_power=float(extra.get("idw_power", 2.0) or 2.0),
+                    auto_radius=bool(extra.get("auto_radius", True)),
+                    min_points=int(extra.get("min_points", 1) or 1),
+                    fill_nodata=bool(extra.get("fill_nodata", True)),
+                    overlap_fraction=float(extra.get("overlap_fraction", 0.5) or 0.0),
+                    blanking_distance=float(extra.get("blanking_distance", 0.0) or 0.0),
+                    smooth_sigma=float(extra.get("smooth_sigma", 0.8) or 0.0),
+                    depth_radius_factor=float(extra.get("depth_radius_factor", 0.6) or 0.0),
+                    balance_profiles=bool(extra.get("balance_profiles", True)),
+                    pre_slice_bg_removal=bool(extra.get("pre_slice_bg_removal", False)),
+                    pre_slice_bg_mode=str(extra.get("pre_slice_bg_mode", "line_by_line") or "line_by_line"),
+                    pre_slice_bg_window=int(extra.get("pre_slice_bg_window", 0) or 0),
+                    pre_slice_bg_sample_start=int(extra.get("pre_slice_bg_sample_start", 0) or 0),
+                    pre_slice_bg_sample_end=int(extra.get("pre_slice_bg_sample_end", 0) or 0),
+                    stack_n=int(extra.get("stack_n", 1) or 1),
+                    stack_kernel=str(extra.get("stack_kernel", "boxcar") or "boxcar"),
+                    flip_traces_mode=str(extra.get("flip_traces_mode", "none") or "none"),
+                    topographic_correction=bool(extra.get("topographic_correction", False)),
+                    topo_reference_mode=str(extra.get("topo_reference_mode", "median") or "median"),
+                    topo_reference_elevation=extra.get("topo_reference_elevation"),
+                    parallel_profiles=bool(extra.get("parallel_profiles", True)),
+                    profile_workers=int(extra.get("profile_workers", 0) or 0),
+                    emit_diagnostics=True,
+                )
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, "Viewer 3D",
+                    f"Errore durante il calcolo volume 3D:\n{exc}",
+                )
+                return
 
         if not grids:
             QMessageBox.warning(
