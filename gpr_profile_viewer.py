@@ -401,11 +401,16 @@ class _PreviewSliceWorker(QObject):
         try:
             if self._spec is not None:
                 # Fase D: spec-native preview (single window), same code path
-                # as the final generation.
+                # as the final generation but with cheap knobs: fast kNN IDW,
+                # no NoData fill, no diagnostics. The final "Salva gruppo" run
+                # still uses the quality settings from the spec.
                 from .gpr_ogpr_slicer import compute_slice_preview
                 grid, extent = compute_slice_preview(
                     self._profiles, self._spec, self._z_from, self._z_to,
                     resolution=self._resolution,
+                    idw_mode="fast",
+                    fill_nodata=False,
+                    emit_diagnostics=False,
                 )
             else:
                 from .gpr_ogpr_slicer import compute_timeslice_preview
@@ -6228,6 +6233,9 @@ class GprProfileViewer(QMainWindow):
             except Exception as exc:
                 self._set_preview_busy(False, f"Parametri slice non validi: {exc}")
                 return
+            # Never render the preview finer than the final output; the
+            # "Qualita' preview" combo only makes it coarser.
+            res = max(float(res), float(preview_spec.resolution_m))
 
         kwargs = {
             "channel": int(self._ch_idx),
