@@ -384,10 +384,28 @@ via `_build_phase1_step_controls`. 8 test in `test/test_gpr_processing_adv.py`
 (tot 27). `migration_kirchhoff_topo` NON fatta (serve elevazione per traccia,
 va con la Fase 5 navigazione/topografia).
 
-**Fase 5 — navigazione completa + dominio griglia.**
-Modello marker + 4 modi; reverse/staggering/angolo arbitrario persistenti;
-multi info-file; `rotate_translate_grid` / `append_gridsets` / `mosaic_correct`;
-filtri griglia.
+**Fase 5 — navigazione completa + dominio griglia. ◑ CORE FATTO (2026-09).**
+- `grid_filters.py` (nuovo, puro numpy, NaN-aware): `lowpass` / `hipass` /
+  `laplacian` / `gaussian_smooth`; `line_background(grid, axis, length,
+  clip_lo_pct, clip_hi_pct, gain)` (background di linea con soglie percentili
+  per non spalmare i target); `fft2d_filter(grid, mask)` (primitiva) +
+  `fft2d_directional_notch(grid, angle_deg, halfwidth_deg, mode)` (toglie
+  strisce periodiche a direzione nota, es. solchi aratura); `blank(grid, mask)`;
+  `mosaic_zero_mean(grids, scope, axis)` + `mosaic_histogram_match(grid, ref)`.
+  15 test in `test/test_grid_filters.py`.
+- `navigation.py` (nuovo, puro): `Marker` dataclass + i 4 modi
+  (`artificial_markers` / `interval_markers` (+leftover) / `field_markers` /
+  `gps_trace_markers`); `dead_reckon_along` / `dead_reckon_coords`
+  (interpolazione lineare fra marker, estrapolazione costante ai bordi);
+  `reverse_along` (linee invertite/zig-zag), `stagger_shift` (correzione
+  staggering), `line_plan_coords` (ascissa→E/N per qualunque angolo, incl. ANG
+  a lunghezza frazionaria con riproiezione sul segmento). 16 test in
+  `test/test_navigation.py`.
+- **Rinviato:** integrazione UI in `gpr_manual_positioning_dialog.py` (assegna i
+  4 modi, mostra i marker sul radargramma, flag reverse/stagger persistenti,
+  multi information-file); `rotate_translate_grid` / `append_gridsets`
+  (georef-coupled → vanno con la Fase E del timeslice). `migration_kirchhoff_topo`
+  usa `line_plan_coords` + elevazione per traccia — resta da cablare nel viewer.
 
 **Fase 6 — avanzato/opzionale.**
 `cmp_velocity` / `nmo`, `multifreq_blend` (DAG), attributi istantanei.
