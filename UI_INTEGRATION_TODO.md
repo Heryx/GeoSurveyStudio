@@ -81,6 +81,13 @@ salvata in `GPR_Processing/project.json` (`processing_state`) e ri-applicata
 all'apertura del progetto, con un solo riprocessamento. Non serve più
 riprocessare tutto da zero a ogni riapertura del Profile Viewer.
 
+**Fix** — "Variante sorgente" nel pannello Slicing: da campo di testo libero a
+tendina (`SliceSpecPanel.set_variant_choices`) con `raw` + le varianti salvate.
+Quando si sceglie una variante, "Salva gruppo" / "Apri Viewer 3D" affettano i
+suoi `.npz` già filtrati (pipeline disattivata, output in
+`timeslices/<variante>`) invece dei profili correnti —
+`_profiles_for_slicing()`. Prima il campo era solo un'etichetta nel manifesto.
+
 3b (dialog CMP semblance) **saltato** su richiesta utente (acquisizioni
 WARR/CMP di nicchia per l'archeologia). Le funzioni `cmp_semblance` /
 `nmo_correction` restano disponibili come API.

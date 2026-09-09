@@ -137,3 +137,14 @@ a destra **"Radargramma + marker (profilo selezionato)"**.
 5. Rinominare a mano una cartella variante o cancellare `variant_graph.json`:
    il pannello non deve andare in errore (le cartelle senza voce di
    provenienza diventano radici).
+
+### Fix — "Variante sorgente" selezionabile nel pannello Slicing
+1. Con almeno una variante salvata, aprire la tab **Slicing**: il campo
+   "Variante sorgente" e' una **tendina** con `raw` + i nomi delle varianti.
+2. Selezionare una variante e premere **"Salva gruppo"**. **Atteso:** le
+   time-slice vengono generate dai `.npz` **gia' filtrati** di quella variante
+   (nessun ri-processing), output in `GPR_Processing/timeslices/<variante>/`.
+3. Con "Variante sorgente" = `raw` → comportamento invariato (affetta i profili
+   correnti).
+4. "Apri Viewer 3D" con una variante selezionata usa gli stessi dati filtrati.
+5. Salvare una nuova variante → compare subito nella tendina.

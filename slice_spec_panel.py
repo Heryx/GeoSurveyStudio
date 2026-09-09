@@ -78,11 +78,18 @@ class SliceSpecPanel(QWidget):
             self.cb_amplitude.addItem(_AMPLITUDE_LABELS.get(m, m), m)
         form.addRow("Ampiezza:", self.cb_amplitude)
 
-        self.le_source_variant = QLineEdit("raw")
-        self.le_source_variant.setToolTip(
-            "id della variante di pipeline da affettare, oppure 'raw'"
+        self.cb_source_variant = QComboBox()
+        self.cb_source_variant.setEditable(True)
+        self.cb_source_variant.addItem("raw")
+        self.cb_source_variant.setToolTip(
+            "Radargrammi da affettare:\n"
+            " • 'raw' = i profili attualmente caricati (grezzi o con la pipeline\n"
+            "   di anteprima), come prima;\n"
+            " • una variante salvata (GPR_Processing/processed/<nome>) = usa i\n"
+            "   suoi .npz gia' filtrati, senza riapplicare la pipeline.\n"
+            "L'elenco si aggiorna con le varianti presenti nel progetto."
         )
-        form.addRow("Variante sorgente:", self.le_source_variant)
+        form.addRow("Variante sorgente:", self.cb_source_variant)
 
         self.sp_velocity = self._dspin(10.0, 1.0, 30.0, 0.5, " cm/ns")
         self.sp_velocity.setToolTip("velocità onda EM (per conversione tempo→profondità)")
@@ -157,8 +164,29 @@ class SliceSpecPanel(QWidget):
             cb.currentIndexChanged.connect(self._on_changed)
         for chk in (self.chk_z_max_auto, self.chk_radius_auto):
             chk.toggled.connect(self._on_changed)
-        self.le_source_variant.textChanged.connect(self._on_changed)
+        self.cb_source_variant.currentTextChanged.connect(self._on_changed)
         self.le_crs_epsg.textChanged.connect(self._on_changed)
+
+    def set_variant_choices(self, names) -> None:
+        """Ripopola la tendina 'Variante sorgente' con ``raw`` + le varianti
+        date, preservando la selezione corrente."""
+        cb = self.cb_source_variant
+        cur = cb.currentText().strip() or "raw"
+        items = ["raw"]
+        for n in names or []:
+            n = str(n).strip()
+            if n and n != "raw" and n not in items:
+                items.append(n)
+        if cur not in items:
+            items.append(cur)
+        block = cb.blockSignals(True)
+        try:
+            cb.clear()
+            cb.addItems(items)
+            i = cb.findText(cur)
+            cb.setCurrentIndex(i if i >= 0 else 0)
+        finally:
+            cb.blockSignals(block)
 
     # ------------------------------------------------------------------
     # behaviour
@@ -189,7 +217,7 @@ class SliceSpecPanel(QWidget):
             thickness_m=float(self.sp_thickness.value()),
             overlap=round(float(self.sp_overlap.value()) / 100.0, 4),
             amplitude_mode=str(self.cb_amplitude.currentData() or "abs_mean"),
-            source_variant=(self.le_source_variant.text().strip() or "raw"),
+            source_variant=(self.cb_source_variant.currentText().strip() or "raw"),
             velocity_m_s=float(self.sp_velocity.value()) * _CM_NS_TO_M_S,
             resolution_m=float(self.sp_resolution.value()),
             interp=str(self.cb_interp.currentData() or "idw"),
@@ -215,7 +243,7 @@ class SliceSpecPanel(QWidget):
             self.sp_thickness.setValue(float(spec.thickness_m))
             self.sp_overlap.setValue(float(spec.overlap) * 100.0)
             self._set_combo(self.cb_amplitude, spec.amplitude_mode)
-            self.le_source_variant.setText(str(spec.source_variant or "raw"))
+            self._set_source_variant(str(spec.source_variant or "raw"))
             self.sp_velocity.setValue(float(spec.velocity_m_s) * _M_S_TO_CM_NS)
             self.sp_resolution.setValue(float(spec.resolution_m))
             self._set_combo(self.cb_interp, spec.interp)
@@ -235,6 +263,14 @@ class SliceSpecPanel(QWidget):
         idx = cb.findData(data)
         if idx >= 0:
             cb.setCurrentIndex(idx)
+
+    def _set_source_variant(self, name: str) -> None:
+        cb = self.cb_source_variant
+        i = cb.findText(name)
+        if i < 0:
+            cb.addItem(name)
+            i = cb.findText(name)
+        cb.setCurrentIndex(i if i >= 0 else 0)
 
     # ------------------------------------------------------------------
     def validate(self) -> "tuple[bool, str]":

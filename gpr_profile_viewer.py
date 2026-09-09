@@ -2842,9 +2842,15 @@ class GprProfileViewer(QMainWindow):
             variants_scroll.setWidget(self._build_variants_tab())
             variants_scroll.setMinimumWidth(250)
             tabs.addTab(variants_scroll, "Varianti")
-            tabs.currentChanged.connect(
-                lambda i: self._refresh_variants_list() if tabs.tabText(i) == "Varianti" else None
-            )
+
+            def _on_right_tab_changed(i):
+                txt = tabs.tabText(i)
+                if txt == "Varianti":
+                    self._refresh_variants_list()
+                elif txt == "Slicing":
+                    self._refresh_slice_variant_choices()
+
+            tabs.currentChanged.connect(_on_right_tab_changed)
         except Exception:
             pass
         tabs.setCurrentIndex(0)
@@ -7696,6 +7702,7 @@ class GprProfileViewer(QMainWindow):
                 self._variant_parent_ctx = variant
             except Exception:
                 pass
+            self._refresh_slice_variant_choices()
         if errors:
             QMessageBox.warning(
                 self, "Salva variante",
@@ -8501,6 +8508,7 @@ class GprProfileViewer(QMainWindow):
         for root in forest:
             _add(root, None)
         tree.expandAll()
+        self._refresh_slice_variant_choices()
 
     def _selected_variant_dir(self) -> str:
         tree = getattr(self, "_tree_variants", None)
@@ -8644,6 +8652,73 @@ class GprProfileViewer(QMainWindow):
         if not folder:
             return
         self._slice_from_variant_folder(folder)
+
+    def _variant_names_for_picker(self) -> list[str]:
+        """Nomi delle varianti salvate (cartelle in processed/ con .npz)."""
+        paths = self._gpr_processing_paths()
+        processed = paths.get("processed", "") if paths else ""
+        if not processed or not os.path.isdir(processed):
+            return []
+        out = []
+        try:
+            for d in list_variants(processed):
+                man = read_variant_manifest(d) or {}
+                nm = str(man.get("name") or os.path.basename(os.path.normpath(d))).strip()
+                # solo varianti con radargrammi affettabili
+                if nm and glob.glob(os.path.join(d, "*.npz")):
+                    out.append(nm)
+        except Exception:
+            return []
+        return sorted(set(out))
+
+    def _refresh_slice_variant_choices(self) -> None:
+        panel = getattr(self, "_slice_spec_panel", None)
+        if panel is not None and self._is_qt_alive(panel) and hasattr(panel, "set_variant_choices"):
+            try:
+                panel.set_variant_choices(self._variant_names_for_picker())
+            except Exception:
+                pass
+
+    def _variant_dir_for_name(self, name: str) -> str:
+        name = str(name or "").strip()
+        if not name or name.lower() == "raw":
+            return ""
+        paths = self._gpr_processing_paths()
+        processed = paths.get("processed", "") if paths else ""
+        if not processed:
+            return ""
+        d = os.path.join(processed, name)
+        return d if os.path.isdir(d) and glob.glob(os.path.join(d, "*.npz")) else ""
+
+    def _profiles_for_slicing(self):
+        """(profiles, variant_name) da usare per la generazione time-slice.
+
+        Se il pannello ha una 'Variante sorgente' diversa da 'raw' e la cartella
+        esiste con .npz, ritorna i radargrammi gia' filtrati caricati da disco
+        (il chiamante deve disabilitare la pipeline). Altrimenti i profili
+        correnti e ``""``.
+        """
+        panel = getattr(self, "_slice_spec_panel", None)
+        name = ""
+        if panel is not None and self._is_qt_alive(panel):
+            try:
+                name = str(panel.get_spec().source_variant or "").strip()
+            except Exception:
+                name = ""
+        d = self._variant_dir_for_name(name)
+        if not d:
+            return list(self._profiles or []), ""
+        npzs = sorted(glob.glob(os.path.join(d, "*.npz")))
+        try:
+            profs = [load_processed_profile_npz(p) for p in npzs]
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Variante sorgente",
+                f"Impossibile leggere i .npz della variante '{name}':\n{exc}\n\n"
+                "Uso i profili correnti.",
+            )
+            return list(self._profiles or []), ""
+        return profs, name
 
     def _slice_from_variant_folder(self, folder: str):
         """Carica i .npz di una cartella-variante e lancia la generazione slice."""
@@ -9092,6 +9167,15 @@ class GprProfileViewer(QMainWindow):
                                     "Importa almeno un file .ogpr prima.")
             return
         slice_params = self.get_slice_params()
+        slice_profiles, variant_src = self._profiles_for_slicing()
+        if not slice_profiles:
+            QMessageBox.warning(self, "Timeslice", "Nessun radargramma da affettare.")
+            return
+        if variant_src:
+            # dati gia' filtrati su disco: niente ri-processing della pipeline
+            slice_params["use_processing"] = False
+            slice_params["pipeline_params"] = {}
+            slice_params["pre_slice_bg_removal"] = False
         panel = getattr(self, "_slice_spec_panel", None)
         if panel is not None and self._is_qt_alive(panel):
             try:
@@ -9109,17 +9193,21 @@ class GprProfileViewer(QMainWindow):
         slice_params["z_step_override"] = float(dz)
         slice_params["thickness_m"] = float(dz)
         outdir = str(getattr(self, "_le_slice_outdir", None).text() if hasattr(self, "_le_slice_outdir") else "").strip()
+        if not outdir and variant_src:
+            paths = self._gpr_processing_paths()
+            if paths.get("timeslices"):
+                outdir = os.path.join(paths["timeslices"], variant_src)
         if outdir:
             slice_params["output_dir"] = outdir
         if self.plugin and hasattr(self.plugin, "import_ogpr_as_slices"):
             try:
                 self.plugin.import_ogpr_as_slices(
-                    self._profiles,
+                    slice_profiles,
                     slice_params=slice_params,
                     completion_callback=self._on_timeslice_build_finished,
                 )
             except TypeError:
-                self.plugin.import_ogpr_as_slices(self._profiles, slice_params=slice_params)
+                self.plugin.import_ogpr_as_slices(slice_profiles, slice_params=slice_params)
         else:
             QMessageBox.information(
                 self, "Timeslice",
@@ -9158,13 +9246,16 @@ class GprProfileViewer(QMainWindow):
         if _use_spec:
             try:
                 from .slice_params_compat import spec_to_build_params
-                spec = _panel.get_spec().resolve(self._profiles)
+                slice_profiles, _variant_src = self._profiles_for_slicing()
+                if not slice_profiles:
+                    slice_profiles = list(self._profiles or [])
+                spec = _panel.get_spec().resolve(slice_profiles)
                 params = spec_to_build_params(
                     spec, channel=-1, combine_method="mean",
                     group_name="gpr_volume3d_preview",
                 )
                 grids, meta = compute_ogpr_slice_grids(
-                    profiles=self._profiles, channel=-1, combine_method="mean",
+                    profiles=slice_profiles, channel=-1, combine_method="mean",
                     spec=spec, emit_diagnostics=True,
                 )
             except Exception as exc:
