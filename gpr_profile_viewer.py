@@ -17,7 +17,7 @@ from typing import Optional
 
 import numpy as np
 
-from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal, QSettings, QThread, QObject
+from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal, QSettings, QThread, QObject, QSize
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QDialog, QMainWindow, QVBoxLayout, QHBoxLayout, QToolBar,
@@ -91,8 +91,13 @@ except Exception:
     FilterChainWidget = None
     FilterBlockWidget = None
 
+try:
+    from . import gpr_palettes as _gpr_palettes
+except Exception:  # pragma: no cover
+    _gpr_palettes = None
 
-GPR_CMAPS    = [
+
+GPR_BUILTIN_CMAPS = [
     "RdBu_r",
     "seismic",
     "gray",
@@ -106,6 +111,53 @@ GPR_CMAPS    = [
     "Spectral_r",
 ]
 DEFAULT_CMAP = "RdBu_r"
+
+# Lista completa (native + palette esterne registrate in matplotlib).
+GPR_CMAPS = list(GPR_BUILTIN_CMAPS)
+
+
+def refresh_gpr_cmaps():
+    """Ri-scansiona le palette esterne e aggiorna GPR_CMAPS. Idempotente."""
+    global GPR_CMAPS
+    extra = []
+    if _gpr_palettes is not None:
+        try:
+            extra = _gpr_palettes.register_all()
+        except Exception:
+            extra = []
+    GPR_CMAPS = GPR_BUILTIN_CMAPS + [c for c in extra if c not in GPR_BUILTIN_CMAPS]
+    return GPR_CMAPS
+
+
+def _populate_cmap_combo(cb, *, current=None):
+    """Riempie una QComboBox con i nomi colormap + icona anteprima, preservando
+    la selezione corrente quando possibile."""
+    if cb is None:
+        return
+    keep = current if current is not None else cb.currentText()
+    try:
+        cb.blockSignals(True)
+        cb.clear()
+        for name in GPR_CMAPS:
+            icon = None
+            if _gpr_palettes is not None:
+                try:
+                    icon = _gpr_palettes.make_cmap_icon(name, 64, 14)
+                except Exception:
+                    icon = None
+            if icon is not None:
+                cb.addItem(icon, name)
+            else:
+                cb.addItem(name)
+        if keep and keep in GPR_CMAPS:
+            cb.setCurrentText(keep)
+        elif DEFAULT_CMAP in GPR_CMAPS:
+            cb.setCurrentText(DEFAULT_CMAP)
+    finally:
+        cb.blockSignals(False)
+
+
+refresh_gpr_cmaps()
 
 
 class _RangeGainCurveDialog(QDialog):
@@ -540,6 +592,10 @@ class GprProfileViewer(QMainWindow):
         self._updating_xpan = False
 
         self._build_ui()
+        try:
+            self._update_cmap_previews()
+        except Exception:
+            pass
         # Auto-import profili da GPR_Processing/project.json se presente.
         try:
             QTimer.singleShot(0, self._try_import_saved_gpr_processing_project)
@@ -708,6 +764,68 @@ class GprProfileViewer(QMainWindow):
     # UI
     # ------------------------------------------------------------------
 
+    def _update_cmap_previews(self, *_):
+        """Aggiorna le strisce di anteprima della colormap (radargramma + slice)."""
+        if _gpr_palettes is None:
+            return
+        pairs = (
+            ("_lbl_cmap_preview", "_cb_cmap"),
+            ("_lbl_slice_cmap_preview", "_cb_slice_cmap"),
+        )
+        for lbl_attr, cb_attr in pairs:
+            lbl = getattr(self, lbl_attr, None)
+            cb = getattr(self, cb_attr, None)
+            if not self._is_qt_alive(lbl) or not self._is_qt_alive(cb):
+                continue
+            name = cb.currentText().strip()
+            if not name:
+                continue
+            try:
+                pm = _gpr_palettes.colormap_preview_pixmap(
+                    name, max(16, lbl.width()), max(8, lbl.height())
+                )
+                lbl.setPixmap(pm)
+            except Exception:
+                lbl.clear()
+
+    def _on_import_palette(self):
+        """Importa uno o piu' file palette e li rende disponibili in tutte le combo."""
+        if _gpr_palettes is None:
+            QMessageBox.warning(self, "Palette", "Modulo palette non disponibile.")
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Importa palette",
+            "",
+            "Palette (*.svg *.ggr *.cpt);;Tutti i file (*)",
+        )
+        if not paths:
+            return
+
+        added, errors = [], []
+        for p in paths:
+            try:
+                added.append(_gpr_palettes.import_palette_file(p))
+            except Exception as exc:
+                errors.append("%s: %s" % (os.path.basename(p), exc))
+
+        refresh_gpr_cmaps()
+        for cb_attr in ("_cb_cmap", "_cb_slice_cmap"):
+            cb = getattr(self, cb_attr, None)
+            if self._is_qt_alive(cb):
+                _populate_cmap_combo(cb)
+        if added and self._is_qt_alive(getattr(self, "_cb_cmap", None)):
+            self._cb_cmap.setCurrentText(added[-1])
+        self._update_cmap_previews()
+
+        msg = []
+        if added:
+            msg.append("Aggiunte: " + ", ".join(added))
+        if errors:
+            msg.append("Errori:\n" + "\n".join(errors))
+        if msg:
+            QMessageBox.information(self, "Import palette", "\n\n".join(msg))
+
     def _build_ui(self):
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -740,10 +858,24 @@ class GprProfileViewer(QMainWindow):
         tb.addSeparator()
         tb.addWidget(QLabel(" Colormap:"))
         self._cb_cmap = QComboBox()
-        self._cb_cmap.addItems(GPR_CMAPS)
-        self._cb_cmap.setCurrentText(DEFAULT_CMAP)
+        self._cb_cmap.setIconSize(QSize(64, 14))
+        _populate_cmap_combo(self._cb_cmap, current=DEFAULT_CMAP)
         self._cb_cmap.currentTextChanged.connect(self._redraw)
+        self._cb_cmap.currentTextChanged.connect(self._update_cmap_previews)
         tb.addWidget(self._cb_cmap)
+
+        self._lbl_cmap_preview = QLabel()
+        self._lbl_cmap_preview.setFixedSize(140, 16)
+        self._lbl_cmap_preview.setToolTip("Anteprima della scala di colori selezionata.")
+        tb.addWidget(self._lbl_cmap_preview)
+
+        self._btn_import_palette = QToolButton()
+        self._btn_import_palette.setText("➕")
+        self._btn_import_palette.setToolTip(
+            "Importa palette (cpt-city .svg, GIMP .ggr, GMT .cpt)."
+        )
+        self._btn_import_palette.clicked.connect(self._on_import_palette)
+        tb.addWidget(self._btn_import_palette)
 
         tb.addSeparator()
         tb.addWidget(QLabel(" Render:"))
@@ -2294,9 +2426,11 @@ class GprProfileViewer(QMainWindow):
         self._spin_slice_thickness.valueChanged.connect(lambda _v: self._request_preview_update(immediate=False))
 
         self._cb_slice_cmap = QComboBox()
-        self._cb_slice_cmap.addItems(GPR_CMAPS)
-        self._cb_slice_cmap.setCurrentText(DEFAULT_CMAP)
+        self._cb_slice_cmap.setIconSize(QSize(64, 14))
+        _populate_cmap_combo(self._cb_slice_cmap, current=DEFAULT_CMAP)
         self._cb_slice_cmap.setToolTip("Colormap dedicata alla vista timeslice (indipendente dal radargramma).")
+        self._lbl_slice_cmap_preview = QLabel()
+        self._lbl_slice_cmap_preview.setFixedSize(160, 16)
         self._spin_slice_vmin_pct = QDoubleSpinBox()
         self._spin_slice_vmin_pct.setRange(0.0, 49.0)
         self._spin_slice_vmin_pct.setSingleStep(0.5)
@@ -2308,6 +2442,7 @@ class GprProfileViewer(QMainWindow):
         self._spin_slice_vmax_pct.setValue(98.0)
         self._spin_slice_vmax_pct.setToolTip("Percentile massimo per contrasto timeslice.")
         self._cb_slice_cmap.currentTextChanged.connect(lambda _v: self._redraw_slice_view(force=True))
+        self._cb_slice_cmap.currentTextChanged.connect(self._update_cmap_previews)
         self._spin_slice_vmin_pct.valueChanged.connect(self._on_slice_clip_changed)
         self._spin_slice_vmax_pct.valueChanged.connect(self._on_slice_clip_changed)
 
@@ -2579,6 +2714,7 @@ class GprProfileViewer(QMainWindow):
         fl_slice_adv.addRow("Preset:",             self._cb_slice_preset)
         fl_slice_adv.addRow("  azione:",           self._btn_slice_preset_apply)
         fl_slice_adv.addRow("Slice colormap:",     self._cb_slice_cmap)
+        fl_slice_adv.addRow("  anteprima:",        self._lbl_slice_cmap_preview)
         fl_slice_adv.addRow("Slice clip min %:",   self._spin_slice_vmin_pct)
         fl_slice_adv.addRow("Slice clip max %:",   self._spin_slice_vmax_pct)
         fl_slice_adv.addRow("Potenza IDW (p):",    self._spin_slice_idw_power)
@@ -4392,7 +4528,31 @@ class GprProfileViewer(QMainWindow):
             gain_hyper = self._collect_gain_hyper_preset()
         except Exception:
             gain_hyper = {}
-        return {"version": 1, "params": params, "gain_hyper": gain_hyper}
+        n_samples = 0
+        try:
+            if self._raw_data is not None and self._raw_data.ndim == 2:
+                n_samples = int(self._raw_data.shape[0])
+            elif self._profiles:
+                n_samples = int(getattr(self._profiles[0], "n_samples", 0) or 0)
+        except Exception:
+            n_samples = 0
+        return {"version": 1, "params": params, "gain_hyper": gain_hyper,
+                "n_samples": n_samples}
+
+    # Parametri legati alla geometria del dato (unita' = campioni o
+    # dipendenti dalla posizione del burst): NON vanno ripristinati se il
+    # numero di campioni e' cambiato (es. dopo una correzione del reader).
+    _SAMPLE_TIED_PARAM_KEYS = frozenset({
+        "dewow_win", "tz_backup_nsamp",
+        "bg_window", "bg_sample_start", "bg_sample_end",
+        "agc_win", "agc_sample_start",
+        "pre_agc_breakpoints",
+        "dcshift_sample_start", "dcshift_sample_end",
+        "amp_eq_window", "boxcar_width", "boxcar_height",
+        "median2d_w_trace", "median2d_w_sample",
+        "eigen_drop", "eigen_keep_last",
+        "manual_gain_sample_start", "manual_gain_sample_end",
+    })
 
     @staticmethod
     def _set_widget_value(w, value) -> None:
@@ -4520,8 +4680,33 @@ class GprProfileViewer(QMainWindow):
         riprocessa una sola volta."""
         if not isinstance(state, dict):
             return
-        params = state.get("params") if isinstance(state.get("params"), dict) else {}
-        gain_hyper = state.get("gain_hyper") if isinstance(state.get("gain_hyper"), dict) else {}
+        params = dict(state.get("params") if isinstance(state.get("params"), dict) else {})
+        gain_hyper = dict(state.get("gain_hyper") if isinstance(state.get("gain_hyper"), dict) else {})
+
+        # Se il numero di campioni e' cambiato dall'ultimo salvataggio (es.
+        # dopo una correzione del reader), i parametri legati alla geometria
+        # non sono piu' validi: scartali e invita a rifare l'auto-tune.
+        cur_ns = 0
+        try:
+            if self._raw_data is not None and self._raw_data.ndim == 2:
+                cur_ns = int(self._raw_data.shape[0])
+            elif self._profiles:
+                cur_ns = int(getattr(self._profiles[0], "n_samples", 0) or 0)
+        except Exception:
+            cur_ns = 0
+        saved_ns = int(state.get("n_samples", 0) or 0)
+        geometry_changed = bool(saved_ns and cur_ns and saved_ns != cur_ns)
+        if geometry_changed:
+            for k in self._SAMPLE_TIED_PARAM_KEYS:
+                params.pop(k, None)
+            rg = gain_hyper.get("range_gain")
+            if isinstance(rg, dict):
+                rg.pop("breakpoints", None)
+            mg = gain_hyper.get("manual_gain")
+            if isinstance(mg, dict):
+                for k in ("sample_start", "sample_end"):
+                    mg.pop(k, None)
+
         self._syncing_filter_chain = True
         try:
             if gain_hyper:
@@ -4532,6 +4717,17 @@ class GprProfileViewer(QMainWindow):
             self._apply_processing_widget_params(params)
         finally:
             self._syncing_filter_chain = False
+
+        if geometry_changed:
+            try:
+                self._safe_set_text(
+                    self._lbl_status,
+                    f"Geometria dati cambiata ({saved_ns}→{cur_ns} campioni): "
+                    "parametri legati ai campioni non ripristinati. "
+                    "Riesegui 'Auto-tune parametri'.",
+                )
+            except Exception:
+                pass
         try:
             if self._raw_data is not None:
                 self._apply_processing()
