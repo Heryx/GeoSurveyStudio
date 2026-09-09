@@ -32,6 +32,7 @@ from qgis.PyQt.QtWidgets import (
     QFileDialog, QMessageBox, QSizePolicy,
     QGroupBox, QFormLayout, QPushButton, QDialogButtonBox, QScrollArea, QDockWidget, QLineEdit,
     QProgressBar, QListWidget, QListWidgetItem,
+    QTreeWidget, QTreeWidgetItem, QMenu,
 )
 from qgis.core import (
     Qgis,
@@ -495,6 +496,9 @@ class GprProfileViewer(QMainWindow):
         self._slice_catalog_source_dir: str = ""
         self._slice_catalog_dz: float = 0.0
         self._slice_catalog_from_manifest: bool = False
+        # Nome della variante da cui deriva la prossima variante salvata
+        # (impostato da "Nuova variante da qui" nel pannello Varianti).
+        self._variant_parent_ctx: Optional[str] = None
         self._updating_slice_nav: bool = False
         self._chk_slice_open_3d_on_complete = None
         self._show_wiggle: bool = True
@@ -4455,6 +4459,56 @@ class GprProfileViewer(QMainWindow):
             except Exception:
                 pass
 
+    # Coppie (id step catena) -> (chiave bool in _current_processing_params).
+    # I 12 step Fase 1 usano il proprio id come chiave; qui solo le eccezioni.
+    _CHAIN_ENABLE_KEY = {
+        "bg_removal": "bg_removal",
+        "pre_agc_gain": "pre_agc_gain",
+    }
+
+    def _last_enabled_step(self, params: dict, chain_order: list | None) -> str:
+        order = [str(s) for s in (chain_order or params.get("chain_order") or [])]
+        for sid in reversed(order):
+            key = self._CHAIN_ENABLE_KEY.get(sid, sid)
+            if bool(params.get(key, False)):
+                return sid
+        return ""
+
+    def _apply_pipeline_params_dict(self, params: dict, chain_order: list | None = None) -> None:
+        """Carica nei controlli di processing una ricetta salvata come dict
+        piatto (``variant.json['pipeline_params']``): ordine + enable della
+        catena dai flag booleani, poi i valori numerici dei singoli step,
+        infine un solo riprocessamento."""
+        if not isinstance(params, dict) or not params:
+            return
+        order = [str(s) for s in (chain_order or params.get("chain_order") or [])]
+        enabled = {}
+        for sid in order:
+            key = self._CHAIN_ENABLE_KEY.get(sid, sid)
+            enabled[sid] = bool(params.get(key, False))
+        self._syncing_filter_chain = True
+        try:
+            fcw = getattr(self, "_filter_chain_widget", None)
+            if self._is_qt_alive(fcw):
+                try:
+                    if order:
+                        fcw.set_order([str(s) for s in order], emit_signal=False)
+                    if enabled:
+                        fcw.set_enabled_map({str(k): bool(v) for k, v in enabled.items()},
+                                            emit_signal=False)
+                    self._on_filter_chain_widget_changed()
+                except Exception as exc:
+                    print(f"[GPR viewer][WARN] catena filtri: {exc}")
+            self._apply_processing_widget_params(params)
+        finally:
+            self._syncing_filter_chain = False
+        try:
+            if self._raw_data is not None:
+                self._apply_processing()
+                self._request_preview_update(immediate=True)
+        except Exception:
+            pass
+
     def _apply_full_processing_state(self, state: dict) -> None:
         """Ripristina l'intero stato di processing salvato nel progetto e
         riprocessa una sola volta."""
@@ -7626,6 +7680,22 @@ class GprProfileViewer(QMainWindow):
                 write_variant_manifest(variant_dir, variant, params, chain, files)
             except Exception:
                 pass
+            try:
+                from . import variant_provenance as vp
+                parent = getattr(self, "_variant_parent_ctx", None)
+                if parent == variant:
+                    parent = None
+                vp.set_entry(
+                    paths["processed"], variant,
+                    parent=parent,
+                    chain=chain or params.get("chain_order"),
+                    step=self._last_enabled_step(params, chain),
+                    n_profiles=len(files),
+                )
+                # la prossima variante salvata discende da questa
+                self._variant_parent_ctx = variant
+            except Exception:
+                pass
         if errors:
             QMessageBox.warning(
                 self, "Salva variante",
@@ -8317,20 +8387,31 @@ class GprProfileViewer(QMainWindow):
         lay.setSpacing(6)
 
         lay.addWidget(QLabel(
-            "Varianti di radargrammi processati salvate in\n"
-            "GPR_Processing/processed/. Ognuna e' un set .npz gia' filtrato."
+            "Varianti di radargrammi processati in GPR_Processing/processed/.\n"
+            "L'albero segue la provenienza (variant_graph.json): ogni variante\n"
+            "e' figlia di quella da cui e' stata derivata. Tasto destro per le azioni."
         ))
-        self._lst_variants = QListWidget()
-        self._lst_variants.setAlternatingRowColors(True)
-        self._lst_variants.itemSelectionChanged.connect(self._on_variant_selection_changed)
-        self._lst_variants.itemDoubleClicked.connect(
-            lambda _it: self._slice_selected_variant()
+        self._tree_variants = QTreeWidget()
+        self._tree_variants.setHeaderLabels(["Variante", "Profili", "Ultimo step"])
+        self._tree_variants.setAlternatingRowColors(True)
+        self._tree_variants.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._tree_variants.customContextMenuRequested.connect(self._on_variants_context_menu)
+        self._tree_variants.itemSelectionChanged.connect(self._on_variant_selection_changed)
+        self._tree_variants.itemDoubleClicked.connect(
+            lambda _it, _c: self._slice_selected_variant()
         )
-        lay.addWidget(self._lst_variants, 1)
+        lay.addWidget(self._tree_variants, 1)
 
         row = QHBoxLayout()
         self._btn_variants_refresh = QPushButton("Aggiorna")
         self._btn_variants_refresh.clicked.connect(self._refresh_variants_list)
+        self._btn_variants_newfrom = QPushButton("Nuova variante da qui")
+        self._btn_variants_newfrom.setEnabled(False)
+        self._btn_variants_newfrom.setToolTip(
+            "Carica la pipeline di questa variante nei controlli di processing\n"
+            "e la registra come genitore della prossima variante salvata."
+        )
+        self._btn_variants_newfrom.clicked.connect(self._new_variant_from_selected)
         self._btn_variants_slice = QPushButton("Genera time-slice")
         self._btn_variants_slice.setEnabled(False)
         self._btn_variants_slice.setToolTip(
@@ -8342,6 +8423,7 @@ class GprProfileViewer(QMainWindow):
         self._btn_variants_open.setEnabled(False)
         self._btn_variants_open.clicked.connect(self._open_selected_variant_folder)
         row.addWidget(self._btn_variants_refresh)
+        row.addWidget(self._btn_variants_newfrom)
         row.addWidget(self._btn_variants_slice)
         row.addWidget(self._btn_variants_open)
         lay.addLayout(row)
@@ -8353,65 +8435,183 @@ class GprProfileViewer(QMainWindow):
         return w
 
     def _refresh_variants_list(self):
-        lst = getattr(self, "_lst_variants", None)
-        if not self._is_qt_alive(lst):
+        tree = getattr(self, "_tree_variants", None)
+        if not self._is_qt_alive(tree):
             return
-        lst.clear()
-        self._lbl_variant_detail.setText("—")
+        tree.clear()
+        if self._is_qt_alive(getattr(self, "_lbl_variant_detail", None)):
+            self._lbl_variant_detail.setText("—")
         paths = self._gpr_processing_paths()
         processed = paths.get("processed", "") if paths else ""
         if not processed or not os.path.isdir(processed):
-            it = QListWidgetItem("(nessun progetto GPR attivo)")
-            it.setFlags(Qt.NoItemFlags)
-            lst.addItem(it)
+            tree.addTopLevelItem(QTreeWidgetItem(["(nessun progetto GPR attivo)"]))
             return
         try:
             dirs = list_variants(processed)
         except Exception:
             dirs = []
         if not dirs:
-            it = QListWidgetItem("(nessuna variante salvata)")
-            it.setFlags(Qt.NoItemFlags)
-            lst.addItem(it)
+            tree.addTopLevelItem(QTreeWidgetItem(["(nessuna variante salvata)"]))
             return
+
+        try:
+            from . import variant_provenance as vp
+        except Exception:
+            vp = None
+        entries = vp.load(processed) if vp is not None else {}
+
+        by_name = {}
         for d in dirs:
             man = read_variant_manifest(d) or {}
-            name = str(man.get("name") or os.path.basename(os.path.normpath(d)))
-            n_prof = int(man.get("n_profiles") or len(man.get("files") or []))
+            nm = str(man.get("name") or os.path.basename(os.path.normpath(d)))
             chain = [s for s in (man.get("chain_order") or []) if s]
-            label = f"{name}   ({n_prof} profili)"
-            it = QListWidgetItem(label)
-            it.setData(Qt.UserRole, d)
-            it.setData(Qt.UserRole + 1, {"chain": chain, "created": man.get("created", "")})
-            it.setToolTip(
-                f"{d}\ncatena: {', '.join(chain) if chain else '(non registrata)'}"
-            )
-            lst.addItem(it)
+            n_prof = int(man.get("n_profiles") or len(man.get("files") or []))
+            by_name[nm] = {
+                "dir": os.path.normpath(d),
+                "chain": chain,
+                "n_prof": n_prof,
+                "created": man.get("created", ""),
+            }
+
+        present = list(by_name.keys())
+        if vp is not None:
+            forest = vp.build_forest(entries, present)
+        else:
+            forest = [{"name": n, "meta": {}, "children": []} for n in present]
+
+        def _add(node, parent_item):
+            nm = node["name"]
+            info = by_name.get(nm, {})
+            chain = info.get("chain") or []
+            last_step = (entries.get(nm, {}) or {}).get("step") or (chain[-1] if chain else "")
+            it = QTreeWidgetItem([
+                nm, str(info.get("n_prof", "")), str(last_step or ""),
+            ])
+            it.setData(0, Qt.UserRole, info.get("dir", ""))
+            it.setData(0, Qt.UserRole + 1, {"chain": chain, "created": info.get("created", "")})
+            it.setToolTip(0, f"{info.get('dir','')}\ncatena: "
+                             f"{', '.join(chain) if chain else '(non registrata)'}")
+            if parent_item is None:
+                self._tree_variants.addTopLevelItem(it)
+            else:
+                parent_item.addChild(it)
+            for ch in node.get("children") or []:
+                _add(ch, it)
+
+        for root in forest:
+            _add(root, None)
+        tree.expandAll()
 
     def _selected_variant_dir(self) -> str:
-        lst = getattr(self, "_lst_variants", None)
-        if not self._is_qt_alive(lst):
+        tree = getattr(self, "_tree_variants", None)
+        if not self._is_qt_alive(tree):
             return ""
-        it = lst.currentItem()
+        it = tree.currentItem()
         if it is None:
             return ""
-        d = it.data(Qt.UserRole)
+        d = it.data(0, Qt.UserRole)
         return str(d) if d else ""
+
+    def _selected_variant_name(self) -> str:
+        tree = getattr(self, "_tree_variants", None)
+        if not self._is_qt_alive(tree):
+            return ""
+        it = tree.currentItem()
+        return str(it.text(0)) if it is not None else ""
 
     def _on_variant_selection_changed(self):
         d = self._selected_variant_dir()
         has = bool(d)
-        for b in ("_btn_variants_slice", "_btn_variants_open"):
+        for b in ("_btn_variants_slice", "_btn_variants_open", "_btn_variants_newfrom"):
             w = getattr(self, b, None)
             if self._is_qt_alive(w):
                 w.setEnabled(has)
-        it = self._lst_variants.currentItem() if has else None
-        meta = it.data(Qt.UserRole + 1) if it is not None else None
+        tree = getattr(self, "_tree_variants", None)
+        it = tree.currentItem() if (has and self._is_qt_alive(tree)) else None
+        meta = it.data(0, Qt.UserRole + 1) if it is not None else None
         if isinstance(meta, dict):
             chain = ", ".join(meta.get("chain") or []) or "(catena non registrata)"
             self._lbl_variant_detail.setText(f"Catena: {chain}\n{d}")
         else:
             self._lbl_variant_detail.setText("—")
+
+    def _on_variants_context_menu(self, pos):
+        tree = getattr(self, "_tree_variants", None)
+        if not self._is_qt_alive(tree):
+            return
+        it = tree.itemAt(pos)
+        if it is None or not it.data(0, Qt.UserRole):
+            return
+        tree.setCurrentItem(it)
+        menu = QMenu(tree)
+        act_new = menu.addAction("Nuova variante da qui")
+        act_slice = menu.addAction("Genera time-slice")
+        act_open = menu.addAction("Apri cartella")
+        menu.addSeparator()
+        act_del = menu.addAction("Elimina variante…")
+        chosen = menu.exec_(tree.viewport().mapToGlobal(pos))
+        if chosen == act_new:
+            self._new_variant_from_selected()
+        elif chosen == act_slice:
+            self._slice_selected_variant()
+        elif chosen == act_open:
+            self._open_selected_variant_folder()
+        elif chosen == act_del:
+            self._delete_selected_variant()
+
+    def _new_variant_from_selected(self):
+        d = self._selected_variant_dir()
+        name = self._selected_variant_name()
+        if not d or not os.path.isdir(d):
+            return
+        man = read_variant_manifest(d) or {}
+        params = man.get("pipeline_params") if isinstance(man.get("pipeline_params"), dict) else {}
+        if not params:
+            QMessageBox.warning(self, "Nuova variante da qui",
+                                "La variante non registra i parametri della pipeline "
+                                "(variant.json privo di 'pipeline_params').")
+            return
+        chain = [s for s in (man.get("chain_order") or params.get("chain_order") or []) if s]
+        try:
+            self._apply_pipeline_params_dict(dict(params), chain_order=chain)
+        except Exception as exc:
+            QMessageBox.critical(self, "Nuova variante da qui",
+                                 f"Impossibile caricare la pipeline:\n{exc}")
+            return
+        self._variant_parent_ctx = str(name)
+        self._safe_set_text(
+            self._lbl_status,
+            f"Pipeline della variante '{name}' caricata. La prossima variante "
+            f"salvata sara' registrata come sua figlia.",
+        )
+
+    def _delete_selected_variant(self):
+        d = self._selected_variant_dir()
+        name = self._selected_variant_name()
+        if not d or not os.path.isdir(d):
+            return
+        ans = QMessageBox.question(
+            self, "Elimina variante",
+            f"Eliminare la cartella della variante '{name}'?\n{d}\n\n"
+            "I .npz e il manifesto verranno rimossi. Operazione non annullabile.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            shutil.rmtree(d)
+        except Exception as exc:
+            QMessageBox.critical(self, "Elimina variante", f"Rimozione fallita:\n{exc}")
+            return
+        try:
+            paths = self._gpr_processing_paths()
+            processed = paths.get("processed", "") if paths else ""
+            if processed:
+                from . import variant_provenance as vp
+                vp.remove_entry(processed, name)
+        except Exception:
+            pass
+        self._refresh_variants_list()
 
     def _slice_selected_variant(self):
         d = self._selected_variant_dir()

@@ -108,3 +108,32 @@ a destra **"Radargramma + marker (profilo selezionato)"**.
    ed estendono all'indietro, invece di essere rientrate dal lato di
    partenza. Con la checkbox off → comportamento attuale. Lo stagger si
    somma comunque a questa scelta. Stato ripristinato alla riapertura.
+
+---
+
+## Fix — persistenza processing + Passo 10 (Varianti ad albero)
+
+### Persistenza stato di processing
+1. Processare un profilo (gain, dewow, bandpass, bg, ecc.), **chiudere** il
+   Profile Viewer, riaprirlo / riaprire il progetto GPR. **Atteso:** i
+   controlli di processing e l'anteprima tornano com'erano, **senza**
+   riprocessare a mano; il file `GPR_Processing/project.json` contiene una
+   sezione `processing_state`.
+2. Cambiare qualche parametro e richiudere → alla riapertura si ritrova
+   l'ultima configurazione.
+
+### Passo 10 — pannello Varianti ad albero
+1. Salvare una variante (menu → "Salva variante processata", es. `bp`).
+   Nel pannello **Varianti** compare come nodo radice; `processed/` contiene
+   `variant_graph.json`.
+2. Sul nodo `bp` → tasto destro → **"Nuova variante da qui"**: i controlli di
+   processing si popolano con la pipeline di `bp`; barra di stato conferma che
+   la prossima variante sarà registrata come figlia.
+3. Aggiungere un filtro e salvare come `bp_bg`. **Atteso:** nell'albero
+   `bp_bg` appare **annidato sotto** `bp`; colonna "Ultimo step" coerente.
+4. Doppio click su un nodo → genera time-slice (come prima). "Apri cartella"
+   e "Elimina variante…" dal menu contestuale funzionano; eliminando un nodo
+   con figli, i figli si ri-agganciano al nonno.
+5. Rinominare a mano una cartella variante o cancellare `variant_graph.json`:
+   il pannello non deve andare in errore (le cartelle senza voce di
+   provenienza diventano radici).

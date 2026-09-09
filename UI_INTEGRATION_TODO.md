@@ -3,7 +3,7 @@
 **Aggiornato:** 2026-09-09
 **Branch:** `feature/interpolation-improvements-followup` (tutto committato e pushato
 su `geosurveystudio`)
-**Test:** `python -m unittest discover -s test` → 249, i 3 errori
+**Test:** `python -m unittest discover -s test` → 255, i 3 errori
 `test_qgis_environment / test_resources / test_translations` sono **preesistenti**
 (servono un runtime QGIS), tutto il resto verde.
 
@@ -13,7 +13,7 @@ memoria: `project_processing_rewrite.md`, `project_timeslice_redesign.md`.
 
 ---
 
-## Fatto — core headless (Fasi 1‑6 + §5.4) e passi UI 1‑9
+## Fatto — core headless (Fasi 1‑6 + §5.4) e passi UI 1‑10
 
 **Core (puro numpy, testato headless):**
 - Fase 1: `dcshift`, `boxcar_smooth`, `notch_filter`, `spectral_whitening`,
@@ -67,6 +67,13 @@ generati da `_PHASE1_SPECS` / `_build_phase1_step_controls` in
    invertite: parti dalla baseline di ritorno": le linee di ritorno più corte
    dello span vengono allineate al lato opposto (x1/y1) invece che rientrate
    dal lato di partenza (zig-zag di un'area rettangolare).
+10. **Pannello Varianti ad albero (provenienza)** — nuovo `variant_provenance.py`
+    (`variant_graph.json` in `processed/`: per variante `parent` / `chain` /
+    `step`). Scheda "Varianti" → `QTreeWidget` con menu contestuale: "Nuova
+    variante da qui" carica `pipeline_params` della variante nei controlli
+    (`_apply_pipeline_params_dict`) e la registra come genitore della prossima
+    variante salvata; "Genera time-slice" / "Apri cartella" / "Elimina
+    variante". `_slice_from_variant_folder` invariato (lavora sui `.npz`).
 
 **Fix** — persistenza dello stato di processing: la ricetta completa della
 pipeline (parametri per-step + ordine/enable catena + gain + iperbole) viene
@@ -90,16 +97,6 @@ sempre ricalcolato dai profili via `compute_ogpr_slice_grids`, non da una
 cartella di GeoTIFF esistente. Da fare **solo** se in futuro si aggiunge un
 "costruisci volume da set di time‑slice su disco": allora leggere l'asse z da
 `slice_manifest.read_sliceset(dir)["slices"]` e passarlo come `z_levels`.
-
-### Passo 10 — Pannello Varianti come grafo `VariantGraph`  ·  valore medio  ·  rischio medio
-Oggi la scheda "Varianti" è una **lista flat** di cartelle `processed/<nome>/`.
-Portarla al modello a grafo di `variant_graph.py`:
-- Persistere `variant_graph.json` in `processed/` quando si salva una variante
-  (`_save_processed_variant`): nodo con `parent` = variante di partenza, `step` =
-  ultimo filtro attivo, `params`.
-- Scheda "Varianti" → `QTreeWidget` dell'albero; menu contestuale "nuova variante
-  da qui" (carica quella come input della pipeline), "materializza".
-- `_slice_from_variant_folder` invariato (lavora sui `.npz`).
 
 ### Passo 11 — Fase F: unificare adapter LAS / CSV / PDAL  ·  strutturale  ·  headless‑friendly
 Dettagli in `TIMESLICE_REDESIGN_WORKPLAN.md §3bis` (Fase F).
