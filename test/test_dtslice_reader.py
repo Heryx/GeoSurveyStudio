@@ -56,7 +56,8 @@ def _blocked_dt(n_traces: int, seed: int = 0) -> tuple[bytes, np.ndarray]:
     body = bytearray()
     for k in range(n_traces):
         flag = 0x07 if k in (0, n_traces - 1) else 0x00
-        body += bytes([0x52, flag, 0, 0])
+        body += bytes([0x52, flag, 0, 0])                       # int32 marker
+        body += int(1_000_000 + k).to_bytes(4, "little", signed=True)  # counter
         body += samples[k].tobytes()
     raw = _v0_header_bytes(200, 1.2e-7, 0.0324) + bytes(body)
     return raw, samples.T.astype(np.float32)   # (NS, n_traces)

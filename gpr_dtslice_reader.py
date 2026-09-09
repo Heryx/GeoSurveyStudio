@@ -48,13 +48,15 @@ _V0_N_FIELDS = 10
 _SAMPLE_ITEMSIZE = 2  # int16
 
 # Layout "a blocchi": alcuni export .DT scrivono ogni traccia in un blocco di
-# HEADER_BLOCK_SIZE byte = intestazione di traccia + campioni int16. Il campo
-# 0 del blocco V0 (es. 200) NON e' il numero di campioni reale: quello si
-# ricava dal blocco. Intestazione di traccia osservata: byte 0 = 0x52 ('R'),
-# byte 2..3 = 0x0000 (byte 1 = flag, 0x07 su prima/ultima traccia).
+# HEADER_BLOCK_SIZE byte = intestazione di traccia (8 byte) + campioni int16.
+# Il campo 0 del blocco V0 (es. 200) NON e' il numero di campioni reale:
+# quello si ricava dal blocco. Intestazione di traccia osservata (8 byte):
+#   int32 marker  -> byte0 = 0x52 ('R'), byte1 = flag (0x07 su prima/ultima
+#                    traccia, 0x00 altrove), byte2..3 = 0x0000;
+#   int32 counter -> contatore per-traccia (odometro/tempo), NON campioni.
 _TRACE_BLOCK_SIZE = HEADER_BLOCK_SIZE          # 1028
-_TRACE_PREFIX_BYTES = 4
-_SAMPLES_PER_TRACE_BLOCK = (_TRACE_BLOCK_SIZE - _TRACE_PREFIX_BYTES) // _SAMPLE_ITEMSIZE  # 512
+_TRACE_PREFIX_BYTES = 8
+_SAMPLES_PER_TRACE_BLOCK = (_TRACE_BLOCK_SIZE - _TRACE_PREFIX_BYTES) // _SAMPLE_ITEMSIZE  # 510
 _TRACE_MARKER_BYTE = 0x52                      # 'R'
 
 # Il campo 1 del blocco V0 nell'export "raw" non contiene la frequenza
