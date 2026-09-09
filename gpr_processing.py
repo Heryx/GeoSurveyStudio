@@ -192,24 +192,38 @@ def _detect_t0_single(
     tr = np.asarray(trace, dtype=np.float64)
     win = tr[:search_end]
     abs_win = np.abs(win)
-    pk = float(np.max(abs_win))
+    # Riferimento del picco: la parte INIZIALE della finestra (zona onda
+    # diretta), non l'intera finestra di ricerca. Cosi' un riflettore
+    # profondo molto forte (che puo' superare l'onda diretta di 10x) non
+    # "cattura" il t0 alzando la soglia e spostando il first-break piu' giu'.
+    pk_ref_end = max(8, min(len(abs_win), search_end // 3))
+    pk = float(np.max(abs_win[:pk_ref_end])) if abs_win.size else 0.0
+    if pk < 1e-12:
+        pk = float(np.max(abs_win)) if abs_win.size else 0.0
     if pk < 1e-12:
         return 0
     thr_abs = threshold * pk
     breaches = np.flatnonzero(abs_win >= thr_abs)
     breach_idx = int(breaches[0]) if breaches.size > 0 else 0
+    # Il picco dell'onda diretta e' a pochi campioni dal first-break: limita
+    # la ricerca del picco a una finestra corta dopo breach_idx, altrimenti
+    # se l'onda diretta ha la cresta piatta (nessun massimo locale stretto)
+    # la ricerca "scivola" fino a un riflettore profondo molto forte.
+    peak_hi = min(search_end, breach_idx + max(12, 4 * max(1, int(backup_nsamp))))
     if method == "threshold":
         t0 = breach_idx
     elif method == "peak":
         t0 = breach_idx
-        seg = np.abs(tr[breach_idx:search_end])
+        seg = np.abs(tr[breach_idx:peak_hi])
         if seg.size >= 3:
             peaks = np.where((seg[1:-1] > seg[:-2]) & (seg[1:-1] > seg[2:]))[0]
             if peaks.size > 0:
                 t0 = breach_idx + int(peaks[0]) + 1
+            else:
+                t0 = breach_idx + int(np.argmax(seg))
     elif method == "zero_crossing":
         peak_idx = breach_idx
-        seg = np.abs(tr[breach_idx:search_end])
+        seg = np.abs(tr[breach_idx:peak_hi])
         if seg.size >= 3:
             peaks = np.where((seg[1:-1] > seg[:-2]) & (seg[1:-1] > seg[2:]))[0]
             if peaks.size > 0:

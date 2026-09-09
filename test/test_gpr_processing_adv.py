@@ -28,7 +28,41 @@ from gpr_processing import (
     nmo_correction,
     cmp_semblance,
     multifreq_blend,
+    time_zero_correction,
 )
+
+
+class TestTimeZero(unittest.TestCase):
+    def test_strong_deep_reflector_does_not_capture_t0(self):
+        """Regression: un riflettore profondo molto piu' forte dell'onda
+        diretta non deve spostare il t0 (che deve restare sul first-break
+        dell'onda diretta vicino al campione 0)."""
+        n_s, n_t = 400, 32
+        tr = np.zeros(n_s, dtype=np.float32)
+        # onda diretta debole ai campioni 3-8
+        tr[3:9] = np.array([-4, -6, -6, -5, -4, -3], dtype=np.float32) * 100
+        # riflettore fortissimo ai campioni 60-66 (~13x l'onda diretta)
+        tr[60:67] = np.array([1, 5, 8, 5, -1, -5, -4], dtype=np.float32) * 1000
+        data = np.tile(tr[:, None], (1, n_t))
+
+        out = time_zero_correction(
+            data, method="peak", mode="line_by_line",
+            threshold=0.45, backup_nsamp=4,
+        )
+        trimmed = n_s - out.shape[0]
+        # deve tagliare quasi nulla (t0 ~ onda diretta - backup), NON ~56
+        self.assertLess(trimmed, 10)
+
+    def test_normal_trace_still_aligns_to_direct_wave(self):
+        n_s, n_t = 300, 16
+        tr = np.zeros(n_s, dtype=np.float32)
+        tr[40:46] = np.array([2, 6, 9, 6, 2, -3], dtype=np.float32) * 500  # onda diretta a 40
+        data = np.tile(tr[:, None], (1, n_t))
+        out = time_zero_correction(data, method="peak", mode="line_by_line",
+                                   threshold=0.5, backup_nsamp=4)
+        trimmed = n_s - out.shape[0]
+        self.assertGreaterEqual(trimmed, 30)   # ~ 40 - backup
+        self.assertLessEqual(trimmed, 44)
 
 
 class TestGprProcessingAdvanced(unittest.TestCase):
