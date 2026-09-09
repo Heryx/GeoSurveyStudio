@@ -13,7 +13,7 @@ memoria: `project_processing_rewrite.md`, `project_timeslice_redesign.md`.
 
 ---
 
-## Fatto — core headless (Fasi 1‑6 + §5.4) e passi UI 1‑5
+## Fatto — core headless (Fasi 1‑6 + §5.4) e passi UI 1‑6
 
 **Core (puro numpy, testato headless):**
 - Fase 1: `dcshift`, `boxcar_smooth`, `notch_filter`, `spectral_whitening`,
@@ -40,6 +40,9 @@ generati da `_PHASE1_SPECS` / `_build_phase1_step_controls` in
    `37b2a43`
 5. **Filtra time‑slice (dominio griglia)** — `raster_io.read_tif_singleband` +
    azione menu che applica `grid_filters` a un set di GeoTIFF — `7a1f163`
+6. **Unisci / Ruota‑trasla set di time‑slice** — `grid_geometry` in UI
+   (`append_grids` + `edge_match` per l'unione multi‑griglia, `rotate_translate`
+   per la georeferenziazione); manifesto unito/aggiornato — `b064ed7`
 
 3b (dialog CMP semblance) **saltato** su richiesta utente (acquisizioni
 WARR/CMP di nicchia per l'archeologia). Le funzioni `cmp_semblance` /
@@ -48,23 +51,6 @@ WARR/CMP di nicchia per l'archeologia). Le funzioni `cmp_semblance` /
 ---
 
 ## Da fare — in ordine consigliato
-
-### Passo 6 — `grid_geometry` in UI  ·  valore alto (survey multi‑griglia)  ·  rischio basso
-Esporre `grid_geometry.py` (già testato: `rotate_translate`, `append_grids`,
-`edge_match`). Additivo, come il passo 5.
-- **Dove:** nuova azione menu Processing (accanto a "Filtra time‑slice…") oppure
-  una sezione nella scheda Slicing. Riusa `raster_io.read_tif_singleband` /
-  `write_tif_singleband` / `write_qml_singleband`.
-- **Azione "Unisci set di time‑slice":** l'utente sceglie 2+ cartelle di GeoTIFF
-  (stessa cell size, stessi indici z); per ogni indice z legge le griglie,
-  opzionale `edge_match` sulla giunzione, `append_grids(overlap="mean")`, scrive
-  un set unito `<nome>/`. Copiare/fondere i `sliceset.json` (unione delle
-  `slices`, `extent` ricalcolato).
-- **Azione "Ruota/trasla set":** dialog con `angle_deg`, `out_origin` (E,N),
-  `mode` (`fix_origin` | `translate_origin`); applica `rotate_translate` a ogni
-  GeoTIFF del set, scrive `<nome>_rt/`.
-- **Verifica QGIS:** due griglie adiacenti dello stesso sito → "Unisci" → un set
-  unico senza salto alla giunzione, allineato in QGIS.
 
 ### Passo 7 — SliceSet dal manifesto  ·  valore alto (è il cuore del "casino")  ·  rischio medio
 Far leggere profondità/ordine/CRS da `sliceset.json` invece del parsing dei nomi
