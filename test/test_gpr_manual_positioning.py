@@ -279,22 +279,33 @@ class TestComputePositions(unittest.TestCase):
         self.assertAlmostEqual(float(e[-1]), 4.0, places=6)
         self.assertAlmostEqual(float(d[-1]), 4.0, places=6)
 
-    def test_stagger_only_shifts_reversed_lines(self):
+    def test_stagger_translates_whole_reversed_line(self):
         cp = self._fn()
+        # forward line: stagger ignored entirely
         fwd = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
                  length_m=10.0, use_real_length=False, reversed_=False,
                  stagger_m=0.5)
-        # linea forward: stagger ignorato
         np.testing.assert_allclose(fwd[0], np.linspace(0.0, 10.0, 11))
+        # reversed line: the WHOLE line translates by +0.5 m along X
         rev = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
                  length_m=10.0, use_real_length=False, reversed_=True,
                  stagger_m=0.5)
         rev0 = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
                   length_m=10.0, use_real_length=False, reversed_=True,
                   stagger_m=0.0)
-        # +0.5 m di stagger -> tutte le ascisse traslate di +0.05 di frazione (clamp)
-        self.assertGreater(float(np.mean(rev[0])), float(np.mean(rev0[0])) - 1e-9)
-        self.assertFalse(np.allclose(rev[0], rev0[0]))
+        np.testing.assert_allclose(rev[0], rev0[0] + 0.5, atol=1e-9)
+        np.testing.assert_allclose(rev[1], rev0[1], atol=1e-9)  # Y unchanged
+
+    def test_stagger_axis_y(self):
+        cp = self._fn()
+        rev = cp(6, 0.0, 5.0, 0.0, 10.0, "Y", 2.0, grid_span_m=10.0,
+                 length_m=10.0, use_real_length=False, reversed_=True,
+                 stagger_m=-0.3)
+        rev0 = cp(6, 0.0, 5.0, 0.0, 10.0, "Y", 2.0, grid_span_m=10.0,
+                  length_m=10.0, use_real_length=False, reversed_=True,
+                  stagger_m=0.0)
+        np.testing.assert_allclose(rev[1], rev0[1] - 0.3, atol=1e-9)
+        np.testing.assert_allclose(rev[0], rev0[0], atol=1e-9)  # X unchanged
 
     def test_georef_rotation_90(self):
         cp = self._fn()

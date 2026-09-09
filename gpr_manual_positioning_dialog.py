@@ -80,8 +80,6 @@ def compute_positions(
     along = np.linspace(0.0, L, n_t, dtype=np.float64)
     if reversed_:
         along = reverse_along(along, L)
-        if abs(float(stagger_m)) > 1e-12:
-            along = stagger_shift(along, float(stagger_m))
     frac = np.clip(along / span, 0.0, 1.0)
 
     if str(axis).upper() == "X":
@@ -90,6 +88,14 @@ def compute_positions(
     else:
         lx = np.full(n_t, float(offset), dtype=np.float64)
         ly = float(y0) + frac * (float(y1) - float(y0))
+
+    # Staggering: trasla l'INTERA linea invertita lungo il suo asse di
+    # percorrenza (senza clamp) per allineare andata e ritorno.
+    if reversed_ and abs(float(stagger_m)) > 1e-12:
+        if str(axis).upper() == "X":
+            lx = stagger_shift(lx, float(stagger_m))
+        else:
+            ly = stagger_shift(ly, float(stagger_m))
 
     if geo_on:
         az = math.radians(float(az_deg))
@@ -645,19 +651,21 @@ class GprManualPositioningDialog(QDialog):
         use_real_len = bool(
             getattr(self, "_chk_real_length", None) and self._chk_real_length.isChecked()
         )
+        stagger_m = float(getattr(self, "_spin_stagger", None).value()) if getattr(self, "_spin_stagger", None) else 0.0
 
         # Disegna linee dei profili con frecce direzionali
         for idx, it in enumerate(self._profile_items):
             axis = it["axis"]
             offset = it["offset"]
             is_rev = it["reversed"]
+            sh = stagger_m if is_rev else 0.0
 
             if axis == "X":
                 span = (x1 - x0)
                 frac = 1.0
                 if use_real_len and abs(span) > 1e-9:
                     frac = min(1.0, float(it.get("length", abs(span))) / abs(span))
-                xa, xb = x0, x0 + frac * span
+                xa, xb = x0 + sh, x0 + frac * span + sh
                 p_start_loc = (xb, offset) if is_rev else (xa, offset)
                 p_end_loc = (xa, offset) if is_rev else (xb, offset)
             else:
@@ -665,7 +673,7 @@ class GprManualPositioningDialog(QDialog):
                 frac = 1.0
                 if use_real_len and abs(span) > 1e-9:
                     frac = min(1.0, float(it.get("length", abs(span))) / abs(span))
-                ya, yb = y0, y0 + frac * span
+                ya, yb = y0 + sh, y0 + frac * span + sh
                 p_start_loc = (offset, yb) if is_rev else (offset, ya)
                 p_end_loc = (offset, ya) if is_rev else (offset, yb)
 

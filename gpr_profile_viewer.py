@@ -3201,6 +3201,41 @@ class GprProfileViewer(QMainWindow):
                         dlg._chk_real_length.setChecked(bool(nav.get("use_real_length", False)))
                     if hasattr(dlg, "_spin_stagger"):
                         dlg._spin_stagger.setValue(float(nav.get("stagger_m", 0.0)))
+
+                # Ripristina lo stato per-profilo (verso zig-zag, asse, offset,
+                # nome, lunghezza) salvato in precedenza — altrimenti si perde
+                # a ogni riapertura del dialog.
+                saved_profs = saved_params.get("profiles") or []
+                items = getattr(dlg, "_profile_items", None)
+                if saved_profs and isinstance(items, list) and items:
+                    by_path = {}
+                    for sp in saved_profs:
+                        key = os.path.basename(str(sp.get("path", "") or ""))
+                        if key:
+                            by_path.setdefault(key, sp)
+                    for i, it in enumerate(items):
+                        key = os.path.basename(str(it.get("prof") and getattr(it["prof"], "path", "") or ""))
+                        sp = by_path.get(key) or (saved_profs[i] if i < len(saved_profs) else None)
+                        if not isinstance(sp, dict):
+                            continue
+                        if "reversed" in sp:
+                            it["reversed"] = bool(sp["reversed"])
+                        if sp.get("axis") in ("X", "Y"):
+                            it["axis"] = sp["axis"]
+                        if sp.get("offset") is not None:
+                            it["offset"] = float(sp["offset"])
+                        if sp.get("name"):
+                            it["name"] = str(sp["name"])
+                        try:
+                            if float(sp.get("length", 0.0)) > 0.0:
+                                it["length"] = float(sp["length"])
+                        except (TypeError, ValueError):
+                            pass
+                    try:
+                        dlg._update_table_from_items()
+                        dlg._draw_preview()
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
