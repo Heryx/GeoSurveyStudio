@@ -31,7 +31,7 @@ from qgis.PyQt.QtWidgets import (
     QInputDialog,
     QFileDialog, QMessageBox, QSizePolicy,
     QGroupBox, QFormLayout, QPushButton, QDialogButtonBox, QScrollArea, QDockWidget, QLineEdit,
-    QProgressBar,
+    QProgressBar, QListWidget, QListWidgetItem,
 )
 from qgis.core import (
     Qgis,
@@ -2779,10 +2779,21 @@ class GprProfileViewer(QMainWindow):
         timeslice_scroll.setWidget(slice_content)
         timeslice_scroll.setMinimumWidth(270)
 
-        # Unified right panel: Process + Slicing tabs in a single dock.
+        # Unified right panel: Process + Slicing + Variants tabs in a single dock.
         tabs = QTabWidget()
         tabs.addTab(processing_scroll, "Elaborazione")
         tabs.addTab(timeslice_scroll, "Slicing")
+        try:
+            variants_scroll = QScrollArea()
+            variants_scroll.setWidgetResizable(True)
+            variants_scroll.setWidget(self._build_variants_tab())
+            variants_scroll.setMinimumWidth(250)
+            tabs.addTab(variants_scroll, "Varianti")
+            tabs.currentChanged.connect(
+                lambda i: self._refresh_variants_list() if tabs.tabText(i) == "Varianti" else None
+            )
+        except Exception:
+            pass
         tabs.setCurrentIndex(0)
         self._right_tabs = tabs
         try:
@@ -7342,9 +7353,133 @@ class GprProfileViewer(QMainWindow):
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Pannello "Varianti" — elenco delle varianti processate su disco
+    # ------------------------------------------------------------------
+    def _build_variants_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(6)
+
+        lay.addWidget(QLabel(
+            "Varianti di radargrammi processati salvate in\n"
+            "GPR_Processing/processed/. Ognuna e' un set .npz gia' filtrato."
+        ))
+        self._lst_variants = QListWidget()
+        self._lst_variants.setAlternatingRowColors(True)
+        self._lst_variants.itemSelectionChanged.connect(self._on_variant_selection_changed)
+        self._lst_variants.itemDoubleClicked.connect(
+            lambda _it: self._slice_selected_variant()
+        )
+        lay.addWidget(self._lst_variants, 1)
+
+        row = QHBoxLayout()
+        self._btn_variants_refresh = QPushButton("Aggiorna")
+        self._btn_variants_refresh.clicked.connect(self._refresh_variants_list)
+        self._btn_variants_slice = QPushButton("Genera time-slice")
+        self._btn_variants_slice.setEnabled(False)
+        self._btn_variants_slice.setToolTip(
+            "Genera le time-slice dai .npz della variante selezionata,\n"
+            "senza riapplicare la pipeline (i dati sono gia' filtrati)."
+        )
+        self._btn_variants_slice.clicked.connect(self._slice_selected_variant)
+        self._btn_variants_open = QPushButton("Apri cartella")
+        self._btn_variants_open.setEnabled(False)
+        self._btn_variants_open.clicked.connect(self._open_selected_variant_folder)
+        row.addWidget(self._btn_variants_refresh)
+        row.addWidget(self._btn_variants_slice)
+        row.addWidget(self._btn_variants_open)
+        lay.addLayout(row)
+
+        self._lbl_variant_detail = QLabel("—")
+        self._lbl_variant_detail.setWordWrap(True)
+        self._lbl_variant_detail.setStyleSheet("color: palette(mid);")
+        lay.addWidget(self._lbl_variant_detail)
+        return w
+
+    def _refresh_variants_list(self):
+        lst = getattr(self, "_lst_variants", None)
+        if not self._is_qt_alive(lst):
+            return
+        lst.clear()
+        self._lbl_variant_detail.setText("—")
+        paths = self._gpr_processing_paths()
+        processed = paths.get("processed", "") if paths else ""
+        if not processed or not os.path.isdir(processed):
+            it = QListWidgetItem("(nessun progetto GPR attivo)")
+            it.setFlags(Qt.NoItemFlags)
+            lst.addItem(it)
+            return
+        try:
+            dirs = list_variants(processed)
+        except Exception:
+            dirs = []
+        if not dirs:
+            it = QListWidgetItem("(nessuna variante salvata)")
+            it.setFlags(Qt.NoItemFlags)
+            lst.addItem(it)
+            return
+        for d in dirs:
+            man = read_variant_manifest(d) or {}
+            name = str(man.get("name") or os.path.basename(os.path.normpath(d)))
+            n_prof = int(man.get("n_profiles") or len(man.get("files") or []))
+            chain = [s for s in (man.get("chain_order") or []) if s]
+            label = f"{name}   ({n_prof} profili)"
+            it = QListWidgetItem(label)
+            it.setData(Qt.UserRole, d)
+            it.setData(Qt.UserRole + 1, {"chain": chain, "created": man.get("created", "")})
+            it.setToolTip(
+                f"{d}\ncatena: {', '.join(chain) if chain else '(non registrata)'}"
+            )
+            lst.addItem(it)
+
+    def _selected_variant_dir(self) -> str:
+        lst = getattr(self, "_lst_variants", None)
+        if not self._is_qt_alive(lst):
+            return ""
+        it = lst.currentItem()
+        if it is None:
+            return ""
+        d = it.data(Qt.UserRole)
+        return str(d) if d else ""
+
+    def _on_variant_selection_changed(self):
+        d = self._selected_variant_dir()
+        has = bool(d)
+        for b in ("_btn_variants_slice", "_btn_variants_open"):
+            w = getattr(self, b, None)
+            if self._is_qt_alive(w):
+                w.setEnabled(has)
+        it = self._lst_variants.currentItem() if has else None
+        meta = it.data(Qt.UserRole + 1) if it is not None else None
+        if isinstance(meta, dict):
+            chain = ", ".join(meta.get("chain") or []) or "(catena non registrata)"
+            self._lbl_variant_detail.setText(f"Catena: {chain}\n{d}")
+        else:
+            self._lbl_variant_detail.setText("—")
+
+    def _slice_selected_variant(self):
+        d = self._selected_variant_dir()
+        if d:
+            self._slice_from_variant_folder(d)
+
+    def _open_selected_variant_folder(self):
+        d = self._selected_variant_dir()
+        if not d:
+            return
+        try:
+            from qgis.PyQt.QtGui import QDesktopServices
+            from qgis.PyQt.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl.fromLocalFile(d))
+        except Exception:
+            QMessageBox.information(self, "Varianti", d)
+
     def _build_slices_from_variant(self):
         """Genera time-slice a partire da una variante di radargrammi gia'
-        processati (.npz), senza riapplicare la pipeline."""
+        processati (.npz), senza riapplicare la pipeline. Sceglie la cartella
+        con un dialog; per la selezione dal pannello Varianti vedi
+        `_slice_from_variant_folder`."""
         paths = self._gpr_processing_paths()
         start = paths.get("processed", "") if paths else ""
         if not start or not os.path.isdir(start):
@@ -7353,6 +7488,15 @@ class GprProfileViewer(QMainWindow):
             self, "Seleziona cartella variante processata (.npz)", start
         )
         if not folder:
+            return
+        self._slice_from_variant_folder(folder)
+
+    def _slice_from_variant_folder(self, folder: str):
+        """Carica i .npz di una cartella-variante e lancia la generazione slice."""
+        paths = self._gpr_processing_paths()
+        folder = os.path.normpath(str(folder or ""))
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.warning(self, "Time-slice da variante", "Cartella non valida.")
             return
         npzs = sorted(glob.glob(os.path.join(folder, "*.npz")))
         if not npzs:
