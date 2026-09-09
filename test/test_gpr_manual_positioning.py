@@ -245,5 +245,66 @@ class TestGeorefRotation(unittest.TestCase):
         self.assertAlmostEqual(float(n[-1]), -10.0, places=4)
 
 
+class TestComputePositions(unittest.TestCase):
+    """Test della funzione reale `compute_positions` (navigazione: lunghezza
+    reale + stagger)."""
+
+    def _fn(self):
+        from gpr_manual_positioning_dialog import compute_positions
+        return compute_positions
+
+    def test_uniform_matches_grid_span(self):
+        cp = self._fn()
+        e, n, d = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 2.0,
+                     grid_span_m=10.0, length_m=10.0, use_real_length=False,
+                     reversed_=False)
+        np.testing.assert_allclose(e, np.linspace(0.0, 10.0, 11))
+        np.testing.assert_allclose(n, 2.0)
+        self.assertAlmostEqual(float(d[-1]), 10.0, places=6)
+
+    def test_reversed_flips(self):
+        cp = self._fn()
+        e, _, _ = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0,
+                     grid_span_m=10.0, length_m=10.0, use_real_length=False,
+                     reversed_=True)
+        np.testing.assert_allclose(e, np.linspace(10.0, 0.0, 11))
+
+    def test_real_length_occupies_partial_segment(self):
+        cp = self._fn()
+        # profilo lungo 4 m su una linea (span griglia) di 10 m -> occupa 0..4 m
+        e, n, d = cp(9, 0.0, 10.0, 0.0, 5.0, "X", 1.0,
+                     grid_span_m=10.0, length_m=4.0, use_real_length=True,
+                     reversed_=False)
+        self.assertAlmostEqual(float(e[0]), 0.0, places=6)
+        self.assertAlmostEqual(float(e[-1]), 4.0, places=6)
+        self.assertAlmostEqual(float(d[-1]), 4.0, places=6)
+
+    def test_stagger_only_shifts_reversed_lines(self):
+        cp = self._fn()
+        fwd = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                 length_m=10.0, use_real_length=False, reversed_=False,
+                 stagger_m=0.5)
+        # linea forward: stagger ignorato
+        np.testing.assert_allclose(fwd[0], np.linspace(0.0, 10.0, 11))
+        rev = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                 length_m=10.0, use_real_length=False, reversed_=True,
+                 stagger_m=0.5)
+        rev0 = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                  length_m=10.0, use_real_length=False, reversed_=True,
+                  stagger_m=0.0)
+        # +0.5 m di stagger -> tutte le ascisse traslate di +0.05 di frazione (clamp)
+        self.assertGreater(float(np.mean(rev[0])), float(np.mean(rev0[0])) - 1e-9)
+        self.assertFalse(np.allclose(rev[0], rev0[0]))
+
+    def test_georef_rotation_90(self):
+        cp = self._fn()
+        e, n, _ = cp(3, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                     length_m=10.0, use_real_length=False, reversed_=False,
+                     geo_on=True, e0=0.0, n0=0.0, az_deg=90.0)
+        np.testing.assert_allclose(e, 0.0, atol=1e-6)
+        self.assertAlmostEqual(float(n[0]), 0.0, places=4)
+        self.assertAlmostEqual(float(n[-1]), -10.0, places=4)
+
+
 if __name__ == "__main__":
     unittest.main()

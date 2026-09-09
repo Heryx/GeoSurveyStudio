@@ -39,6 +39,73 @@ try:
 except ImportError:
     HAS_MPL = False
 
+try:  # navigazione: primitive marker / dead-reckoning / stagger
+    from .navigation import reverse_along, stagger_shift
+except ImportError:  # pragma: no cover
+    from navigation import reverse_along, stagger_shift
+
+
+def compute_positions(
+    n_traces: int,
+    x0: float, x1: float, y0: float, y1: float,
+    axis: str,
+    offset: float,
+    grid_span_m: float,
+    length_m: float,
+    use_real_length: bool,
+    reversed_: bool,
+    stagger_m: float = 0.0,
+    geo_on: bool = False,
+    e0: float = 0.0, n0: float = 0.0, az_deg: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Calcola E/N/distanza cumulativa per gli scan di un profilo.
+
+    - ``use_real_length`` : se True il profilo occupa solo ``length_m`` a partire
+      dall'inizio della linea (linee ANG / parziali), altrimenti l'intero span
+      della griglia lungo l'asse.
+    - ``reversed_``        : linea percorsa in direzione opposta (zig-zag).
+    - ``stagger_m``        : traslazione applicata SOLO alle linee invertite,
+      per correggere lo staggering fra andata e ritorno.
+
+    Ritorna ``(east, north, dist)`` (array lunghi ``n_traces``).
+    """
+    n_t = int(n_traces)
+    if n_t <= 0:
+        z = np.zeros(0, dtype=np.float64)
+        return z, z.copy(), z.copy()
+
+    span = float(grid_span_m) if float(grid_span_m) > 1e-9 else 1.0
+    L = float(length_m) if (use_real_length and float(length_m) > 1e-9) else span
+    # ascissa metrica lungo la linea, 0..L
+    along = np.linspace(0.0, L, n_t, dtype=np.float64)
+    if reversed_:
+        along = reverse_along(along, L)
+        if abs(float(stagger_m)) > 1e-12:
+            along = stagger_shift(along, float(stagger_m))
+    frac = np.clip(along / span, 0.0, 1.0)
+
+    if str(axis).upper() == "X":
+        lx = float(x0) + frac * (float(x1) - float(x0))
+        ly = np.full(n_t, float(offset), dtype=np.float64)
+    else:
+        lx = np.full(n_t, float(offset), dtype=np.float64)
+        ly = float(y0) + frac * (float(y1) - float(y0))
+
+    if geo_on:
+        az = math.radians(float(az_deg))
+        ca, sa = math.cos(az), math.sin(az)
+        de = lx * ca + ly * sa
+        dn = -lx * sa + ly * ca
+        east = float(e0) + de
+        north = float(n0) + dn
+    else:
+        east = lx
+        north = ly
+
+    dseg = np.sqrt(np.diff(lx) ** 2 + np.diff(ly) ** 2)
+    dist = np.concatenate([[0.0], np.cumsum(dseg)]) if n_t > 1 else np.zeros(1)
+    return east, north, dist
+
 
 def check_profiles_have_gps(profiles: list) -> bool:
     """Verifica se almeno un canale dei profili caricati possiede coordinate GPS reali plausibili."""
@@ -216,6 +283,33 @@ class GprManualPositioningDialog(QDialog):
 
         grp_geo.toggled.connect(self._draw_preview)
         left_layout.addWidget(grp_geo)
+
+        # Group Box Navigazione / Marker
+        grp_nav = QGroupBox("Navigazione")
+        nav_form = QFormLayout(grp_nav)
+        self._chk_real_length = QCheckBox("Usa la lunghezza reale del profilo (non lo span griglia)")
+        self._chk_real_length.setChecked(False)
+        self._chk_real_length.setToolTip(
+            "Se attivo, ogni profilo occupa solo la sua 'Lunghezza (m)' a partire\n"
+            "dall'inizio della linea (linee ANG / parziali). La colonna Lunghezza\n"
+            "in tabella diventa modificabile."
+        )
+        self._chk_real_length.toggled.connect(self._on_nav_changed)
+        nav_form.addRow(self._chk_real_length)
+
+        self._spin_stagger = QDoubleSpinBox()
+        self._spin_stagger.setRange(-50.0, 50.0)
+        self._spin_stagger.setDecimals(3)
+        self._spin_stagger.setSingleStep(0.05)
+        self._spin_stagger.setValue(0.0)
+        self._spin_stagger.setSuffix(" m")
+        self._spin_stagger.setToolTip(
+            "Correzione staggering: traslazione applicata SOLO alle linee\n"
+            "invertite (zig-zag), per allineare andata e ritorno. 0 = nessuna."
+        )
+        self._spin_stagger.valueChanged.connect(self._on_nav_changed)
+        nav_form.addRow("Stagger (linee invertite):", self._spin_stagger)
+        left_layout.addWidget(grp_nav)
 
         # Tabella Profili e Strumenti Rapidi
         grp_table = QGroupBox("Elenco Profili e Sequenza")
@@ -458,21 +552,42 @@ class GprManualPositioningDialog(QDialog):
                 item_tr.setTextAlignment(Qt.AlignCenter)
                 self._table.setItem(r, 5, item_tr)
 
-                # Lunghezza
+                # Lunghezza (modificabile solo se "usa lunghezza reale")
                 item_len = QTableWidgetItem(f"{it['length']:.2f}")
-                item_len.setFlags(item_len.flags() & ~Qt.ItemIsEditable)
+                editable = bool(
+                    getattr(self, "_chk_real_length", None)
+                    and self._chk_real_length.isChecked()
+                )
+                if editable:
+                    item_len.setFlags(item_len.flags() | Qt.ItemIsEditable)
+                else:
+                    item_len.setFlags(item_len.flags() & ~Qt.ItemIsEditable)
                 item_len.setTextAlignment(Qt.AlignCenter)
                 self._table.setItem(r, 6, item_len)
         finally:
             self._syncing_table = False
+
+    def _on_nav_changed(self, *_a):
+        self._update_table_from_items()
+        self._draw_preview()
 
     def _on_table_item_changed(self, item):
         if self._syncing_table or not item:
             return
         r = item.row()
         c = item.column()
-        if c == 1 and 0 <= r < len(self._profile_items):
+        if not (0 <= r < len(self._profile_items)):
+            return
+        if c == 1:
             self._profile_items[r]["name"] = str(item.text()).strip()
+            self._draw_preview()
+        elif c == 6:
+            try:
+                val = float(str(item.text()).replace(",", "."))
+                if val > 0:
+                    self._profile_items[r]["length"] = val
+            except ValueError:
+                pass
             self._draw_preview()
 
     def _on_axis_changed(self, row: int, axis_text: str):
@@ -527,6 +642,10 @@ class GprManualPositioningDialog(QDialog):
         by = [p[1] for p in corners_disp]
         self._ax.plot(bx, by, "k--", lw=1.2, alpha=0.6, label="Limite griglia")
 
+        use_real_len = bool(
+            getattr(self, "_chk_real_length", None) and self._chk_real_length.isChecked()
+        )
+
         # Disegna linee dei profili con frecce direzionali
         for idx, it in enumerate(self._profile_items):
             axis = it["axis"]
@@ -534,11 +653,21 @@ class GprManualPositioningDialog(QDialog):
             is_rev = it["reversed"]
 
             if axis == "X":
-                p_start_loc = (x1, offset) if is_rev else (x0, offset)
-                p_end_loc = (x0, offset) if is_rev else (x1, offset)
+                span = (x1 - x0)
+                frac = 1.0
+                if use_real_len and abs(span) > 1e-9:
+                    frac = min(1.0, float(it.get("length", abs(span))) / abs(span))
+                xa, xb = x0, x0 + frac * span
+                p_start_loc = (xb, offset) if is_rev else (xa, offset)
+                p_end_loc = (xa, offset) if is_rev else (xb, offset)
             else:
-                p_start_loc = (offset, y1) if is_rev else (offset, y0)
-                p_end_loc = (offset, y0) if is_rev else (offset, y1)
+                span = (y1 - y0)
+                frac = 1.0
+                if use_real_len and abs(span) > 1e-9:
+                    frac = min(1.0, float(it.get("length", abs(span))) / abs(span))
+                ya, yb = y0, y0 + frac * span
+                p_start_loc = (offset, yb) if is_rev else (offset, ya)
+                p_end_loc = (offset, ya) if is_rev else (offset, yb)
 
             ps_disp = _to_display_xy(*p_start_loc)
             pe_disp = _to_display_xy(*p_end_loc)
@@ -597,8 +726,11 @@ class GprManualPositioningDialog(QDialog):
         e0 = float(self._spin_e0.value()) if geo_on else 0.0
         n0 = float(self._spin_n0.value()) if geo_on else 0.0
         az_deg = float(self._spin_azimuth.value()) if geo_on else 0.0
-        az_rad = math.radians(az_deg)
-        cos_a, sin_a = math.cos(az_rad), math.sin(az_rad)
+
+        use_real_length = bool(
+            getattr(self, "_chk_real_length", None) and self._chk_real_length.isChecked()
+        )
+        stagger_m = float(getattr(self, "_spin_stagger", None).value()) if getattr(self, "_spin_stagger", None) else 0.0
 
         configured_records = []
 
@@ -617,33 +749,16 @@ class GprManualPositioningDialog(QDialog):
             n_t = it["n_traces"]
 
             if n_t > 0:
-                t_ratio = np.linspace(0.0, 1.0, n_t, dtype=np.float64)
-                if is_rev:
-                    t_ratio = t_ratio[::-1]
-
-                if axis == "X":
-                    lx = x0 + t_ratio * (x1 - x0)
-                    ly = np.full(n_t, offset, dtype=np.float64)
-                else:
-                    lx = np.full(n_t, offset, dtype=np.float64)
-                    ly = y0 + t_ratio * (y1 - y0)
-
-                if geo_on:
-                    de = lx * cos_a + ly * sin_a
-                    dn = -lx * sin_a + ly * cos_a
-                    final_e = e0 + de
-                    final_n = n0 + dn
-                else:
-                    final_e = lx
-                    final_n = ly
-
-                # Distanza cumulativa calcolata dalla linea metrica
-                dx = np.diff(lx)
-                dy = np.diff(ly)
-                dist_seg = np.sqrt(dx ** 2 + dy ** 2)
-                final_dist = np.concatenate([[0.0], np.cumsum(dist_seg)])
-
-                # Assegna a tutti i canali del profilo
+                grid_span = (x1 - x0) if axis == "X" else (y1 - y0)
+                final_e, final_n, final_dist = compute_positions(
+                    n_t, x0, x1, y0, y1, axis, offset,
+                    grid_span_m=grid_span,
+                    length_m=float(it.get("length", grid_span) or grid_span),
+                    use_real_length=use_real_length,
+                    reversed_=is_rev,
+                    stagger_m=stagger_m,
+                    geo_on=geo_on, e0=e0, n0=n0, az_deg=az_deg,
+                )
                 for ch in channels:
                     ch.easting = final_e.copy()
                     ch.northing = final_n.copy()
@@ -657,6 +772,7 @@ class GprManualPositioningDialog(QDialog):
                 "offset": offset,
                 "reversed": is_rev,
                 "n_traces": n_t,
+                "length": float(it.get("length", 0.0) or 0.0),
             })
 
         result_payload = {
@@ -666,6 +782,10 @@ class GprManualPositioningDialog(QDialog):
                 "origin_e": e0,
                 "origin_n": n0,
                 "azimuth_deg": az_deg,
+            },
+            "navigation": {
+                "use_real_length": use_real_length,
+                "stagger_m": stagger_m,
             },
             "profiles": configured_records,
         }

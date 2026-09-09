@@ -3195,6 +3195,12 @@ class GprProfileViewer(QMainWindow):
                     dlg._spin_e0.setValue(float(gr.get("origin_e", 0.0)))
                     dlg._spin_n0.setValue(float(gr.get("origin_n", 0.0)))
                     dlg._spin_azimuth.setValue(float(gr.get("azimuth_deg", 0.0)))
+                nav = saved_params.get("navigation", {})
+                if isinstance(nav, dict) and nav:
+                    if hasattr(dlg, "_chk_real_length"):
+                        dlg._chk_real_length.setChecked(bool(nav.get("use_real_length", False)))
+                    if hasattr(dlg, "_spin_stagger"):
+                        dlg._spin_stagger.setValue(float(nav.get("stagger_m", 0.0)))
             except Exception:
                 pass
 
