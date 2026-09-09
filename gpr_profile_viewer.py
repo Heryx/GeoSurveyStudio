@@ -72,6 +72,7 @@ from .gpr_processing import (
     _normalize_display_vmax,
     manual_gain,
     auto_tune_params,
+    multifreq_blend,
     log_exception,
     LOG_FILE_PATH,
 )
@@ -1240,6 +1241,15 @@ class GprProfileViewer(QMainWindow):
         act_slice_variant = QAction("Time-slice da variante processata...", self)
         act_slice_variant.triggered.connect(self._build_slices_from_variant)
         m_proc.addAction(act_slice_variant)
+
+        act_blend = QAction("Combina canali multi-frequenza → variante...", self)
+        act_blend.setToolTip(
+            "Fonde i canali di un'antenna dual/triple frequenza in un unico\n"
+            "radargramma (somma pesata, con allineamento tempo-zero) e lo salva\n"
+            "come variante processata."
+        )
+        act_blend.triggered.connect(self._blend_multifreq_to_variant)
+        m_proc.addAction(act_blend)
         m_proc.addSeparator()
 
         act_save_preset = QAction("Salva preset gain/hyperbola...", self)
@@ -7393,6 +7403,100 @@ class GprProfileViewer(QMainWindow):
             )
         except Exception:
             pass
+
+    def _blend_multifreq_to_variant(self):
+        """Fonde i canali multi-frequenza di ogni profilo (somma pesata con
+        allineamento t0) e salva il risultato come variante a 1 canale."""
+        if not self._profiles:
+            QMessageBox.information(self, "Combina multi-frequenza",
+                                    "Importa almeno un profilo prima.")
+            return
+        n_ch = int(getattr(self._profiles[self._prof_idx], "n_channels", 0) or 0)
+        if n_ch < 2:
+            QMessageBox.information(
+                self, "Combina multi-frequenza",
+                "Serve un profilo con almeno 2 canali (antenna dual/triple frequenza).",
+            )
+            return
+        paths = self._ensure_gpr_processing_layout()
+        if not paths:
+            QMessageBox.warning(self, "Combina multi-frequenza",
+                                "Nessun workspace disponibile.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Combina canali multi-frequenza")
+        fl = QFormLayout(dlg)
+        fl.addRow(QLabel(
+            f"Il profilo corrente ha {n_ch} canali.\n"
+            "Peso e shift tempo-zero (campioni) per canale:"
+        ))
+        w_spins, s_spins = [], []
+        for ci in range(n_ch):
+            ws = QDoubleSpinBox(); ws.setRange(0.0, 10.0); ws.setSingleStep(0.05)
+            ws.setDecimals(3); ws.setValue(round(1.0 / n_ch, 3))
+            ss = QSpinBox(); ss.setRange(-4096, 4096); ss.setValue(0)
+            row = QWidget(); rl = QHBoxLayout(row); rl.setContentsMargins(0, 0, 0, 0)
+            rl.addWidget(QLabel("peso")); rl.addWidget(ws)
+            rl.addWidget(QLabel("shift t0")); rl.addWidget(ss)
+            fl.addRow(f"Canale {ci}:", row)
+            w_spins.append(ws); s_spins.append(ss)
+        cb_target = QComboBox()
+        for ci in range(n_ch):
+            cb_target.addItem(f"Canale {ci}", ci)
+        cb_target.setToolTip("Il canale il cui asse tempi definisce la griglia di uscita.")
+        fl.addRow("Canale target:", cb_target)
+        le_name = QLineEdit("blend")
+        fl.addRow("Nome variante:", le_name)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        fl.addRow(bb)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        weights = [float(w.value()) for w in w_spins]
+        shifts = [int(s.value()) for s in s_spins]
+        target = int(cb_target.currentData() or 0)
+        variant = "".join(
+            c if c.isalnum() or c in "_-" else "_" for c in str(le_name.text()).strip()
+        ).strip("_") or "blend"
+        variant_dir = os.path.join(paths["processed"], variant)
+        os.makedirs(variant_dir, exist_ok=True)
+
+        meta = {"blend": {"weights": weights, "t0_shift_samples": shifts, "target": target}}
+        files, errors = [], []
+        for prof in self._profiles:
+            try:
+                nc = int(getattr(prof, "n_channels", 0) or 0)
+                if nc < 2:
+                    continue
+                arrs = [np.asarray(prof.channel(ci).data, dtype=np.float32) for ci in range(nc)]
+                dts = [float(getattr(prof, "dt_ns", 0.1) or 0.1)] * nc
+                blend = multifreq_blend(
+                    arrs, weights[:nc], dts, shifts[:nc], target=min(target, nc - 1)
+                )
+                fp = save_processed_profile_npz(variant_dir, prof, [blend], meta, [])
+                files.append(fp)
+            except Exception as e:
+                errors.append(f"{os.path.basename(getattr(prof, 'path', '?'))}: {e}")
+
+        if files:
+            try:
+                write_variant_manifest(variant_dir, variant, meta, [], files)
+            except Exception:
+                pass
+            QMessageBox.information(
+                self, "Combina multi-frequenza",
+                f"Variante '{variant}' salvata: {len(files)} profili.\n"
+                "Aprila dalla scheda 'Varianti' per generare le time-slice.",
+            )
+            try:
+                self._refresh_variants_list()
+            except Exception:
+                pass
+        else:
+            QMessageBox.warning(self, "Combina multi-frequenza",
+                                "Nessun profilo combinato.\n" + "\n".join(errors[:5]))
 
     # ------------------------------------------------------------------
     # Pannello "Varianti" — elenco delle varianti processate su disco
