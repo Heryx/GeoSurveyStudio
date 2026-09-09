@@ -217,9 +217,48 @@ class ProjectManagerTimesliceImportMixin:
             if fresh.get("is_valid_raster"):
                 rec["meta"] = fresh
 
+    def _fill_missing_crs_from_sliceset(self, records):
+        """When a record's raster carries no CRS but its folder has a
+        ``sliceset.json`` with a valid ``crs_epsg``, adopt that EPSG so the
+        import does not stop to ask for a CRS. Returns the count filled."""
+        try:
+            from .slice_manifest import has_sliceset, read_sliceset
+        except Exception:
+            return 0
+        cache = {}
+        filled = 0
+        for rec in records or []:
+            meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else None
+            if not meta or (meta.get("crs") or "").strip():
+                continue
+            src = rec.get("source_path") or ""
+            d = os.path.dirname(os.path.abspath(src)) if src else ""
+            if not d:
+                continue
+            if d not in cache:
+                epsg = None
+                try:
+                    if has_sliceset(d):
+                        data = read_sliceset(d)
+                        code = data.get("crs_epsg")
+                        epsg = int(code) if code else None
+                except Exception:
+                    epsg = None
+                cache[d] = epsg
+            epsg = cache[d]
+            if not epsg:
+                continue
+            meta["crs"] = "EPSG:%d" % epsg
+            meta["crs_assumed"] = True
+            meta["crs_from_sliceset"] = True
+            filled += 1
+        return filled
+
     def _validate_timeslice_records_before_import(self, records, scope_label="selected images"):
         if not records:
             return records, 0, False
+
+        self._fill_missing_crs_from_sliceset(records)
 
         while True:
             issue_rows = []
@@ -269,6 +308,7 @@ class ProjectManagerTimesliceImportMixin:
                 # Let the user pick the import CRS now, then re-validate.
                 self._choose_default_import_crs()
                 self._reinspect_timeslice_records(records)
+                self._fill_missing_crs_from_sliceset(records)
                 continue
             break
 

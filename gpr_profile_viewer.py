@@ -494,6 +494,7 @@ class GprProfileViewer(QMainWindow):
         self._slice_catalog: list[dict] = []
         self._slice_catalog_source_dir: str = ""
         self._slice_catalog_dz: float = 0.0
+        self._slice_catalog_from_manifest: bool = False
         self._updating_slice_nav: bool = False
         self._chk_slice_open_3d_on_complete = None
         self._show_wiggle: bool = True
@@ -7055,6 +7056,21 @@ class GprProfileViewer(QMainWindow):
         base = str(outdir or "").strip()
         if not base or not os.path.isdir(base):
             return []
+
+        # Manifesto autorevole: se c'e' un sliceset.json valido leggi da li'
+        # profondita'/ordine/nomi invece di dedurli dai nomi file.
+        try:
+            from . import slice_manifest as _sm
+            if _sm.has_sliceset(base):
+                rows = _sm.slice_catalog_from_sliceset(base)
+                if rows:
+                    rows.sort(key=lambda it: (float(it.get("z_center", 0.0)),
+                                              int(it.get("index", 0))))
+                    self._slice_catalog_from_manifest = True
+                    return rows
+        except Exception:
+            pass
+        self._slice_catalog_from_manifest = False
 
         paths = sorted(glob.glob(os.path.join(base, "slice_*.tif")))
         if not paths:

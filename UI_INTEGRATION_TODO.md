@@ -3,7 +3,7 @@
 **Aggiornato:** 2026-09-09
 **Branch:** `feature/interpolation-improvements-followup` (tutto committato e pushato
 su `geosurveystudio`)
-**Test:** `python -m unittest discover -s test` → 223, i 3 errori
+**Test:** `python -m unittest discover -s test` → 225, i 3 errori
 `test_qgis_environment / test_resources / test_translations` sono **preesistenti**
 (servono un runtime QGIS), tutto il resto verde.
 
@@ -13,7 +13,7 @@ memoria: `project_processing_rewrite.md`, `project_timeslice_redesign.md`.
 
 ---
 
-## Fatto — core headless (Fasi 1‑6 + §5.4) e passi UI 1‑6
+## Fatto — core headless (Fasi 1‑6 + §5.4) e passi UI 1‑7
 
 **Core (puro numpy, testato headless):**
 - Fase 1: `dcshift`, `boxcar_smooth`, `notch_filter`, `spectral_whitening`,
@@ -43,6 +43,11 @@ generati da `_PHASE1_SPECS` / `_build_phase1_step_controls` in
 6. **Unisci / Ruota‑trasla set di time‑slice** — `grid_geometry` in UI
    (`append_grids` + `edge_match` per l'unione multi‑griglia, `rotate_translate`
    per la georeferenziazione); manifesto unito/aggiornato — `b064ed7`
+7. **SliceSet dal manifesto** — `slice_manifest.slice_catalog_from_sliceset`;
+   il viewer legge profondità/ordine/nomi da `sliceset.json` quando presente
+   (fallback al parsing nomi); group‑manager blocca l'editing profondità sui
+   set con manifesto; l'import salta il prompt CRS se il manifesto porta un
+   `crs_epsg` valido — vedi sotto per il punto 3D rimandato
 
 3b (dialog CMP semblance) **saltato** su richiesta utente (acquisizioni
 WARR/CMP di nicchia per l'archeologia). Le funzioni `cmp_semblance` /
@@ -52,24 +57,14 @@ WARR/CMP di nicchia per l'archeologia). Le funzioni `cmp_semblance` /
 
 ## Da fare — in ordine consigliato
 
-### Passo 7 — SliceSet dal manifesto  ·  valore alto (è il cuore del "casino")  ·  rischio medio
-Far leggere profondità/ordine/CRS da `sliceset.json` invece del parsing dei nomi
-file. Dettagli in `TIMESLICE_REDESIGN_WORKPLAN.md §3bis` (Fase E).
-- `slice_manifest.py`: aggiungere `slice_catalog_from_sliceset(dir)` → righe
-  compatibili con `_slice_catalog` del viewer (path assoluto `dir/<grid>`,
-  `z_from/z_to/z_center` dal manifesto, `stats`).
-- `gpr_profile_viewer._scan_slice_catalog` / `_refresh_slice_catalog`
-  (~riga 7027‑7093): se `slice_manifest.has_sliceset(dir)` usare il nuovo
-  helper; altrimenti fallback attuale (scan + `TimesliceDepthParser`).
-- `timeslice_group_manager_dialog.py` (1181 righe): se il set ha `sliceset.json`,
-  disabilitare `_auto_depth_sequence_selected` e `_set_depth_range_selected`
-  (profondità già autorevole) e mostrarlo con un'etichetta.
-- `build_3d_volume` / `gpr_volume_3d`: prendere l'asse z dal manifesto invece di
-  dedurre `dz` dai nomi.
-- `project_manager_timeslice_import_mixin._validate_timeslice_records_before_import`:
-  saltare il dialog CRS quando `sliceset.json` porta un `crs_epsg` valido.
-- **Verifica QGIS:** generare un set (scrive `sliceset.json`), rinominare a caso
-  i file → il catalogo/gruppi/3D mostrano comunque profondità corrette.
+### Passo 7bis (rimandato) — asse z 3D dal manifesto
+`build_3d_volume` / `volume_axes` (`gpr_volume_3d.py`) **già** accettano
+`z_from`/`z_to`/`z_lev` per griglia e `z_levels` nel meta; il gap teorico
+("dedurre `dz` dai nomi") non ha oggi un chiamante concreto: il volume 3D è
+sempre ricalcolato dai profili via `compute_ogpr_slice_grids`, non da una
+cartella di GeoTIFF esistente. Da fare **solo** se in futuro si aggiunge un
+"costruisci volume da set di time‑slice su disco": allora leggere l'asse z da
+`slice_manifest.read_sliceset(dir)["slices"]` e passarlo come `z_levels`.
 
 ### Passo 8 — Quote per traccia nel Posizionamento Manuale  ·  valore medio  ·  rischio basso
 Serve per `kirchhoff_migration_topo` e la correzione statica su survey **senza**

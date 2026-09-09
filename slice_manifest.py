@@ -131,6 +131,61 @@ def sliceset_path(output_dir: str) -> str:
     return os.path.join(output_dir, MANIFEST_FILENAME)
 
 
+def slice_catalog_from_sliceset(directory: str) -> list[dict]:
+    """Build a viewer ``_slice_catalog`` from the authoritative ``sliceset.json``.
+
+    Returns rows shaped like ``GprProfileViewer._scan_slice_catalog`` output —
+    ``path`` (absolute, ``directory/<grid>``), ``index``, ``name``, ``z_center``,
+    ``z_top`` / ``z_bot`` (from the manifest's ``z_from`` / ``z_to``) — plus the
+    manifest ``stats`` and the raw ``z_from`` / ``z_to``. Rows whose grid file is
+    missing on disk are skipped. Order follows the manifest (sorted by depth).
+
+    Raises ``SliceSetError`` when there is no readable manifest.
+    """
+    data = read_sliceset(directory)
+    base = directory
+    if os.path.isfile(base):
+        base = os.path.dirname(base)
+    rows: list[dict] = []
+    for i, s in enumerate(data.get("slices") or []):
+        grid = str(s.get("grid") or "").strip()
+        if not grid:
+            continue
+        path = os.path.normpath(os.path.join(base, grid))
+        if not os.path.isfile(path):
+            continue
+        try:
+            z_from = float(s.get("z_from"))
+            z_to = float(s.get("z_to"))
+        except (TypeError, ValueError):
+            continue
+        z_center = s.get("z_center")
+        try:
+            z_center = float(z_center)
+        except (TypeError, ValueError):
+            z_center = 0.5 * (z_from + z_to)
+        lo, hi = (z_from, z_to) if z_from <= z_to else (z_to, z_from)
+        try:
+            idx = int(s.get("index", i))
+        except (TypeError, ValueError):
+            idx = i
+        row = {
+            "path": path,
+            "index": idx,
+            "name": os.path.splitext(os.path.basename(path))[0],
+            "z_center": float(z_center),
+            "z_top": float(lo),
+            "z_bot": float(hi),
+            "z_from": float(z_from),
+            "z_to": float(z_to),
+        }
+        stats = s.get("stats")
+        if isinstance(stats, dict):
+            row["stats"] = stats
+        rows.append(row)
+    return rows
+
+
 def has_sliceset(output_dir: str) -> bool:
     return os.path.isfile(sliceset_path(output_dir))
 

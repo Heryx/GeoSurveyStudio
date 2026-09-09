@@ -163,6 +163,38 @@ class ManifestTest(unittest.TestCase):
         self.assertAlmostEqual(s0["stats"]["fill"], 0.75)
         self.assertEqual(man["slices"][1]["stats"]["fill"], 0.0)
 
+    def test_slice_catalog_from_sliceset(self):
+        spec = SliceSpec(z_max_m=1.0, search_radius_m=0.5, crs_epsg=32633)
+        with tempfile.TemporaryDirectory() as d:
+            slice_manifest.write_sliceset(
+                d, spec, self._slices(),
+                source={"kind": "ogpr"},
+                extent=[0.0, 0.0, 10.0, 5.0],
+            )
+            # grid files referenced by the manifest must exist on disk
+            for name in ("slice_0000.tif", "slice_0001.tif"):
+                open(pathlib.Path(d) / name, "wb").close()
+            rows = slice_manifest.slice_catalog_from_sliceset(d)
+
+        self.assertEqual([r["index"] for r in rows], [0, 1])          # depth order
+        r0 = rows[0]
+        self.assertTrue(r0["path"].endswith("slice_0000.tif"))
+        self.assertEqual(r0["name"], "slice_0000")
+        self.assertAlmostEqual(r0["z_top"], 0.0)
+        self.assertAlmostEqual(r0["z_bot"], 0.1)
+        self.assertAlmostEqual(r0["z_center"], 0.05)
+        self.assertIn("stats", r0)
+
+    def test_slice_catalog_from_sliceset_skips_missing_files(self):
+        spec = SliceSpec(z_max_m=1.0)
+        with tempfile.TemporaryDirectory() as d:
+            slice_manifest.write_sliceset(
+                d, spec, self._slices(), source={"kind": "ogpr"},
+            )
+            open(pathlib.Path(d) / "slice_0000.tif", "wb").close()  # only one on disk
+            rows = slice_manifest.slice_catalog_from_sliceset(d)
+        self.assertEqual([r["name"] for r in rows], ["slice_0000"])
+
     def test_read_errors(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(SliceSetError):

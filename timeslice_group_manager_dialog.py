@@ -142,6 +142,18 @@ class TimesliceGroupManagerDialog(QDialog):
         self.ts_table.horizontalHeader().setStretchLastSection(True)
         ts_layout.addWidget(self.ts_table)
 
+        self.ts_manifest_note = QLabel("")
+        self.ts_manifest_note.setWordWrap(True)
+        self.ts_manifest_note.setStyleSheet("color: #666; font-style: italic;")
+        self.ts_manifest_note.setVisible(False)
+        ts_layout.addWidget(self.ts_manifest_note)
+
+        ts_selection_model = self.ts_table.selectionModel()
+        if ts_selection_model is not None:
+            ts_selection_model.selectionChanged.connect(
+                lambda _sel, _desel: self._refresh_manifest_note()
+            )
+
         tabs.addTab(ts_tab, "Time-slices")
 
         grp_tab = QDialog(self)
@@ -372,6 +384,8 @@ class TimesliceGroupManagerDialog(QDialog):
                         QItemSelectionModel.Select | QItemSelectionModel.Rows,
                     )
 
+        self._refresh_manifest_note()
+
     def _refresh_group_table(self):
         groups = list(self._catalog.get("raster_groups", []))
         selected_gid = self._selected_group_id()
@@ -430,6 +444,59 @@ class TimesliceGroupManagerDialog(QDialog):
 
     def _timeslice_record_by_id(self, tid):
         return next((r for r in self._catalog.get("timeslices", []) if r.get("id") == tid), None)
+
+    @staticmethod
+    def _record_dir_has_sliceset(rec):
+        """True se il record vive in una cartella con ``sliceset.json``
+        (la profondita' e' quindi autorevole e non va sovrascritta a mano)."""
+        if not isinstance(rec, dict):
+            return False
+        p = str(rec.get("project_path") or "").strip()
+        if not p:
+            return False
+        d = os.path.dirname(os.path.abspath(p))
+        return os.path.isfile(os.path.join(d, "sliceset.json"))
+
+    def _selected_records_with_sliceset(self):
+        out = []
+        for tid in self._selected_timeslice_ids():
+            rec = self._timeslice_record_by_id(tid)
+            if rec is not None and self._record_dir_has_sliceset(rec):
+                out.append(rec.get("normalized_name") or rec.get("name") or rec.get("id"))
+        return out
+
+    def _refresh_manifest_note(self):
+        note = getattr(self, "ts_manifest_note", None)
+        if note is None:
+            return
+        names = self._selected_records_with_sliceset()
+        if names:
+            note.setText(
+                "Profondita' da sliceset.json (manifesto autorevole) per "
+                f"{len(names)} time-slice selezionate — 'Set Depth Range' e "
+                "'Auto Depth Sequence' sono disabilitati per questa selezione."
+            )
+            note.setVisible(True)
+        else:
+            note.setVisible(False)
+        gated = bool(names)
+        for btn in (getattr(self, "set_depth_btn", None),
+                    getattr(self, "sequence_depth_btn", None)):
+            if btn is not None:
+                btn.setEnabled(not gated)
+
+    def _depth_edit_blocked_by_manifest(self, title):
+        names = self._selected_records_with_sliceset()
+        if not names:
+            return False
+        QMessageBox.information(
+            self, title,
+            "La profondita' di queste time-slice proviene da sliceset.json "
+            "(manifesto autorevole della generazione) e non va modificata a "
+            "mano.\n\nRigenera il set per cambiarla, oppure usa 'Clear Depth' "
+            "e reimporta se devi forzare valori diversi.",
+        )
+        return True
 
     def _group_record_by_id(self, gid):
         return next((g for g in self._catalog.get("raster_groups", []) if g.get("id") == gid), None)
@@ -806,6 +873,8 @@ class TimesliceGroupManagerDialog(QDialog):
         if not tids:
             QMessageBox.information(self, "Set Depth Range", "Select one or more time-slices.")
             return
+        if self._depth_edit_blocked_by_manifest("Set Depth Range"):
+            return
 
         from_txt, ok = QInputDialog.getText(
             self,
@@ -874,6 +943,8 @@ class TimesliceGroupManagerDialog(QDialog):
         tids = self._selected_timeslice_ids()
         if len(tids) < 1:
             QMessageBox.information(self, "Auto Depth Sequence", "Select one or more time-slices.")
+            return
+        if self._depth_edit_blocked_by_manifest("Auto Depth Sequence"):
             return
 
         start_txt, ok = QInputDialog.getText(self, "Auto Depth Sequence", "Start depth:", text="0.0")
