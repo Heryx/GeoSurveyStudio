@@ -255,8 +255,17 @@ Punti di innesto già mappati:
 - Persistenza: `SliceSpec.to_dict()` in `GPR_Processing/project.json`
   (`_save_gpr_processing_project_meta` / `_load_gpr_processing_project_meta`).
 
-**Fase E — display / 3D dal manifesto**
-- `slice_manifest.read_sliceset(dir)` restituisce già `slices` ordinate con
+**Fase E — filtri/geometria griglia + display dal manifesto**
+- ✅ (2026-09, passo UI 5) `raster_io.read_tif_singleband(path)` — controparte di
+  `write_tif_singleband` (NODATA→NaN, righe rifless.). Azione viewer
+  `_filter_timeslices_grid`: filtra un set di GeoTIFF con `grid_filters`
+  (lowpass 3/5/7, hipass, laplacian, background di linea X/Y con clip percentile,
+  notch FFT direzionale) → nuovo set `<cartella>_<suffisso>/`, copia il
+  `sliceset.json`, ripunta `_le_slice_outdir` + rinfresca il catalogo. Menu
+  Processing → "Filtra time-slice (dominio griglia)...". Nuovo tipo controllo
+  `bool` nella factory già aggiunto al passo 4. `grid_geometry`
+  (rotate/translate/append/edge_match) NON ancora esposto in UI.
+- ⏳ `slice_manifest.read_sliceset(dir)` restituisce già `slices` ordinate con
   `index/z_from/z_to/z_center/grid/stats` + `spec` (SliceSpec) + `crs_epsg`.
   Aggiungere un helper `slice_catalog_from_sliceset(dir)` che converte in righe
   `_slice_catalog` (path assoluto = `dir/grid`, campi depth dal manifesto).

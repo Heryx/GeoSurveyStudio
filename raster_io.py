@@ -57,6 +57,49 @@ def write_tif_singleband(grid, out_path, x_min, y_min, y_max, resolution, epsg):
     ds = None
 
 
+def read_tif_singleband(path):
+    """Read band 1 of a GeoTIFF back into the internal (y-ascending) grid.
+
+    Returns ``(grid, x_min, y_min, y_max, resolution, epsg)`` with NODATA -> NaN
+    and rows flipped so ``grid[0]`` is the southernmost row (matches
+    ``write_tif_singleband``'s input convention). ``epsg`` is 0 when unknown.
+    """
+    from osgeo import gdal, osr
+
+    ds = gdal.Open(str(path), gdal.GA_ReadOnly)
+    if ds is None:
+        raise IOError(f"impossibile aprire il raster: {path}")
+    bnd = ds.GetRasterBand(1)
+    arr = np.asarray(bnd.ReadAsArray(), dtype=np.float64)
+    nod = bnd.GetNoDataValue()
+    if nod is not None:
+        arr = np.where(arr == nod, np.nan, arr)
+    arr = np.where(arr == NODATA, np.nan, arr)
+    arr = np.flipud(arr)                       # north-up -> y-ascending
+
+    gt = ds.GetGeoTransform() or (0.0, 1.0, 0.0, 0.0, 0.0, -1.0)
+    res = float(abs(gt[1])) or 1.0
+    n_y, n_x = arr.shape
+    x_min = float(gt[0] + res / 2.0)
+    y_top = float(gt[3] - res / 2.0)           # centre of the top (north) pixel
+    y_max = y_top
+    y_min = float(y_top - (n_y - 1) * res)
+
+    epsg = 0
+    try:
+        wkt = ds.GetProjection()
+        if wkt:
+            srs = osr.SpatialReference()
+            srs.ImportFromWkt(wkt)
+            code = srs.GetAuthorityCode(None)
+            if code:
+                epsg = int(code)
+    except Exception:
+        epsg = 0
+    ds = None
+    return arr, x_min, y_min, y_max, res, epsg
+
+
 def write_tif_rgb(r_grid, g_grid, b_grid, out_path, x_min, y_min, y_max,
                   resolution, epsg):
     """Write a 3-band float32 GeoTIFF and return per-band (min, max) ranges."""

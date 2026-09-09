@@ -1251,6 +1251,15 @@ class GprProfileViewer(QMainWindow):
         )
         act_blend.triggered.connect(self._blend_multifreq_to_variant)
         m_proc.addAction(act_blend)
+
+        act_grid_filter = QAction("Filtra time-slice (dominio griglia)...", self)
+        act_grid_filter.setToolTip(
+            "Applica un filtro 2D (passa-basso, laplaciano, background di linea,\n"
+            "notch FFT direzionale) a tutte le GeoTIFF di un set di time-slice,\n"
+            "scrivendo un nuovo set filtrato."
+        )
+        act_grid_filter.triggered.connect(self._filter_timeslices_grid)
+        m_proc.addAction(act_grid_filter)
         m_proc.addSeparator()
 
         act_save_preset = QAction("Salva preset gain/hyperbola...", self)
@@ -7611,6 +7620,146 @@ class GprProfileViewer(QMainWindow):
         else:
             QMessageBox.warning(self, "Combina multi-frequenza",
                                 "Fusione non riuscita:\n" + "\n".join(errors[:5]))
+
+    def _filter_timeslices_grid(self):
+        """Applica un filtro nel dominio griglia a tutte le GeoTIFF di un set di
+        time-slice, scrivendo un nuovo set filtrato accanto."""
+        start = str(self._le_slice_outdir.text() or "").strip() if self._is_qt_alive(
+            getattr(self, "_le_slice_outdir", None)) else ""
+        if not start or not os.path.isdir(start):
+            paths = self._gpr_processing_paths()
+            start = (paths.get("timeslices", "") if paths else "") or os.path.expanduser("~")
+        folder = QFileDialog.getExistingDirectory(
+            self, "Cartella time-slice (GeoTIFF) da filtrare", start
+        )
+        if not folder:
+            return
+        tifs = sorted(
+            glob.glob(os.path.join(folder, "*.tif"))
+            + glob.glob(os.path.join(folder, "*.tiff"))
+        )
+        if not tifs:
+            QMessageBox.warning(self, "Filtra time-slice",
+                                "Nessuna GeoTIFF nella cartella selezionata.")
+            return
+        try:
+            from .raster_io import (
+                read_tif_singleband, write_tif_singleband, write_qml_singleband,
+            )
+            from . import grid_filters as gf
+        except Exception as exc:
+            QMessageBox.critical(self, "Filtra time-slice",
+                                 f"Modulo non disponibile:\n{exc}")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Filtra time-slice (dominio griglia)")
+        fl = QFormLayout(dlg)
+        cb = QComboBox()
+        cb.addItem("Passa-basso 3x3", ("lowpass", 3))
+        cb.addItem("Passa-basso 5x5", ("lowpass", 5))
+        cb.addItem("Passa-basso 7x7", ("lowpass", 7))
+        cb.addItem("Passa-alto 3x3", ("hipass", 3))
+        cb.addItem("Laplaciano (enfasi bordi)", ("laplacian", 0))
+        cb.addItem("Background di linea — X (righe)", ("bg_x", 0))
+        cb.addItem("Background di linea — Y (colonne)", ("bg_y", 0))
+        cb.addItem("Notch FFT direzionale", ("fftnotch", 0))
+        fl.addRow("Filtro:", cb)
+        sp_len = QSpinBox(); sp_len.setRange(0, 99999); sp_len.setValue(0)
+        sp_len.setToolTip("Lunghezza del filtro di linea in celle (0 = intera linea).")
+        sp_clip = QDoubleSpinBox(); sp_clip.setRange(50.0, 100.0); sp_clip.setValue(100.0)
+        sp_clip.setToolTip("Background di linea: esclude dal calcolo i valori sopra\n"
+                           "questo percentile della linea (protegge i target forti).")
+        sp_ang = QDoubleSpinBox(); sp_ang.setRange(0.0, 180.0); sp_ang.setValue(0.0)
+        sp_ang.setSuffix(" °")
+        sp_hw = QDoubleSpinBox(); sp_hw.setRange(1.0, 45.0); sp_hw.setValue(10.0)
+        sp_hw.setSuffix(" °")
+        le_suffix = QLineEdit("filt")
+        fl.addRow("Lunghezza filtro linea:", sp_len)
+        fl.addRow("Clip percentile (bg linea):", sp_clip)
+        fl.addRow("Angolo (notch FFT):", sp_ang)
+        fl.addRow("Semi-larghezza (notch FFT):", sp_hw)
+        fl.addRow("Suffisso cartella output:", le_suffix)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        fl.addRow(bb)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        kind, param = cb.currentData()
+        suffix = "".join(c if c.isalnum() or c in "_-" else "_"
+                         for c in str(le_suffix.text()).strip()).strip("_") or "filt"
+        out_dir = os.path.normpath(folder).rstrip("\\/") + "_" + suffix
+        os.makedirs(out_dir, exist_ok=True)
+
+        from PyQt5.QtWidgets import QProgressDialog
+        from PyQt5.QtCore import Qt as _Qt
+        prog = QProgressDialog("Filtraggio time-slice...", "Annulla", 0, len(tifs), self)
+        prog.setWindowModality(_Qt.WindowModal)
+        prog.setMinimumDuration(0)
+
+        n_ok, errors = 0, []
+        for i, tif in enumerate(tifs):
+            if prog.wasCanceled():
+                break
+            try:
+                grid, x_min, y_min, y_max, res, epsg = read_tif_singleband(tif)
+                if kind == "lowpass":
+                    out = gf.lowpass(grid, int(param))
+                elif kind == "hipass":
+                    out = gf.hipass(grid, int(param))
+                elif kind == "laplacian":
+                    out = gf.laplacian(grid)
+                elif kind == "bg_x":
+                    out = gf.line_background(grid, "x", int(sp_len.value()),
+                                            0.0, float(sp_clip.value()))
+                elif kind == "bg_y":
+                    out = gf.line_background(grid, "y", int(sp_len.value()),
+                                            0.0, float(sp_clip.value()))
+                elif kind == "fftnotch":
+                    out = gf.fft2d_directional_notch(
+                        grid, float(sp_ang.value()), float(sp_hw.value()), "reject"
+                    )
+                else:
+                    out = grid
+                out_path = os.path.join(out_dir, os.path.basename(tif))
+                write_tif_singleband(out, out_path, x_min, y_min, y_max, res, epsg or 0)
+                try:
+                    write_qml_singleband(out_path, out)
+                except Exception:
+                    pass
+                n_ok += 1
+            except Exception as e:
+                errors.append(f"{os.path.basename(tif)}: {e}")
+            prog.setValue(i + 1)
+        prog.setValue(len(tifs))
+
+        # porta con se' il manifesto (i nomi file combaciano)
+        src_manifest = os.path.join(folder, "sliceset.json")
+        if os.path.isfile(src_manifest):
+            try:
+                shutil.copy2(src_manifest, os.path.join(out_dir, "sliceset.json"))
+            except Exception:
+                pass
+
+        if n_ok:
+            msg = f"{n_ok}/{len(tifs)} time-slice filtrate in\n{out_dir}"
+            if errors:
+                msg += "\n\nErrori:\n" + "\n".join(errors[:5])
+            QMessageBox.information(self, "Filtra time-slice", msg)
+            if self._is_qt_alive(getattr(self, "_le_slice_outdir", None)):
+                self._le_slice_outdir.setText(out_dir)
+                try:
+                    dz0 = float(self._spin_slice_thickness.value())
+                except Exception:
+                    dz0 = 0.10
+                try:
+                    self._refresh_slice_catalog(out_dir, dz=dz0, reset_index=True, redraw=True)
+                except Exception:
+                    pass
+        else:
+            QMessageBox.warning(self, "Filtra time-slice",
+                                "Nessuna slice filtrata.\n" + "\n".join(errors[:5]))
 
     # ------------------------------------------------------------------
     # Pannello "Varianti" — elenco delle varianti processate su disco
