@@ -3250,6 +3250,18 @@ class GprProfileViewer(QMainWindow):
                         dlg._chk_real_length.setChecked(bool(nav.get("use_real_length", False)))
                     if hasattr(dlg, "_spin_stagger"):
                         dlg._spin_stagger.setValue(float(nav.get("stagger_m", 0.0)))
+                    if hasattr(dlg, "_cb_elev_mode"):
+                        want = str(nav.get("elev_mode", "none") or "none")
+                        j = dlg._cb_elev_mode.findData(want)
+                        if j >= 0:
+                            dlg._cb_elev_mode.setCurrentIndex(j)
+                        dlg._spin_z_start.setValue(float(nav.get("z_start", 0.0) or 0.0))
+                        dlg._spin_z_end.setValue(float(nav.get("z_end", 0.0) or 0.0))
+                        if nav.get("elev_file"):
+                            dlg._le_elev_file.setText(str(nav.get("elev_file")))
+                        k = dlg._cb_elev_kind.findData(str(nav.get("elev_ref_kind", "x") or "x"))
+                        if k >= 0:
+                            dlg._cb_elev_kind.setCurrentIndex(k)
 
                 # Ripristina lo stato per-profilo (verso zig-zag, asse, offset,
                 # nome, lunghezza) salvato in precedenza — altrimenti si perde

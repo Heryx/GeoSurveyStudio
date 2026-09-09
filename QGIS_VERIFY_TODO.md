@@ -54,3 +54,26 @@ size, stessi indici z). *(In attesa che l'utente recuperi i dati.)*
    (se abilitati per errore) deve comparire il messaggio di blocco.
 6. Controprova: un set **senza** `sliceset.json` deve comportarsi come prima
    (parsing nomi, pulsanti profondità attivi).
+
+---
+
+## Passo 8 — Quote per traccia nel Posizionamento Manuale (commit da pushare)
+
+Profile Viewer → menu → **Posizionamento Manuale Griglia GPR** (profili senza
+GPS). Nel gruppo **Navigazione** c'è ora "Quota per traccia".
+
+1. **Piano inclinato:** selezionare il modo, impostare *Quota inizio linea* e
+   *Quota fine linea* (es. 100 → 105). Applicare.
+   **Atteso:** `ch.altitude` di ogni profilo varia linearmente lungo la linea;
+   su una linea in zig-zag (invertita) la prima traccia acquisita prende la
+   quota dell'estremo "fine" della linea di griglia.
+2. **Da file:** preparare un `.csv`/`.txt` a due colonne (`posizione, quota`);
+   scegliere se la colonna 1 è *metri lungo la linea* o *indice di traccia*.
+   Applicare. **Atteso:** quote interpolate (`np.interp`) sulle tracce; file
+   illeggibile → messaggio d'errore, nessuna modifica.
+3. **Nessuna quota** (default): `ch.altitude` **non** viene toccato (si
+   preserva un'eventuale quota da `.gec`/GPS).
+4. Riaprire il dialog: modo quota, quote inizio/fine, path file e
+   interpretazione colonna devono risultare **ripristinati**.
+5. Verifica d'uso: con le quote assegnate, la **Migrazione Kirchhoff
+   topografica** (passo 4) deve usarle senza bisogno del `.gec`.

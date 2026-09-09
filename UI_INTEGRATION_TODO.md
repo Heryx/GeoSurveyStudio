@@ -3,7 +3,7 @@
 **Aggiornato:** 2026-09-09
 **Branch:** `feature/interpolation-improvements-followup` (tutto committato e pushato
 su `geosurveystudio`)
-**Test:** `python -m unittest discover -s test` → 225, i 3 errori
+**Test:** `python -m unittest discover -s test` → 230, i 3 errori
 `test_qgis_environment / test_resources / test_translations` sono **preesistenti**
 (servono un runtime QGIS), tutto il resto verde.
 
@@ -13,7 +13,7 @@ memoria: `project_processing_rewrite.md`, `project_timeslice_redesign.md`.
 
 ---
 
-## Fatto — core headless (Fasi 1‑6 + §5.4) e passi UI 1‑7
+## Fatto — core headless (Fasi 1‑6 + §5.4) e passi UI 1‑8
 
 **Core (puro numpy, testato headless):**
 - Fase 1: `dcshift`, `boxcar_smooth`, `notch_filter`, `spectral_whitening`,
@@ -48,6 +48,11 @@ generati da `_PHASE1_SPECS` / `_build_phase1_step_controls` in
    (fallback al parsing nomi); group‑manager blocca l'editing profondità sui
    set con manifesto; l'import salta il prompt CRS se il manifesto porta un
    `crs_epsg` valido — vedi sotto per il punto 3D rimandato
+8. **Quote per traccia nel Posizionamento Manuale** — `compute_positions`
+   ritorna anche `elev`; gruppo "Navigazione" con modo quota *nessuna* /
+   *piano inclinato* (quota inizio→fine, segue lo zig-zag) / *da file*
+   (`x,z` o `traccia,z`); `ch.altitude` assegnato solo se il modo ≠ nessuna;
+   stato persistito in `navigation` e ripristinato alla riapertura
 
 3b (dialog CMP semblance) **saltato** su richiesta utente (acquisizioni
 WARR/CMP di nicchia per l'archeologia). Le funzioni `cmp_semblance` /
@@ -65,19 +70,6 @@ sempre ricalcolato dai profili via `compute_ogpr_slice_grids`, non da una
 cartella di GeoTIFF esistente. Da fare **solo** se in futuro si aggiunge un
 "costruisci volume da set di time‑slice su disco": allora leggere l'asse z da
 `slice_manifest.read_sliceset(dir)["slices"]` e passarlo come `z_levels`.
-
-### Passo 8 — Quote per traccia nel Posizionamento Manuale  ·  valore medio  ·  rischio basso
-Serve per `kirchhoff_migration_topo` e la correzione statica su survey **senza**
-GPS. Oggi `gpr_manual_positioning_dialog.compute_positions` calcola solo E/N/dist,
-non le quote.
-- Gruppo "Navigazione": modo quota = *nessuna* | *piano inclinato* (quota inizio
-  + quota fine, per profilo o globale) | *da file* (`x,z` o `traccia,z`).
-- In `_apply_and_accept`: calcolare `altitude` per traccia (interp lineare per il
-  piano inclinato; `np.interp` per il file) e assegnare `ch.altitude`.
-- Persistere in `result_payload["navigation"]` + ripristino in
-  `_open_manual_positioning_dialog` (come già fatto per stagger/lunghezza).
-- Test: estendere `test/test_gpr_manual_positioning.py` (`compute_positions`
-  ritorna anche `elev`).
 
 ### Passo 9 — 4 modi marker + overlay nel Posizionamento Manuale (F5)  ·  valore medio  ·  rischio medio
 Agganciare `navigation.py` (`artificial_markers`, `interval_markers`,

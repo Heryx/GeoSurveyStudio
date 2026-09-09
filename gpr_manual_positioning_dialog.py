@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from typing import Any, Callable
 
 import numpy as np
@@ -29,7 +30,7 @@ from qgis.PyQt.QtWidgets import (
     QLabel, QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox,
     QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
     QGroupBox, QSplitter, QWidget, QMessageBox, QDialogButtonBox,
-    QToolButton, QAbstractItemView,
+    QToolButton, QAbstractItemView, QLineEdit, QFileDialog,
 )
 
 try:
@@ -57,8 +58,12 @@ def compute_positions(
     stagger_m: float = 0.0,
     geo_on: bool = False,
     e0: float = 0.0, n0: float = 0.0, az_deg: float = 0.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Calcola E/N/distanza cumulativa per gli scan di un profilo.
+    elev_mode: str = "none",
+    z_start: float = 0.0, z_end: float = 0.0,
+    elev_ref: "np.ndarray | list | None" = None,
+    elev_ref_kind: str = "x",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Calcola E/N/distanza cumulativa/quota per gli scan di un profilo.
 
     - ``use_real_length`` : se True il profilo occupa solo ``length_m`` a partire
       dall'inizio della linea (linee ANG / parziali), altrimenti l'intero span
@@ -66,13 +71,19 @@ def compute_positions(
     - ``reversed_``        : linea percorsa in direzione opposta (zig-zag).
     - ``stagger_m``        : traslazione applicata SOLO alle linee invertite,
       per correggere lo staggering fra andata e ritorno.
+    - ``elev_mode``        : ``"none"`` (quota 0), ``"plane"`` (piano inclinato:
+      ``z_start`` all'inizio linea, ``z_end`` alla fine — interpolazione lineare
+      sulla frazione di linea, tiene conto del verso zig-zag) o ``"file"``
+      (interpola ``elev_ref``, array Nx2, contro la posizione lungo linea in
+      metri se ``elev_ref_kind == "x"`` o contro l'indice di traccia se
+      ``"trace"``).
 
-    Ritorna ``(east, north, dist)`` (array lunghi ``n_traces``).
+    Ritorna ``(east, north, dist, elev)`` (array lunghi ``n_traces``).
     """
     n_t = int(n_traces)
     if n_t <= 0:
         z = np.zeros(0, dtype=np.float64)
-        return z, z.copy(), z.copy()
+        return z, z.copy(), z.copy(), z.copy()
 
     span = float(grid_span_m) if float(grid_span_m) > 1e-9 else 1.0
     L = float(length_m) if (use_real_length and float(length_m) > 1e-9) else span
@@ -110,7 +121,29 @@ def compute_positions(
 
     dseg = np.sqrt(np.diff(lx) ** 2 + np.diff(ly) ** 2)
     dist = np.concatenate([[0.0], np.cumsum(dseg)]) if n_t > 1 else np.zeros(1)
-    return east, north, dist
+
+    # quota per traccia
+    elev = np.zeros(n_t, dtype=np.float64)
+    mode = str(elev_mode or "none").lower()
+    # ascissa lungo il profilo, 0..L dall'inizio linea (tiene conto dello zig-zag)
+    frac_line = (along / L) if L > 1e-9 else np.zeros(n_t, dtype=np.float64)
+    if mode == "plane":
+        elev = float(z_start) + frac_line * (float(z_end) - float(z_start))
+    elif mode == "file" and elev_ref is not None:
+        ref = np.asarray(elev_ref, dtype=np.float64)
+        if ref.ndim == 2 and ref.shape[0] >= 1 and ref.shape[1] >= 2:
+            order = np.argsort(ref[:, 0])
+            xr, zr = ref[order, 0], ref[order, 1]
+            if str(elev_ref_kind or "x").lower().startswith("trace"):
+                query = np.arange(n_t, dtype=np.float64)
+            else:
+                query = along  # metri dall'inizio del profilo
+            if xr.size == 1:
+                elev = np.full(n_t, float(zr[0]), dtype=np.float64)
+            else:
+                elev = np.interp(query, xr, zr)
+
+    return east, north, dist, np.asarray(elev, dtype=np.float64)
 
 
 def check_profiles_have_gps(profiles: list) -> bool:
@@ -315,7 +348,61 @@ class GprManualPositioningDialog(QDialog):
         )
         self._spin_stagger.valueChanged.connect(self._on_nav_changed)
         nav_form.addRow("Stagger (linee invertite):", self._spin_stagger)
+
+        # --- Quota per traccia (per migrazione topografica / correzione statica) ---
+        self._cb_elev_mode = QComboBox()
+        self._cb_elev_mode.addItem("Nessuna quota", "none")
+        self._cb_elev_mode.addItem("Piano inclinato (quota inizio → fine)", "plane")
+        self._cb_elev_mode.addItem("Da file (x,z  oppure  traccia,z)", "file")
+        self._cb_elev_mode.setToolTip(
+            "Assegna una quota (Z) a ogni traccia, usata dalla migrazione\n"
+            "Kirchhoff topografica e dalla correzione statica su rilievi senza GPS."
+        )
+        self._cb_elev_mode.currentIndexChanged.connect(self._on_elev_mode_changed)
+        nav_form.addRow("Quota per traccia:", self._cb_elev_mode)
+
+        self._spin_z_start = QDoubleSpinBox()
+        self._spin_z_start.setRange(-9999.0, 9999.0)
+        self._spin_z_start.setDecimals(3)
+        self._spin_z_start.setSingleStep(0.05)
+        self._spin_z_start.setValue(0.0)
+        self._spin_z_start.setSuffix(" m")
+        self._spin_z_start.valueChanged.connect(self._on_nav_changed)
+        self._lbl_z_start = QLabel("Quota inizio linea:")
+        nav_form.addRow(self._lbl_z_start, self._spin_z_start)
+
+        self._spin_z_end = QDoubleSpinBox()
+        self._spin_z_end.setRange(-9999.0, 9999.0)
+        self._spin_z_end.setDecimals(3)
+        self._spin_z_end.setSingleStep(0.05)
+        self._spin_z_end.setValue(0.0)
+        self._spin_z_end.setSuffix(" m")
+        self._spin_z_end.valueChanged.connect(self._on_nav_changed)
+        self._lbl_z_end = QLabel("Quota fine linea:")
+        nav_form.addRow(self._lbl_z_end, self._spin_z_end)
+
+        elev_file_row = QHBoxLayout()
+        self._le_elev_file = QLineEdit()
+        self._le_elev_file.setPlaceholderText("file .csv/.txt  —  due colonne: posizione, quota")
+        self._le_elev_file.textChanged.connect(self._on_nav_changed)
+        self._btn_elev_file = QPushButton("Sfoglia…")
+        self._btn_elev_file.clicked.connect(self._pick_elev_file)
+        elev_file_row.addWidget(self._le_elev_file, 1)
+        elev_file_row.addWidget(self._btn_elev_file, 0)
+        self._elev_file_widget = QWidget()
+        self._elev_file_widget.setLayout(elev_file_row)
+        self._lbl_elev_file = QLabel("File quote:")
+        nav_form.addRow(self._lbl_elev_file, self._elev_file_widget)
+
+        self._cb_elev_kind = QComboBox()
+        self._cb_elev_kind.addItem("Colonna 1 = metri lungo la linea", "x")
+        self._cb_elev_kind.addItem("Colonna 1 = indice di traccia", "trace")
+        self._cb_elev_kind.currentIndexChanged.connect(self._on_nav_changed)
+        self._lbl_elev_kind = QLabel("Interpretazione colonna 1:")
+        nav_form.addRow(self._lbl_elev_kind, self._cb_elev_kind)
+
         left_layout.addWidget(grp_nav)
+        self._on_elev_mode_changed()
 
         # Tabella Profili e Strumenti Rapidi
         grp_table = QGroupBox("Elenco Profili e Sequenza")
@@ -577,6 +664,61 @@ class GprManualPositioningDialog(QDialog):
         self._update_table_from_items()
         self._draw_preview()
 
+    def _elev_mode(self) -> str:
+        cb = getattr(self, "_cb_elev_mode", None)
+        return str(cb.currentData()) if cb is not None else "none"
+
+    def _on_elev_mode_changed(self, *_a):
+        mode = self._elev_mode()
+        is_plane = mode == "plane"
+        is_file = mode == "file"
+        for w in (getattr(self, "_lbl_z_start", None), getattr(self, "_spin_z_start", None),
+                  getattr(self, "_lbl_z_end", None), getattr(self, "_spin_z_end", None)):
+            if w is not None:
+                w.setVisible(is_plane)
+        for w in (getattr(self, "_lbl_elev_file", None), getattr(self, "_elev_file_widget", None),
+                  getattr(self, "_lbl_elev_kind", None), getattr(self, "_cb_elev_kind", None)):
+            if w is not None:
+                w.setVisible(is_file)
+        if getattr(self, "_table", None) is not None:
+            self._on_nav_changed()
+
+    def _pick_elev_file(self):
+        start = os.path.dirname(str(self._le_elev_file.text()).strip() or "") or os.path.expanduser("~")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "File quote per traccia", start,
+            "Tabelle (*.csv *.txt *.dat *.xyz);;Tutti i file (*)",
+        )
+        if path:
+            self._le_elev_file.setText(path)
+
+    @staticmethod
+    def _parse_elev_file(path: str) -> "np.ndarray | None":
+        """Legge un file a due colonne (posizione, quota). Accetta separatori
+        virgola / punto e virgola / tab / spazi, salta righe non numeriche
+        (header inclusi). Ritorna un array Nx2 o None."""
+        try:
+            rows = []
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    parts = [p for p in re.split(r"[,;\t ]+", s) if p != ""]
+                    if len(parts) < 2:
+                        continue
+                    try:
+                        a = float(parts[0].replace(",", "."))
+                        b = float(parts[1].replace(",", "."))
+                    except ValueError:
+                        continue
+                    rows.append((a, b))
+            if len(rows) < 1:
+                return None
+            return np.asarray(rows, dtype=np.float64)
+        except OSError:
+            return None
+
     def _on_table_item_changed(self, item):
         if self._syncing_table or not item:
             return
@@ -740,6 +882,23 @@ class GprManualPositioningDialog(QDialog):
         )
         stagger_m = float(getattr(self, "_spin_stagger", None).value()) if getattr(self, "_spin_stagger", None) else 0.0
 
+        elev_mode = self._elev_mode()
+        z_start = float(self._spin_z_start.value())
+        z_end = float(self._spin_z_end.value())
+        elev_ref_kind = str(self._cb_elev_kind.currentData() or "x")
+        elev_file = str(self._le_elev_file.text()).strip()
+        elev_ref = None
+        if elev_mode == "file":
+            if not elev_file or not os.path.isfile(elev_file):
+                QMessageBox.warning(self, "Quota per traccia",
+                                    "Modo 'Da file' selezionato ma il file quote non esiste.")
+                return
+            elev_ref = self._parse_elev_file(elev_file)
+            if elev_ref is None:
+                QMessageBox.warning(self, "Quota per traccia",
+                                    "Impossibile leggere due colonne numeriche dal file quote.")
+                return
+
         configured_records = []
 
         for idx, it in enumerate(self._profile_items):
@@ -758,7 +917,7 @@ class GprManualPositioningDialog(QDialog):
 
             if n_t > 0:
                 grid_span = (x1 - x0) if axis == "X" else (y1 - y0)
-                final_e, final_n, final_dist = compute_positions(
+                final_e, final_n, final_dist, final_elev = compute_positions(
                     n_t, x0, x1, y0, y1, axis, offset,
                     grid_span_m=grid_span,
                     length_m=float(it.get("length", grid_span) or grid_span),
@@ -766,11 +925,15 @@ class GprManualPositioningDialog(QDialog):
                     reversed_=is_rev,
                     stagger_m=stagger_m,
                     geo_on=geo_on, e0=e0, n0=n0, az_deg=az_deg,
+                    elev_mode=elev_mode, z_start=z_start, z_end=z_end,
+                    elev_ref=elev_ref, elev_ref_kind=elev_ref_kind,
                 )
                 for ch in channels:
                     ch.easting = final_e.copy()
                     ch.northing = final_n.copy()
                     ch.distances = final_dist.copy()
+                    if elev_mode != "none":
+                        ch.altitude = final_elev.copy()
 
             configured_records.append({
                 "index": idx,
@@ -794,6 +957,11 @@ class GprManualPositioningDialog(QDialog):
             "navigation": {
                 "use_real_length": use_real_length,
                 "stagger_m": stagger_m,
+                "elev_mode": elev_mode,
+                "z_start": z_start,
+                "z_end": z_end,
+                "elev_file": elev_file,
+                "elev_ref_kind": elev_ref_kind,
             },
             "profiles": configured_records,
         }

@@ -38,7 +38,7 @@ for cls in ["QDialog", "QVBoxLayout", "QHBoxLayout", "QGridLayout", "QFormLayout
             "QLabel", "QDoubleSpinBox", "QSpinBox", "QCheckBox", "QComboBox",
             "QPushButton", "QTableWidget", "QTableWidgetItem", "QHeaderView",
             "QGroupBox", "QSplitter", "QWidget", "QMessageBox", "QDialogButtonBox",
-            "QToolButton", "QAbstractItemView"]:
+            "QToolButton", "QAbstractItemView", "QLineEdit", "QFileDialog"]:
     setattr(QtWidgets, cls, type(cls, (), {
         "__init__": lambda self, *a, **kw: None,
     }))
@@ -255,26 +255,27 @@ class TestComputePositions(unittest.TestCase):
 
     def test_uniform_matches_grid_span(self):
         cp = self._fn()
-        e, n, d = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 2.0,
-                     grid_span_m=10.0, length_m=10.0, use_real_length=False,
-                     reversed_=False)
+        e, n, d, z = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 2.0,
+                        grid_span_m=10.0, length_m=10.0, use_real_length=False,
+                        reversed_=False)
         np.testing.assert_allclose(e, np.linspace(0.0, 10.0, 11))
         np.testing.assert_allclose(n, 2.0)
         self.assertAlmostEqual(float(d[-1]), 10.0, places=6)
+        np.testing.assert_allclose(z, 0.0)  # nessuna quota per default
 
     def test_reversed_flips(self):
         cp = self._fn()
-        e, _, _ = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0,
-                     grid_span_m=10.0, length_m=10.0, use_real_length=False,
-                     reversed_=True)
+        e, _, _, _ = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0,
+                        grid_span_m=10.0, length_m=10.0, use_real_length=False,
+                        reversed_=True)
         np.testing.assert_allclose(e, np.linspace(10.0, 0.0, 11))
 
     def test_real_length_occupies_partial_segment(self):
         cp = self._fn()
         # profilo lungo 4 m su una linea (span griglia) di 10 m -> occupa 0..4 m
-        e, n, d = cp(9, 0.0, 10.0, 0.0, 5.0, "X", 1.0,
-                     grid_span_m=10.0, length_m=4.0, use_real_length=True,
-                     reversed_=False)
+        e, n, d, _ = cp(9, 0.0, 10.0, 0.0, 5.0, "X", 1.0,
+                        grid_span_m=10.0, length_m=4.0, use_real_length=True,
+                        reversed_=False)
         self.assertAlmostEqual(float(e[0]), 0.0, places=6)
         self.assertAlmostEqual(float(e[-1]), 4.0, places=6)
         self.assertAlmostEqual(float(d[-1]), 4.0, places=6)
@@ -309,12 +310,63 @@ class TestComputePositions(unittest.TestCase):
 
     def test_georef_rotation_90(self):
         cp = self._fn()
-        e, n, _ = cp(3, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
-                     length_m=10.0, use_real_length=False, reversed_=False,
-                     geo_on=True, e0=0.0, n0=0.0, az_deg=90.0)
+        e, n, _, _ = cp(3, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                        length_m=10.0, use_real_length=False, reversed_=False,
+                        geo_on=True, e0=0.0, n0=0.0, az_deg=90.0)
         np.testing.assert_allclose(e, 0.0, atol=1e-6)
         self.assertAlmostEqual(float(n[0]), 0.0, places=4)
         self.assertAlmostEqual(float(n[-1]), -10.0, places=4)
+
+    def test_elev_plane_linear_along_line(self):
+        cp = self._fn()
+        _, _, _, z = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                        length_m=10.0, use_real_length=False, reversed_=False,
+                        elev_mode="plane", z_start=100.0, z_end=105.0)
+        np.testing.assert_allclose(z, np.linspace(100.0, 105.0, 11))
+
+    def test_elev_plane_follows_zigzag(self):
+        cp = self._fn()
+        # linea invertita: la prima traccia acquisita e' all'estremo "fine"
+        # della linea di griglia -> quota z_end; l'ultima -> z_start.
+        _, _, _, z = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                        length_m=10.0, use_real_length=False, reversed_=True,
+                        elev_mode="plane", z_start=100.0, z_end=105.0)
+        self.assertAlmostEqual(float(z[0]), 105.0, places=6)
+        self.assertAlmostEqual(float(z[-1]), 100.0, places=6)
+
+    def test_elev_file_x_column(self):
+        cp = self._fn()
+        ref = np.array([[0.0, 10.0], [5.0, 20.0], [10.0, 10.0]])
+        _, _, _, z = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                        length_m=10.0, use_real_length=False, reversed_=False,
+                        elev_mode="file", elev_ref=ref, elev_ref_kind="x")
+        self.assertAlmostEqual(float(z[0]), 10.0, places=6)
+        self.assertAlmostEqual(float(z[5]), 20.0, places=6)   # a meta' linea
+        self.assertAlmostEqual(float(z[-1]), 10.0, places=6)
+
+    def test_elev_file_trace_index(self):
+        cp = self._fn()
+        ref = np.array([[0.0, 0.0], [10.0, 100.0]])
+        _, _, _, z = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                        length_m=10.0, use_real_length=False, reversed_=False,
+                        elev_mode="file", elev_ref=ref, elev_ref_kind="trace")
+        np.testing.assert_allclose(z, np.linspace(0.0, 100.0, 11))
+
+    def test_parse_elev_file_mixed_separators(self, ):
+        import tempfile, os as _os
+        from gpr_manual_positioning_dialog import GprManualPositioningDialog
+        txt = "pos,quota\n0 100\n5;102.5\n10\t101\nbad line\n"
+        fd, path = tempfile.mkstemp(suffix=".csv")
+        _os.close(fd)
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(txt)
+            arr = GprManualPositioningDialog._parse_elev_file(path)
+        finally:
+            _os.remove(path)
+        self.assertEqual(arr.shape, (3, 2))
+        np.testing.assert_allclose(arr[:, 0], [0.0, 5.0, 10.0])
+        np.testing.assert_allclose(arr[:, 1], [100.0, 102.5, 101.0])
 
 
 if __name__ == "__main__":
