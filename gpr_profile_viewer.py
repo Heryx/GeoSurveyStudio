@@ -1375,6 +1375,7 @@ class GprProfileViewer(QMainWindow):
             ("kirchhoff_dx_m", "dx tracce (m):", "float", 0.001, 10.0, 0.05, 3, 0.01),
             ("kirchhoff_aperture_m", "Apertura (m, 0=auto):", "float", 0.0, 200.0, 0.0, 2, 0.5),
             ("kirchhoff_txrx_m", "Offset Tx-Rx (m):", "float", 0.0, 3.0, 0.0, 3, 0.02),
+            ("kirchhoff_topo", "Correzione topografica (usa quote):", "bool", False),
         ],
         "inst_attr": [
             ("inst_attr_kind", "Attributo:", "choice",
@@ -1441,6 +1442,13 @@ class GprProfileViewer(QMainWindow):
                     w.currentIndexChanged.connect(
                         lambda _i, s=sid: self._on_phase1_control_changed(s)
                     )
+                elif kind == "bool":
+                    _dv = bool(row[3]) if len(row) > 3 else False
+                    w = QCheckBox()
+                    w.setChecked(_dv)
+                    w.toggled.connect(
+                        lambda _v, s=sid: self._on_phase1_control_changed(s)
+                    )
                 else:
                     continue
                 store[key] = w
@@ -1456,6 +1464,8 @@ class GprProfileViewer(QMainWindow):
                     continue
                 if isinstance(w, QComboBox):
                     out[key] = str(w.currentData() or w.currentText())
+                elif isinstance(w, QCheckBox):
+                    out[key] = bool(w.isChecked())
                 elif isinstance(w, QSpinBox):
                     out[key] = int(w.value())
                 elif isinstance(w, QDoubleSpinBox):
@@ -3305,6 +3315,34 @@ class GprProfileViewer(QMainWindow):
             # Auto reset zoom on channel change (same behavior as Reset Zoom button).
             self._reset_zoom()
 
+    def _current_channel_elevation(self):
+        """Quote per traccia del profilo/canale corrente, allineate al numero
+        di tracce del dato grezzo. None se assenti."""
+        try:
+            prof = self._profiles[self._prof_idx]
+            ch = prof.channel(self._ch_idx)
+            alt = np.asarray(getattr(ch, "altitude", []), dtype=np.float64)
+            if alt.size == 0 or not np.isfinite(alt).any():
+                return None
+            n_t = None
+            if self._raw_data is not None and getattr(self._raw_data, "ndim", 0) == 2:
+                n_t = int(self._raw_data.shape[1])
+            if n_t:
+                alt = self._channel_trace_vector(alt, n_t)
+            return np.asarray(alt, dtype=np.float64).tolist()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _profile_channel_elevation(prof, ci: int):
+        try:
+            alt = np.asarray(getattr(prof.channel(ci), "altitude", []), dtype=np.float64)
+            if alt.size and np.isfinite(alt).any():
+                return alt.tolist()
+        except Exception:
+            pass
+        return None
+
     def _update_trim_controls_for_channel(self, n_traces: int):
         n_t = max(0, int(n_traces))
         max_trim = max(0, n_t - 1)
@@ -3472,6 +3510,11 @@ class GprProfileViewer(QMainWindow):
         phase1: dict = dict(self._phase1_params())
         for _sid in self._PHASE1_STEP_IDS:
             phase1[_sid] = bool(chain_enabled.get(_sid, False))
+        # Migrazione Kirchhoff topografica: inietta le quote per traccia del
+        # profilo/canale corrente (per il salvataggio variante ogni profilo
+        # riceve le proprie quote in _save_processed_variant).
+        if phase1.get("kirchhoff") and phase1.get("kirchhoff_topo"):
+            phase1["kirchhoff_elev_m"] = self._current_channel_elevation()
         return {
             **phase1,
             "dewow": bool(self._chk_dewow.isChecked()),
@@ -7366,8 +7409,12 @@ class GprProfileViewer(QMainWindow):
                 proc_by_ch = []
                 for ci in range(int(getattr(prof, "n_channels", 0) or 0)):
                     raw = np.asarray(prof.channel(ci).data, dtype=np.float32)
+                    p_ch = params
+                    if params.get("kirchhoff") and params.get("kirchhoff_topo"):
+                        p_ch = dict(params)
+                        p_ch["kirchhoff_elev_m"] = self._profile_channel_elevation(prof, ci)
                     out = apply_pipeline(
-                        raw, params, dt_ns=prof.dt_ns,
+                        raw, p_ch, dt_ns=prof.dt_ns,
                         normalize_output=False, chain_order=chain,
                     )
                     proc_by_ch.append(out)

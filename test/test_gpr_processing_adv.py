@@ -23,6 +23,7 @@ from gpr_processing import (
     fk_filter,
     fk_dip_filter,
     kirchhoff_migration_2d,
+    kirchhoff_migration_topo,
     instantaneous_attributes,
     nmo_correction,
     cmp_semblance,
@@ -360,6 +361,60 @@ class TestPhase4Filters(unittest.TestCase):
         out = kirchhoff_migration_2d(data, 0.4, 0.05, v_of_t, aperture_m=0.8)
         self.assertEqual(out.shape, data.shape)
         self.assertTrue(np.isfinite(out).all())
+
+    def test_kirchhoff_topo_constant_elev_equals_flat(self):
+        data = self._synth(n_s=200, n_t=48, seed=11)
+        flat = kirchhoff_migration_2d(data, 0.5, 0.05, 1e8)
+        topo = kirchhoff_migration_topo(data, 0.5, 0.05, 1e8, elev_m=np.full(48, 42.0))
+        np.testing.assert_allclose(topo, flat, rtol=1e-6, atol=1e-6)
+        # None / wrong length -> also falls back to flat
+        np.testing.assert_allclose(
+            kirchhoff_migration_topo(data, 0.5, 0.05, 1e8, elev_m=None), flat,
+            rtol=1e-6, atol=1e-6,
+        )
+
+    def test_kirchhoff_topo_aligns_reflector_to_datum(self):
+        n_s, n_t = 300, 80
+        dt_ns, v = 0.4, 1e8
+        dt = dt_ns * 1e-9
+        elev = np.linspace(2.0, 0.0, n_t)           # 2 m surface drop
+        datum = float(elev.max())
+        wav = np.exp(-((np.arange(-8, 9) / 3.0) ** 2))
+        g = np.zeros((n_s, n_t), dtype=np.float32)
+        for j in range(n_t):
+            d_surf = datum - elev[j]
+            zloc = 3.0 - d_surf                     # reflector 3 m below datum
+            s = int(round((2 * zloc / v) / dt))
+            for k, wv in enumerate(wav):
+                si = s + k - len(wav) // 2
+                if 0 <= si < n_s:
+                    g[si, j] += wv
+        mig = kirchhoff_migration_topo(g, dt_ns, 0.05, v, elev_m=elev, aperture_m=n_t * 0.05)
+        self.assertEqual(mig.shape, g.shape)
+        self.assertTrue(np.isfinite(mig).all())
+        peak_row = int(np.argmax(np.sum(mig ** 2, axis=1)))
+        expected = int(round((2 * 3.0 / v) / dt))  # depth 3 m below datum
+        self.assertAlmostEqual(peak_row, expected, delta=6)
+
+    def test_kirchhoff_topo_pipeline_step(self):
+        from gpr_processing import apply_pipeline
+        data = self._synth(n_s=128, n_t=40, seed=2)
+        p = dict(DEFAULT_PIPELINE)
+        for k in ("dewow", "bg_removal", "agc"):
+            p[k] = False
+        p["kirchhoff"] = True
+        p["kirchhoff_topo"] = True
+        p["kirchhoff_elev_m"] = np.linspace(10.0, 8.0, 40).tolist()
+        p["chain_order"] = ["kirchhoff"]
+        out = apply_pipeline(data, p, dt_ns=0.4, normalize_output=False)
+        self.assertEqual(out.shape, data.shape)
+        self.assertTrue(np.isfinite(out).all())
+        # fingerprint distinguishes different elevation vectors
+        from gpr_processing import _step_fingerprint
+        f1 = _step_fingerprint("kirchhoff", p, data.shape, 0.4)
+        p2 = dict(p); p2["kirchhoff_elev_m"] = np.linspace(10.0, 5.0, 40).tolist()
+        f2 = _step_fingerprint("kirchhoff", p2, data.shape, 0.4)
+        self.assertNotEqual(f1, f2)
 
     def test_phase4_registered_default_off_and_in_chain(self):
         for sid in ("eigen_filter", "median2d", "fk_dip", "kirchhoff"):

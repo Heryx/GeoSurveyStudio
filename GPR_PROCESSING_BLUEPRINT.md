@@ -380,9 +380,18 @@ Wiring: `DEFAULT_PIPELINE` (tutti OFF), `FILTER_REGISTRY`, `DEFAULT_CHAIN_ORDER`
 (19 step; `eigen_filter` dopo bg, `fk_dip` dopo bandpass, `median2d` dopo boxcar,
 `kirchhoff` dopo `migration`), `_step_fingerprint`, branch `apply_pipeline`.
 UI: aggiunti a `_PHASE1_SPECS` / `_PHASE1_STEP_IDS` / help → controlli generici
-via `_build_phase1_step_controls`. 8 test in `test/test_gpr_processing_adv.py`
-(tot 27). `migration_kirchhoff_topo` NON fatta (serve elevazione per traccia,
-va con la Fase 5 navigazione/topografia).
+via `_build_phase1_step_controls`. 8 test in `test/test_gpr_processing_adv.py`.
+
+**`kirchhoff_migration_topo` ✅ FATTA (2026-09, passo UI 4).**
+`kirchhoff_migration_topo(data, dt_ns, dx_m, velocity_m_s, elev_m, datum_m,
+aperture_m, tr_offset_m)` — quota per traccia; ogni traccia ha la superficie a
+`d_j = datum - elev_j` sotto un piano di riferimento; l'uscita è riferita al
+**datum** (riga i = profondità `v·dt/2·i` sotto il datum). Con `elev_m`
+costante/assente collassa in `kirchhoff_migration_2d`. Wired nel branch
+`kirchhoff` di `apply_pipeline` via i param `kirchhoff_topo` (bool) +
+`kirchhoff_elev_m` (array, iniettato dal viewer: `_current_channel_elevation` per
+l'anteprima, per-profilo in `_save_processed_variant`). Factory UI: nuovo tipo
+di controllo `bool` in `_build_phase1_step_controls`. 4 test (tot 36).
 
 **Fase 5 — navigazione completa + dominio griglia. ◑ CORE FATTO (2026-09).**
 - `grid_filters.py` (nuovo, puro numpy, NaN-aware): `lowpass` / `hipass` /

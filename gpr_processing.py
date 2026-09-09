@@ -1333,6 +1333,107 @@ def kirchhoff_migration_2d(
     return out.astype(np.float32)
 
 
+def kirchhoff_migration_topo(
+    data: np.ndarray,
+    dt_ns: float,
+    dx_m: float = 0.05,
+    velocity_m_s: float = 1.0e8,
+    elev_m=None,
+    datum_m: float | None = None,
+    aperture_m: float = 0.0,
+    tr_offset_m: float = 0.0,
+) -> np.ndarray:
+    """Migrazione Kirchhoff 2D con **correzione topografica**.
+
+    ``elev_m`` : quota della superficie per ogni traccia (array lungo n_traces).
+    Ogni traccia ha la sua superficie a profondità ``d_j = datum - elev_j`` sotto
+    un piano di riferimento orizzontale (``datum_m``, default = quota massima).
+    L'uscita è riferita al **datum**: la riga ``i0`` corrisponde alla profondità
+    ``z = i0 * v*dt/2`` sotto il datum (non sotto la superficie locale). Le
+    porzioni sopra la superficie di una traccia non contribuiscono.
+
+    Con ``elev_m`` costante o assente collassa in ``kirchhoff_migration_2d``.
+    """
+    if data is None:
+        return np.zeros((0, 0), dtype=np.float32)
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim != 2 or arr.size == 0:
+        return arr.copy()
+    arr = np.nan_to_num(arr, copy=True, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+    n_s, n_t = arr.shape
+
+    elev = np.asarray(elev_m, dtype=np.float64).ravel() if elev_m is not None else None
+    _fin = elev[np.isfinite(elev)] if elev is not None else np.zeros(0)
+    if elev is None or elev.size != n_t or _fin.size < 2 or float(_fin.max() - _fin.min()) < 1e-6:
+        # niente topografia utile → migrazione piana standard
+        return kirchhoff_migration_2d(arr, dt_ns, dx_m, velocity_m_s, aperture_m, tr_offset_m)
+
+    if n_s < 4 or n_t < 4:
+        return arr.astype(np.float32)
+    dt = float(dt_ns) * 1e-9
+    dx = max(float(dx_m), 1e-4)
+    if not np.isfinite(dt) or dt <= 0.0:
+        return arr.astype(np.float32)
+
+    v = np.asarray(velocity_m_s, dtype=np.float64)
+    v_scalar = float(v) if v.ndim == 0 else float(np.median(np.clip(v, 1e3, None)))
+    v_scalar = max(v_scalar, 1e3)
+
+    elev = np.nan_to_num(elev, nan=float(np.nanmedian(elev)))
+    datum = float(datum_m) if datum_m is not None else float(np.max(elev))
+    d_surf = np.clip(datum - elev, 0.0, None)          # (n_t,) prof. superficie sotto datum
+    dz = 0.5 * v_scalar * dt                            # incremento profondità per riga
+
+    half = float(tr_offset_m) * 0.5
+    ap = float(aperture_m) if float(aperture_m) > 0.0 else (0.5 * n_t * dx)
+    max_off = max(1, int(round(ap / dx)))
+
+    out = np.zeros_like(arr)
+    j0 = np.arange(n_t)
+    for i0 in range(n_s):
+        z0 = i0 * dz                                    # profondità sotto datum
+        for off in range(-max_off, max_off + 1):
+            src = j0 + off
+            m = (src >= 0) & (src < n_t)
+            if not np.any(m):
+                continue
+            src_c = np.clip(src, 0, n_t - 1)
+            zloc = z0 - d_surf[src_c]                   # prof. riflettore sotto la superficie di src
+            valid = m & (zloc > 0.0)
+            if not np.any(valid):
+                continue
+            xr = off * dx
+            r1 = np.hypot(xr - half, zloc)
+            r2 = np.hypot(xr + half, zloc)
+            t_hyp = (r1 + r2) / v_scalar
+            s = t_hyp / dt
+            valid &= (s >= 0.0) & (s <= (n_s - 1))
+            if not np.any(valid):
+                continue
+            s0 = np.floor(s).astype(np.int64)
+            fr = s - s0
+            s0c = np.clip(s0, 0, n_s - 1)
+            s1c = np.clip(s0 + 1, 0, n_s - 1)
+            a = arr[s0c, src_c] * (1.0 - fr) + arr[s1c, src_c] * fr
+            dist_mean = 0.5 * (r1 + r2)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                obliq = np.where(dist_mean > 1e-9, zloc / np.maximum(dist_mean, 1e-12), 0.0)
+                spread = 1.0 / np.sqrt(np.maximum(v_scalar * t_hyp, 1e-12))
+            w = np.nan_to_num(obliq * spread, nan=0.0, posinf=0.0, neginf=0.0)
+            contrib = np.where(valid, w * a, 0.0)
+            out[i0, :] += contrib
+    peak_in = float(np.max(np.abs(arr))) or 1.0
+    peak_out = float(np.max(np.abs(out))) or 1.0
+    if peak_out > 1e-20:
+        out *= peak_in / peak_out
+    _log_gpr(
+        f"[GPR] kirchhoff_migration_topo: v={v_scalar:.3e} dx={dx:.3f} "
+        f"datum={datum:.3f} dz_surf=[{d_surf.min():.3f},{d_surf.max():.3f}]m  "
+        f"shape={arr.shape}"
+    )
+    return out.astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Fase 6 — attributi istantanei, NMO / analisi velocità CMP, blending multi-freq
 # ---------------------------------------------------------------------------
@@ -1676,6 +1777,8 @@ DEFAULT_PIPELINE = {
     "kirchhoff_dx_m":       0.05,
     "kirchhoff_aperture_m": 0.0,          # 0 = auto (mezza traccia)
     "kirchhoff_txrx_m":     0.0,
+    "kirchhoff_topo":       False,        # correzione topografica (serve kirchhoff_elev_m)
+    "kirchhoff_elev_m":     None,         # array quota per traccia (iniettato dal viewer)
     # --- Filtri Fase 6 (disattivi di default) ---------------------------
     "inst_attr":            False,
     "inst_attr_kind":       "phase",      # phase | cos_phase | frequency | envelope
@@ -1911,12 +2014,22 @@ def _step_fingerprint(
             dt_ns, input_shape
         )
     elif step == "kirchhoff":
+        _elev = p.get("kirchhoff_elev_m")
+        _elev_sig = 0
+        if _elev is not None:
+            try:
+                _ea = np.asarray(_elev, dtype=np.float64).ravel()
+                _elev_sig = (int(_ea.size), round(float(_ea.sum()), 3),
+                             round(float(_ea.max() - _ea.min()), 4)) if _ea.size else 0
+            except Exception:
+                _elev_sig = 0
         return (
             "kirchhoff", bool(p.get("kirchhoff")),
             float(p.get("kirchhoff_velocity_m_s", 1.0e8)),
             float(p.get("kirchhoff_dx_m", 0.05)),
             float(p.get("kirchhoff_aperture_m", 0.0)),
-            float(p.get("kirchhoff_txrx_m", 0.0)), dt_ns, input_shape
+            float(p.get("kirchhoff_txrx_m", 0.0)),
+            bool(p.get("kirchhoff_topo", False)), _elev_sig, dt_ns, input_shape
         )
     elif step == "inst_attr":
         return (
@@ -2277,19 +2390,23 @@ def apply_pipeline(
 
         elif step == "kirchhoff":
             if bool(p.get("kirchhoff", False)):
-                out = kirchhoff_migration_2d(
-                    out,
+                _kw = dict(
                     dt_ns=dt_ns,
                     dx_m=float(p.get("kirchhoff_dx_m", 0.05)),
                     velocity_m_s=float(p.get("kirchhoff_velocity_m_s", 1.0e8)),
                     aperture_m=float(p.get("kirchhoff_aperture_m", 0.0)),
                     tr_offset_m=float(p.get("kirchhoff_txrx_m", 0.0)),
                 )
-                _log(
-                    f"kirchhoff(v={float(p.get('kirchhoff_velocity_m_s', 1e8)):.3e} "
-                    f"dx={p.get('kirchhoff_dx_m', 0.05)})",
-                    out,
-                )
+                if bool(p.get("kirchhoff_topo", False)) and p.get("kirchhoff_elev_m") is not None:
+                    out = kirchhoff_migration_topo(out, elev_m=p.get("kirchhoff_elev_m"), **_kw)
+                    _log("kirchhoff(topo)", out)
+                else:
+                    out = kirchhoff_migration_2d(out, **_kw)
+                    _log(
+                        f"kirchhoff(v={float(p.get('kirchhoff_velocity_m_s', 1e8)):.3e} "
+                        f"dx={p.get('kirchhoff_dx_m', 0.05)})",
+                        out,
+                    )
 
         elif step == "inst_attr":
             if bool(p.get("inst_attr", False)):
