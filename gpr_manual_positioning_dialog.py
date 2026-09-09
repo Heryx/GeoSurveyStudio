@@ -63,6 +63,7 @@ def compute_positions(
     elev_ref: "np.ndarray | list | None" = None,
     elev_ref_kind: str = "x",
     markers: "list | None" = None,
+    reverse_anchor: str = "near",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Calcola E/N/distanza cumulativa/quota per gli scan di un profilo.
 
@@ -81,6 +82,11 @@ def compute_positions(
     - ``markers``         : se dato (lista di ``navigation.Marker`` con
       ``pos_m``), le ascisse degli scan vengono da ``dead_reckon_along`` invece
       che da ``linspace`` — dead-reckoning fra marker (modi interval/artificial).
+    - ``reverse_anchor``  : per le linee invertite più corte dello span griglia,
+      ``"near"`` (default) le àncora al lato di partenza delle linee dirette
+      (x0 / y0); ``"far"`` le àncora al lato opposto — la *baseline di ritorno*
+      dello zig-zag (x1 / y1) — così ogni linea di ritorno parte allineata a
+      destra/in alto invece che rientrata.
 
     Ritorna ``(east, north, dist, elev)`` (array lunghi ``n_traces``).
     """
@@ -91,7 +97,7 @@ def compute_positions(
 
     span = float(grid_span_m) if float(grid_span_m) > 1e-9 else 1.0
     L = float(length_m) if (use_real_length and float(length_m) > 1e-9) else span
-    # ascissa metrica lungo la linea, 0..L
+    # ascissa metrica lungo il PROFILO, 0..L (per quota e file quote)
     if markers:
         along = np.asarray(dead_reckon_along(markers, n_t), dtype=np.float64)
         if not np.isfinite(along).all():
@@ -100,7 +106,12 @@ def compute_positions(
         along = np.linspace(0.0, L, n_t, dtype=np.float64)
     if reversed_:
         along = reverse_along(along, L)
-    frac = np.clip(along / span, 0.0, 1.0)
+    # ascissa nel sistema GRIGLIA (per mappare a X/Y): per le linee invertite
+    # ancorate al lato opposto si somma lo scarto (span - L).
+    along_grid = along
+    if reversed_ and L < span - 1e-9 and str(reverse_anchor).lower().startswith("far"):
+        along_grid = along + (span - L)
+    frac = np.clip(along_grid / span, 0.0, 1.0)
 
     if str(axis).upper() == "X":
         lx = float(x0) + frac * (float(x1) - float(x0))
@@ -361,6 +372,19 @@ class GprManualPositioningDialog(QDialog):
         )
         self._spin_stagger.valueChanged.connect(self._on_nav_changed)
         nav_form.addRow("Stagger (linee invertite):", self._spin_stagger)
+
+        self._chk_reverse_far = QCheckBox(
+            "Linee invertite: parti dalla baseline di ritorno (lato opposto)"
+        )
+        self._chk_reverse_far.setChecked(False)
+        self._chk_reverse_far.setToolTip(
+            "Zig-zag: se una linea di ritorno è più corta dello span griglia,\n"
+            "viene allineata al lato OPPOSTO (x1 / y1 — dove l'operatore ha\n"
+            "invertito la marcia) invece che rientrata dal lato di partenza.\n"
+            "Richiede 'Usa la lunghezza reale del profilo'."
+        )
+        self._chk_reverse_far.toggled.connect(self._on_nav_changed)
+        nav_form.addRow(self._chk_reverse_far)
 
         # --- Modo posizionamento tracce (uniforme / marker + dead-reckoning) ---
         self._cb_pos_mode = QComboBox()
@@ -986,6 +1010,9 @@ class GprManualPositioningDialog(QDialog):
             getattr(self, "_chk_real_length", None) and self._chk_real_length.isChecked()
         )
         stagger_m = float(getattr(self, "_spin_stagger", None).value()) if getattr(self, "_spin_stagger", None) else 0.0
+        rev_far = bool(
+            getattr(self, "_chk_reverse_far", None) and self._chk_reverse_far.isChecked()
+        )
 
         # Disegna linee dei profili con frecce direzionali
         for idx, it in enumerate(self._profile_items):
@@ -995,21 +1022,26 @@ class GprManualPositioningDialog(QDialog):
             sh = stagger_m if is_rev else 0.0
 
             if axis == "X":
-                span = (x1 - x0)
-                frac = 1.0
-                if use_real_len and abs(span) > 1e-9:
-                    frac = min(1.0, float(it.get("length", abs(span))) / abs(span))
-                xa, xb = x0 + sh, x0 + frac * span + sh
-                p_start_loc = (xb, offset) if is_rev else (xa, offset)
-                p_end_loc = (xa, offset) if is_rev else (xb, offset)
+                lo, hi = x0, x1
             else:
-                span = (y1 - y0)
-                frac = 1.0
-                if use_real_len and abs(span) > 1e-9:
-                    frac = min(1.0, float(it.get("length", abs(span))) / abs(span))
-                ya, yb = y0 + sh, y0 + frac * span + sh
-                p_start_loc = (offset, yb) if is_rev else (offset, ya)
-                p_end_loc = (offset, ya) if is_rev else (offset, yb)
+                lo, hi = y0, y1
+            span = hi - lo
+            frac = 1.0
+            if use_real_len and abs(span) > 1e-9:
+                frac = min(1.0, float(it.get("length", abs(span))) / abs(span))
+            if is_rev and rev_far and frac < 1.0:
+                # linea di ritorno ancorata al lato opposto: parte da hi
+                seg_start, seg_end = hi + sh, hi - frac * span + sh
+            elif is_rev:
+                seg_start, seg_end = lo + frac * span + sh, lo + sh
+            else:
+                seg_start, seg_end = lo + sh, lo + frac * span + sh
+            if axis == "X":
+                p_start_loc = (seg_start, offset)
+                p_end_loc = (seg_end, offset)
+            else:
+                p_start_loc = (offset, seg_start)
+                p_end_loc = (offset, seg_end)
 
             ps_disp = _to_display_xy(*p_start_loc)
             pe_disp = _to_display_xy(*p_end_loc)
@@ -1081,6 +1113,9 @@ class GprManualPositioningDialog(QDialog):
         elev_file = str(self._le_elev_file.text()).strip()
         pos_mode = self._pos_mode()
         pos_param = int(self._spin_pos_param.value())
+        reverse_anchor = "far" if (
+            getattr(self, "_chk_reverse_far", None) and self._chk_reverse_far.isChecked()
+        ) else "near"
 
         elev_ref = None
         if elev_mode == "file":
@@ -1124,6 +1159,7 @@ class GprManualPositioningDialog(QDialog):
                     elev_mode=elev_mode, z_start=z_start, z_end=z_end,
                     elev_ref=elev_ref, elev_ref_kind=elev_ref_kind,
                     markers=markers or None,
+                    reverse_anchor=reverse_anchor,
                 )
                 for ch in channels:
                     ch.easting = final_e.copy()
@@ -1161,6 +1197,7 @@ class GprManualPositioningDialog(QDialog):
                 "elev_ref_kind": elev_ref_kind,
                 "pos_mode": pos_mode,
                 "pos_param": pos_param,
+                "reverse_anchor": reverse_anchor,
             },
             "profiles": configured_records,
         }

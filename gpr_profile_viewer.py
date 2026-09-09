@@ -3270,6 +3270,10 @@ class GprProfileViewer(QMainWindow):
                             dlg._spin_pos_param.setValue(int(nav.get("pos_param", 0) or 0))
                         except (TypeError, ValueError):
                             pass
+                    if hasattr(dlg, "_chk_reverse_far"):
+                        dlg._chk_reverse_far.setChecked(
+                            str(nav.get("reverse_anchor", "near") or "near").lower().startswith("far")
+                        )
 
                 # Ripristina lo stato per-profilo (verso zig-zag, asse, offset,
                 # nome, lunghezza) salvato in precedenza — altrimenti si perde

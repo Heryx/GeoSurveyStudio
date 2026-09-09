@@ -3,7 +3,7 @@
 **Aggiornato:** 2026-09-09
 **Branch:** `feature/interpolation-improvements-followup` (tutto committato e pushato
 su `geosurveystudio`)
-**Test:** `python -m unittest discover -s test` → 245, i 3 errori
+**Test:** `python -m unittest discover -s test` → 249, i 3 errori
 `test_qgis_environment / test_resources / test_translations` sono **preesistenti**
 (servono un runtime QGIS), tutto il resto verde.
 
@@ -62,7 +62,11 @@ generati da `_PHASE1_SPECS` / `_build_phase1_step_controls` in
    parametro passo/N nel gruppo Navigazione; nuovo modulo `radargram_render.py`
    (`draw_radargram` condiviso) e mini-canvas radargramma+marker nel dialog che
    mostra il profilo selezionato e la coda "sbordata"; stato in `navigation`
-   (`pos_mode`/`pos_param`) ripristinato alla riapertura
+   (`pos_mode`/`pos_param`) ripristinato alla riapertura.
+   Inoltre `compute_positions(..., reverse_anchor="far")` + checkbox "Linee
+   invertite: parti dalla baseline di ritorno": le linee di ritorno più corte
+   dello span vengono allineate al lato opposto (x1/y1) invece che rientrate
+   dal lato di partenza (zig-zag di un'area rettangolare).
 
 3b (dialog CMP semblance) **saltato** su richiesta utente (acquisizioni
 WARR/CMP di nicchia per l'archeologia). Le funzioni `cmp_semblance` /

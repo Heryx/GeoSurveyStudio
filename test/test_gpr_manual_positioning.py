@@ -379,6 +379,42 @@ class TestComputePositions(unittest.TestCase):
         self.assertAlmostEqual(float(e[10]), 1.0, places=6)
         self.assertAlmostEqual(float(e[20]), 2.0, places=6)
 
+    def test_reverse_anchor_near_is_default(self):
+        cp = self._fn()
+        # linea invertita, lunghezza reale 4 su span 10 -> ancorata a x0
+        e, _, _, _ = cp(5, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                        length_m=4.0, use_real_length=True, reversed_=True)
+        self.assertAlmostEqual(float(e[0]), 4.0, places=6)
+        self.assertAlmostEqual(float(e[-1]), 0.0, places=6)
+
+    def test_reverse_anchor_far_aligns_to_return_baseline(self):
+        cp = self._fn()
+        e, _, _, _ = cp(5, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                        length_m=4.0, use_real_length=True, reversed_=True,
+                        reverse_anchor="far")
+        # prima traccia sulla baseline di ritorno (x1), estende indietro di 4 m
+        self.assertAlmostEqual(float(e[0]), 10.0, places=6)
+        self.assertAlmostEqual(float(e[-1]), 6.0, places=6)
+
+    def test_reverse_anchor_far_noop_when_full_length(self):
+        cp = self._fn()
+        # se la linea copre tutto lo span, 'far' non cambia nulla
+        near = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                  length_m=10.0, use_real_length=True, reversed_=True)
+        far = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                 length_m=10.0, use_real_length=True, reversed_=True,
+                 reverse_anchor="far")
+        np.testing.assert_allclose(near[0], far[0])
+
+    def test_reverse_anchor_far_only_affects_reversed(self):
+        cp = self._fn()
+        # linea diretta: 'far' ignorato, resta ancorata a x0
+        e, _, _, _ = cp(5, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                        length_m=4.0, use_real_length=True, reversed_=False,
+                        reverse_anchor="far")
+        self.assertAlmostEqual(float(e[0]), 0.0, places=6)
+        self.assertAlmostEqual(float(e[-1]), 4.0, places=6)
+
     def test_markers_none_matches_uniform(self):
         cp = self._fn()
         a = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,

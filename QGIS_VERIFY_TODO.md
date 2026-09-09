@@ -101,3 +101,10 @@ a destra **"Radargramma + marker (profilo selezionato)"**.
 6. Riaprire il dialog: modo e parametro devono risultare **ripristinati**.
 7. Con `matplotlib` assente il pannello mostra un testo di fallback, il resto
    del dialog funziona.
+8. **Baseline di ritorno (zig-zag):** con "Usa la lunghezza reale" attivo e
+   profili di ritorno più corti dello span, attivare "Linee invertite: parti
+   dalla baseline di ritorno". **Atteso** nell'anteprima schema: le linee
+   pari (ritorno) partono allineate al lato **destro** (x1) / **alto** (y1)
+   ed estendono all'indietro, invece di essere rientrate dal lato di
+   partenza. Con la checkbox off → comportamento attuale. Lo stagger si
+   somma comunque a questa scelta. Stato ripristinato alla riapertura.
