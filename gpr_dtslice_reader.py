@@ -47,6 +47,16 @@ _V0_FIELD_WIDTH = 16
 _V0_N_FIELDS = 10
 _SAMPLE_ITEMSIZE = 2  # int16
 
+# Layout "a blocchi": alcuni export .DT scrivono ogni traccia in un blocco di
+# HEADER_BLOCK_SIZE byte = intestazione di traccia + campioni int16. Il campo
+# 0 del blocco V0 (es. 200) NON e' il numero di campioni reale: quello si
+# ricava dal blocco. Intestazione di traccia osservata: byte 0 = 0x52 ('R'),
+# byte 2..3 = 0x0000 (byte 1 = flag, 0x07 su prima/ultima traccia).
+_TRACE_BLOCK_SIZE = HEADER_BLOCK_SIZE          # 1028
+_TRACE_PREFIX_BYTES = 4
+_SAMPLES_PER_TRACE_BLOCK = (_TRACE_BLOCK_SIZE - _TRACE_PREFIX_BYTES) // _SAMPLE_ITEMSIZE  # 512
+_TRACE_MARKER_BYTE = 0x52                      # 'R'
+
 # Il campo 1 del blocco V0 nell'export "raw" non contiene la frequenza
 # reale dell'antenna: e' un valore fisso 1.0E+08 Hz (100 MHz) scritto come
 # segnaposto. La frequenza vera va recuperata dal file `install.dat` di
@@ -302,6 +312,50 @@ def _locate_trace_data(raw: bytes, n_samples: int) -> tuple[int, int]:
     return best, n_traces
 
 
+def _find_trace_block_start(raw: bytes) -> int | None:
+    """Se il .DT usa il layout 'a blocchi' (una traccia per blocco di
+    HEADER_BLOCK_SIZE byte), ritorna l'offset della prima traccia; altrimenti
+    None. Cerca >=3 blocchi consecutivi con l'intestazione di traccia
+    (byte 0 = 0x52, byte 2..3 = 0x0000)."""
+    if len(raw) % _TRACE_BLOCK_SIZE != 0:
+        return None
+    n_blocks = len(raw) // _TRACE_BLOCK_SIZE
+    lo = max(1, DEFAULT_HEADER_BLOCKS - 4)
+    hi = min(n_blocks - 3, DEFAULT_HEADER_BLOCKS + 8)
+    for b in range(lo, hi + 1):
+        off = b * _TRACE_BLOCK_SIZE
+        ok = True
+        for j in range(3):
+            o = off + j * _TRACE_BLOCK_SIZE
+            if not (raw[o] == _TRACE_MARKER_BYTE and raw[o + 2] == 0 and raw[o + 3] == 0):
+                ok = False
+                break
+        if ok:
+            return off
+    return None
+
+
+def _read_dt_blocked(raw: bytes, header: dict) -> tuple[np.ndarray, int, int] | None:
+    """Decodifica il layout 'a blocchi'. Ritorna (data, data_start, n_traces)
+    oppure None se il layout non e' riconosciuto."""
+    data_start = _find_trace_block_start(raw)
+    if data_start is None:
+        return None
+    n_traces = (len(raw) - data_start) // _TRACE_BLOCK_SIZE
+    if n_traces <= 0:
+        return None
+    ns = _SAMPLES_PER_TRACE_BLOCK
+    rows = np.empty((n_traces, ns), dtype=np.float32)
+    for k in range(n_traces):
+        o = data_start + k * _TRACE_BLOCK_SIZE + _TRACE_PREFIX_BYTES
+        rows[k] = np.frombuffer(raw, dtype="<i2", count=ns, offset=o)
+    header["n_samples"] = ns
+    header["trace_layout"] = "blocked"
+    header["trace_block_bytes"] = _TRACE_BLOCK_SIZE
+    header["trace_prefix_bytes"] = _TRACE_PREFIX_BYTES
+    return rows.T.copy(), data_start, int(n_traces)
+
+
 def _read_dt_binary(path: Path) -> tuple[np.ndarray, dict]:
     raw = path.read_bytes()
     if len(raw) < HEADER_BLOCK_SIZE:
@@ -323,6 +377,18 @@ def _read_dt_binary(path: Path) -> tuple[np.ndarray, dict]:
         )
         header = {**fb_header}
 
+    # 1) layout "a blocchi" (una traccia per blocco da 1028 byte): il campo
+    #    n_samples dell'header e' inaffidabile, si ricava dal blocco.
+    blocked = _read_dt_blocked(raw, header)
+    if blocked is not None:
+        data, data_start, n_traces = blocked
+        header["data_start"] = data_start
+        header["n_traces"] = n_traces
+        if header_warning:
+            header["header_warning"] = header_warning
+        return data, header
+
+    # 2) layout storico: campioni int16 contigui, n_samples dall'header.
     n_samples = header["n_samples"]
     if n_samples <= 0:
         raise DtSliceReadError(f"n_samples non valido ({n_samples}) in {path}")
@@ -337,6 +403,7 @@ def _read_dt_binary(path: Path) -> tuple[np.ndarray, dict]:
     data = samples.reshape(n_traces, n_samples).T.copy()  # (n_samples, n_traces)
     header["data_start"] = data_start
     header["n_traces"] = n_traces
+    header["trace_layout"] = "contiguous"
     if header_warning:
         header["header_warning"] = header_warning
     return data, header
@@ -384,7 +451,9 @@ def _parse_gec(path: Path) -> dict:
                 if len(parts) < 6:
                     continue
                 try:
-                    trace_idx = int(float(parts[0]))
+                    # gli indici .gec sono 1-based (il primo marker e' la
+                    # traccia 1, l'ultimo == n_tracce): riportali a 0-based.
+                    trace_idx = max(0, int(float(parts[0])) - 1)
                     x = float(parts[3])
                     y = float(parts[4])
                     z = float(parts[5])
