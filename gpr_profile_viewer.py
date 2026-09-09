@@ -1260,6 +1260,24 @@ class GprProfileViewer(QMainWindow):
         )
         act_grid_filter.triggered.connect(self._filter_timeslices_grid)
         m_proc.addAction(act_grid_filter)
+
+        act_merge_sets = QAction("Unisci set di time-slice...", self)
+        act_merge_sets.setToolTip(
+            "Fonde due o piu' cartelle di GeoTIFF (stessa cell size, stessi\n"
+            "indici z) in un unico set: per ogni z pareggia la giunzione\n"
+            "(edge-match opzionale) e appende le griglie (media sulle\n"
+            "sovrapposizioni). Utile per survey a piu' griglie adiacenti."
+        )
+        act_merge_sets.triggered.connect(self._merge_timeslice_sets)
+        m_proc.addAction(act_merge_sets)
+
+        act_rt_set = QAction("Ruota/trasla set di time-slice...", self)
+        act_rt_set.setToolTip(
+            "Ruota (CCW) e trasla ogni GeoTIFF di un set verso un'origine\n"
+            "comune, con ricampionamento bilineare. Scrive un nuovo set _rt."
+        )
+        act_rt_set.triggered.connect(self._rotate_translate_timeslice_set)
+        m_proc.addAction(act_rt_set)
         m_proc.addSeparator()
 
         act_save_preset = QAction("Salva preset gain/hyperbola...", self)
@@ -7760,6 +7778,368 @@ class GprProfileViewer(QMainWindow):
         else:
             QMessageBox.warning(self, "Filtra time-slice",
                                 "Nessuna slice filtrata.\n" + "\n".join(errors[:5]))
+
+    # ------------------------------------------------------------------
+    # grid_geometry in UI — unione / rototraslazione di set di time-slice
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _gg_list_tifs(folder):
+        return sorted(
+            glob.glob(os.path.join(folder, "*.tif"))
+            + glob.glob(os.path.join(folder, "*.tiff"))
+        )
+
+    @staticmethod
+    def _gg_read_manifest(folder):
+        """Raw sliceset.json (dict) o None; niente rehydrate della spec."""
+        path = os.path.join(folder, "sliceset.json")
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _gg_slice_start_dir(self):
+        start = str(self._le_slice_outdir.text() or "").strip() if self._is_qt_alive(
+            getattr(self, "_le_slice_outdir", None)) else ""
+        if not start or not os.path.isdir(start):
+            paths = self._gpr_processing_paths()
+            start = (paths.get("timeslices", "") if paths else "") or os.path.expanduser("~")
+        return start
+
+    def _gg_repoint_slice_view(self, out_dir):
+        if not self._is_qt_alive(getattr(self, "_le_slice_outdir", None)):
+            return
+        self._le_slice_outdir.setText(out_dir)
+        try:
+            dz0 = float(self._spin_slice_thickness.value())
+        except Exception:
+            dz0 = 0.10
+        try:
+            self._refresh_slice_catalog(out_dir, dz=dz0, reset_index=True, redraw=True)
+        except Exception:
+            pass
+
+    def _merge_timeslice_sets(self):
+        """Unisce 2+ cartelle di GeoTIFF (stessa cella, stessi z) in un set unico
+        via ``grid_geometry.append_grids`` (edge-match opzionale sulla giunzione)."""
+        try:
+            from .raster_io import read_tif_singleband, write_tif_singleband, write_qml_singleband
+            from . import grid_geometry as gg
+            from . import slice_manifest as sm
+        except Exception as exc:
+            QMessageBox.critical(self, "Unisci set di time-slice",
+                                 f"Modulo non disponibile:\n{exc}")
+            return
+
+        start = self._gg_slice_start_dir()
+        folders = []
+        while True:
+            title = ("Cartella time-slice #%d (Annulla per terminare)"
+                     % (len(folders) + 1)) if folders else "Prima cartella time-slice"
+            d = QFileDialog.getExistingDirectory(self, title, start)
+            if not d:
+                break
+            d = os.path.normpath(d)
+            if d in folders:
+                continue
+            if not self._gg_list_tifs(d):
+                QMessageBox.warning(self, "Unisci set di time-slice",
+                                    "Nessuna GeoTIFF in:\n" + d)
+                continue
+            folders.append(d)
+            start = os.path.dirname(d)
+            if len(folders) >= 2:
+                if QMessageBox.question(
+                    self, "Unisci set di time-slice",
+                    "Aggiungere un'altra cartella?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                ) != QMessageBox.Yes:
+                    break
+        if len(folders) < 2:
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Unisci set di time-slice")
+        fl = QFormLayout(dlg)
+        chk_em = QCheckBox("Edge-match sulla giunzione (pareggia la media)")
+        chk_em.setChecked(True)
+        cb_axis = QComboBox()
+        cb_axis.addItem("Affiancate lungo X (bordo verticale)", "x")
+        cb_axis.addItem("Impilate lungo Y (bordo orizzontale)", "y")
+        sp_ov = QSpinBox(); sp_ov.setRange(1, 999); sp_ov.setValue(3)
+        cb_overlap = QComboBox()
+        for lbl, val in (("Media", "mean"), ("Prima griglia", "first"), ("Ultima griglia", "last")):
+            cb_overlap.addItem(lbl, val)
+        le_suffix = QLineEdit("merged")
+        fl.addRow(chk_em)
+        fl.addRow("Asse giunzione (edge-match):", cb_axis)
+        fl.addRow("Celle di sovrapposizione:", sp_ov)
+        fl.addRow("Celle coperte da piu' griglie:", cb_overlap)
+        fl.addRow("Suffisso cartella output:", le_suffix)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        fl.addRow(bb)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        do_em = bool(chk_em.isChecked())
+        em_axis = cb_axis.currentData()
+        em_ov = int(sp_ov.value())
+        overlap = cb_overlap.currentData()
+        suffix = "".join(c if c.isalnum() or c in "_-" else "_"
+                         for c in str(le_suffix.text()).strip()).strip("_") or "merged"
+        out_dir = os.path.normpath(folders[0]).rstrip("\\/") + "_" + suffix
+        os.makedirs(out_dir, exist_ok=True)
+
+        # indicizza ogni cartella per chiave z (manifesto se c'e', altrimenti
+        # posizione ordinata dei file)
+        manifests = [self._gg_read_manifest(f) for f in folders]
+        per_folder = []           # list[dict[zkey] -> (tif_path, z_from, z_to, z_center)]
+        for f, man in zip(folders, manifests):
+            tifs = self._gg_list_tifs(f)
+            entries = {}
+            if man and isinstance(man.get("slices"), list) and len(man["slices"]) == len(tifs):
+                for s in man["slices"]:
+                    gp = os.path.join(f, str(s.get("grid", "")))
+                    if not os.path.isfile(gp):
+                        entries = {}
+                        break
+                    zc = round(float(s.get("z_center", 0.0)), 4)
+                    entries[zc] = (gp, float(s.get("z_from", zc)),
+                                   float(s.get("z_to", zc)), float(s.get("z_center", zc)))
+            if not entries:
+                for i, gp in enumerate(tifs):
+                    entries[float(i)] = (gp, float(i), float(i), float(i))
+            per_folder.append(entries)
+
+        all_keys = sorted(set().union(*[set(d.keys()) for d in per_folder]))
+        if not all_keys:
+            QMessageBox.warning(self, "Unisci set di time-slice", "Nessuna slice da unire.")
+            return
+
+        from PyQt5.QtWidgets import QProgressDialog
+        from PyQt5.QtCore import Qt as _Qt
+        prog = QProgressDialog("Unione time-slice...", "Annulla", 0, len(all_keys), self)
+        prog.setWindowModality(_Qt.WindowModal)
+        prog.setMinimumDuration(0)
+
+        epsg_out = 0
+        for man in manifests:
+            if man and man.get("crs_epsg"):
+                epsg_out = int(man["crs_epsg"]); break
+
+        out_slices = []
+        n_ok, errors = 0, []
+        ext_xmin = ext_ymin = ext_xmax = ext_ymax = None
+        for i, zk in enumerate(all_keys):
+            if prog.wasCanceled():
+                break
+            try:
+                grids, meta = [], None
+                for entries in per_folder:
+                    if zk not in entries:
+                        continue
+                    gp, zf, zt, zc = entries[zk]
+                    arr, x_min, y_min, y_max, res, epsg = read_tif_singleband(gp)
+                    grids.append({"array": arr, "x0": x_min, "y0": y_min, "cell": res})
+                    if meta is None:
+                        meta = (zf, zt, zc)
+                    if not epsg_out and epsg:
+                        epsg_out = int(epsg)
+                if not grids:
+                    continue
+                if do_em and len(grids) >= 2:
+                    base = grids[0]
+                    for k in range(1, len(grids)):
+                        grids[k] = gg.edge_match(base, grids[k], axis=em_axis,
+                                                 overlap_cells=em_ov)
+                merged = grids[0] if len(grids) == 1 else gg.append_grids(grids, overlap=overlap)
+                arr = merged["array"]
+                x0, y0, cell = float(merged["x0"]), float(merged["y0"]), float(merged["cell"])
+                n_y, n_x = arr.shape
+                y_top = y0 + (n_y - 1) * cell
+                x_right = x0 + (n_x - 1) * cell
+                name = "slice_%04d.tif" % i
+                out_path = os.path.join(out_dir, name)
+                write_tif_singleband(arr, out_path, x0, y0, y_top, cell, epsg_out or 0)
+                try:
+                    write_qml_singleband(out_path, arr)
+                except Exception:
+                    pass
+                zf, zt, zc = meta if meta else (float(i), float(i), float(i))
+                out_slices.append({
+                    "index": i, "z_from": zf, "z_to": zt, "z_center": zc,
+                    "grid": name, "stats": sm.compute_slice_stats(arr),
+                })
+                hw = cell / 2.0
+                ext_xmin = (x0 - hw) if ext_xmin is None else min(ext_xmin, x0 - hw)
+                ext_ymin = (y0 - hw) if ext_ymin is None else min(ext_ymin, y0 - hw)
+                ext_xmax = (x_right + hw) if ext_xmax is None else max(ext_xmax, x_right + hw)
+                ext_ymax = (y_top + hw) if ext_ymax is None else max(ext_ymax, y_top + hw)
+                n_ok += 1
+            except Exception as e:
+                errors.append("z=%s: %s" % (zk, e))
+            prog.setValue(i + 1)
+        prog.setValue(len(all_keys))
+
+        # manifesto unito (se almeno una sorgente ne aveva uno)
+        base_man = next((m for m in manifests if m), None)
+        if base_man is not None and out_slices:
+            merged_man = dict(base_man)
+            merged_man["slices"] = out_slices
+            merged_man["extent"] = [ext_xmin, ext_ymin, ext_xmax, ext_ymax]
+            if epsg_out:
+                merged_man["crs_epsg"] = int(epsg_out)
+            src = dict(merged_man.get("source") or {})
+            src["merged_from"] = [os.path.basename(f) for f in folders]
+            merged_man["source"] = src
+            try:
+                with open(os.path.join(out_dir, "sliceset.json"), "w", encoding="utf-8") as f:
+                    json.dump(merged_man, f, indent=2, ensure_ascii=True, sort_keys=True)
+            except Exception:
+                pass
+
+        if n_ok:
+            msg = "%d/%d slice unite in\n%s" % (n_ok, len(all_keys), out_dir)
+            if errors:
+                msg += "\n\nErrori:\n" + "\n".join(errors[:5])
+            QMessageBox.information(self, "Unisci set di time-slice", msg)
+            self._gg_repoint_slice_view(out_dir)
+        else:
+            QMessageBox.warning(self, "Unisci set di time-slice",
+                                "Nessuna slice unita.\n" + "\n".join(errors[:5]))
+
+    def _rotate_translate_timeslice_set(self):
+        """Ruota/trasla ogni GeoTIFF di un set via
+        ``grid_geometry.rotate_translate`` e scrive un nuovo set ``_rt``."""
+        try:
+            from .raster_io import read_tif_singleband, write_tif_singleband, write_qml_singleband
+            from . import grid_geometry as gg
+            from . import slice_manifest as sm
+        except Exception as exc:
+            QMessageBox.critical(self, "Ruota/trasla set", f"Modulo non disponibile:\n{exc}")
+            return
+
+        folder = QFileDialog.getExistingDirectory(
+            self, "Cartella time-slice (GeoTIFF) da ruotare/traslare",
+            self._gg_slice_start_dir()
+        )
+        if not folder:
+            return
+        tifs = self._gg_list_tifs(folder)
+        if not tifs:
+            QMessageBox.warning(self, "Ruota/trasla set",
+                                "Nessuna GeoTIFF nella cartella selezionata.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Ruota/trasla set di time-slice")
+        fl = QFormLayout(dlg)
+        sp_ang = QDoubleSpinBox(); sp_ang.setRange(-360.0, 360.0); sp_ang.setDecimals(4)
+        sp_ang.setValue(0.0); sp_ang.setSuffix(" ° CCW")
+        sp_e = QDoubleSpinBox(); sp_e.setRange(-1e9, 1e9); sp_e.setDecimals(3); sp_e.setValue(0.0)
+        sp_n = QDoubleSpinBox(); sp_n.setRange(-1e9, 1e9); sp_n.setDecimals(3); sp_n.setValue(0.0)
+        cb_mode = QComboBox()
+        cb_mode.addItem("Angolo SW sorgente -> origine (fix_origin)", "fix_origin")
+        cb_mode.addItem("Angolo SW inviluppo ruotato -> origine (translate_origin)",
+                        "translate_origin")
+        le_suffix = QLineEdit("rt")
+        fl.addRow("Angolo:", sp_ang)
+        fl.addRow("Origine E:", sp_e)
+        fl.addRow("Origine N:", sp_n)
+        fl.addRow("Modo:", cb_mode)
+        fl.addRow("Suffisso cartella output:", le_suffix)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        fl.addRow(bb)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        angle = float(sp_ang.value())
+        origin = (float(sp_e.value()), float(sp_n.value()))
+        mode = cb_mode.currentData()
+        suffix = "".join(c if c.isalnum() or c in "_-" else "_"
+                         for c in str(le_suffix.text()).strip()).strip("_") or "rt"
+        out_dir = os.path.normpath(folder).rstrip("\\/") + "_" + suffix
+        os.makedirs(out_dir, exist_ok=True)
+
+        man = self._gg_read_manifest(folder)
+        stats_by_name = {}
+
+        from PyQt5.QtWidgets import QProgressDialog
+        from PyQt5.QtCore import Qt as _Qt
+        prog = QProgressDialog("Rototraslazione time-slice...", "Annulla", 0, len(tifs), self)
+        prog.setWindowModality(_Qt.WindowModal)
+        prog.setMinimumDuration(0)
+
+        n_ok, errors = 0, []
+        ext_xmin = ext_ymin = ext_xmax = ext_ymax = None
+        for i, tif in enumerate(tifs):
+            if prog.wasCanceled():
+                break
+            try:
+                arr, x_min, y_min, y_max, res, epsg = read_tif_singleband(tif)
+                res_g = gg.rotate_translate(
+                    {"array": arr, "x0": x_min, "y0": y_min, "cell": res},
+                    angle, origin, mode=mode,
+                )
+                oarr = res_g["array"]
+                x0, y0, cell = float(res_g["x0"]), float(res_g["y0"]), float(res_g["cell"])
+                n_y, n_x = oarr.shape
+                y_top = y0 + (n_y - 1) * cell
+                x_right = x0 + (n_x - 1) * cell
+                out_path = os.path.join(out_dir, os.path.basename(tif))
+                write_tif_singleband(oarr, out_path, x0, y0, y_top, cell, epsg or 0)
+                try:
+                    write_qml_singleband(out_path, oarr)
+                except Exception:
+                    pass
+                stats_by_name[os.path.basename(tif)] = sm.compute_slice_stats(oarr)
+                hw = cell / 2.0
+                ext_xmin = (x0 - hw) if ext_xmin is None else min(ext_xmin, x0 - hw)
+                ext_ymin = (y0 - hw) if ext_ymin is None else min(ext_ymin, y0 - hw)
+                ext_xmax = (x_right + hw) if ext_xmax is None else max(ext_xmax, x_right + hw)
+                ext_ymax = (y_top + hw) if ext_ymax is None else max(ext_ymax, y_top + hw)
+                n_ok += 1
+            except Exception as e:
+                errors.append("%s: %s" % (os.path.basename(tif), e))
+            prog.setValue(i + 1)
+        prog.setValue(len(tifs))
+
+        if man is not None and n_ok:
+            new_man = dict(man)
+            slices = []
+            for s in (man.get("slices") or []):
+                s2 = dict(s)
+                nm = str(s.get("grid", ""))
+                if nm in stats_by_name:
+                    s2["stats"] = stats_by_name[nm]
+                slices.append(s2)
+            if slices:
+                new_man["slices"] = slices
+            new_man["extent"] = [ext_xmin, ext_ymin, ext_xmax, ext_ymax]
+            src = dict(new_man.get("source") or {})
+            src["rotate_translate"] = {"angle_deg": angle, "origin": list(origin), "mode": mode}
+            new_man["source"] = src
+            try:
+                with open(os.path.join(out_dir, "sliceset.json"), "w", encoding="utf-8") as f:
+                    json.dump(new_man, f, indent=2, ensure_ascii=True, sort_keys=True)
+            except Exception:
+                pass
+
+        if n_ok:
+            msg = "%d/%d slice rototraslate in\n%s" % (n_ok, len(tifs), out_dir)
+            if errors:
+                msg += "\n\nErrori:\n" + "\n".join(errors[:5])
+            QMessageBox.information(self, "Ruota/trasla set", msg)
+            self._gg_repoint_slice_view(out_dir)
+        else:
+            QMessageBox.warning(self, "Ruota/trasla set",
+                                "Nessuna slice scritta.\n" + "\n".join(errors[:5]))
 
     # ------------------------------------------------------------------
     # Pannello "Varianti" — elenco delle varianti processate su disco
