@@ -11,12 +11,41 @@ from navigation import (
     interval_markers,
     field_markers,
     gps_trace_markers,
+    build_markers,
     dead_reckon_along,
     dead_reckon_coords,
     reverse_along,
     stagger_shift,
     line_plan_coords,
 )
+
+
+class BuildMarkersTest(unittest.TestCase):
+    def test_uniform_returns_empty(self):
+        ms, leftover = build_markers("uniform", 100, 10.0)
+        self.assertEqual(ms, [])
+        self.assertEqual(leftover, 0)
+
+    def test_interval_explicit_step_and_leftover(self):
+        ms, leftover = build_markers("interval", 25, 10.0, scans_per_mark=10)
+        self.assertEqual([m.trace_idx for m in ms], [0, 10, 20])
+        self.assertEqual(leftover, 4)             # scan 21..24 oltre l'ultimo marker
+        self.assertTrue(all(m.kind == "interval" for m in ms))
+
+    def test_interval_auto_step_about_one_per_metre(self):
+        ms, _ = build_markers("interval", 201, 10.0)   # ~20 scan/m -> step ~20
+        self.assertGreaterEqual(len(ms), 10)
+        self.assertLessEqual(len(ms), 12)
+
+    def test_artificial_explicit_count(self):
+        ms, leftover = build_markers("artificial", 100, 5.0, n_marks=6)
+        self.assertEqual(len(ms), 6)
+        self.assertEqual(leftover, 0)
+        self.assertAlmostEqual(ms[0].pos_m, 0.0)
+        self.assertAlmostEqual(ms[-1].pos_m, 5.0)
+
+    def test_unknown_mode_falls_back_to_empty(self):
+        self.assertEqual(build_markers("bogus", 10, 1.0), ([], 0))
 
 
 class MarkerModelTest(unittest.TestCase):

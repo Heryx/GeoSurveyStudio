@@ -20,11 +20,22 @@ import types
 import numpy as np
 
 # Stub leggero dei moduli Qt non disponibili nell'ambiente di test.
-for mod_name in [
+_stub_mods = [
     "qgis", "qgis.PyQt", "qgis.PyQt.QtCore", "qgis.PyQt.QtWidgets",
-    "matplotlib", "matplotlib.backends", "matplotlib.backends.backend_qt5agg",
-    "matplotlib.figure",
-]:
+]
+# matplotlib va stubbato SOLO se non installato davvero: stubbarlo comunque
+# inquinerebbe gli altri moduli di test che usano il vero matplotlib.
+try:
+    import matplotlib  # noqa: F401
+    import matplotlib.figure  # noqa: F401
+    _HAVE_REAL_MPL = True
+except Exception:
+    _HAVE_REAL_MPL = False
+    _stub_mods += [
+        "matplotlib", "matplotlib.backends",
+        "matplotlib.backends.backend_qt5agg", "matplotlib.figure",
+    ]
+for mod_name in _stub_mods:
     if mod_name not in sys.modules:
         sys.modules[mod_name] = types.ModuleType(mod_name)
 
@@ -43,13 +54,14 @@ for cls in ["QDialog", "QVBoxLayout", "QHBoxLayout", "QGridLayout", "QFormLayout
         "__init__": lambda self, *a, **kw: None,
     }))
 
-mpl_mods = {
-    "matplotlib.backends.backend_qt5agg": ["FigureCanvasQTAgg"],
-    "matplotlib.figure": ["Figure"],
-}
-for mod, attrs in mpl_mods.items():
-    for attr in attrs:
-        setattr(sys.modules[mod], attr, None)
+if not _HAVE_REAL_MPL:
+    mpl_mods = {
+        "matplotlib.backends.backend_qt5agg": ["FigureCanvasQTAgg"],
+        "matplotlib.figure": ["Figure"],
+    }
+    for mod, attrs in mpl_mods.items():
+        for attr in attrs:
+            setattr(sys.modules[mod], attr, None)
 
 # Importa il modulo reale (senza UI Qt)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -351,6 +363,29 @@ class TestComputePositions(unittest.TestCase):
                         length_m=10.0, use_real_length=False, reversed_=False,
                         elev_mode="file", elev_ref=ref, elev_ref_kind="trace")
         np.testing.assert_allclose(z, np.linspace(0.0, 100.0, 11))
+
+    def test_markers_drive_dead_reckoning(self):
+        cp = self._fn()
+        from navigation import interval_markers
+        # 21 scan, marker ogni 10 scan a 0/1/2 m -> dead-reckoning lineare,
+        # gli scan 21..20 (nessuno) e la coda oltre l'ultimo marker restano
+        # a 2 m (estrapolazione costante).
+        ms, _ = interval_markers(21, 10, unit_m=1.0)
+        e, _, _, _ = cp(21, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+                        length_m=10.0, use_real_length=False, reversed_=False,
+                        markers=ms)
+        # marker: scan0->0m, scan10->1m, scan20->2m  (frac = along/span)
+        self.assertAlmostEqual(float(e[0]), 0.0, places=6)
+        self.assertAlmostEqual(float(e[10]), 1.0, places=6)
+        self.assertAlmostEqual(float(e[20]), 2.0, places=6)
+
+    def test_markers_none_matches_uniform(self):
+        cp = self._fn()
+        a = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+               length_m=10.0, use_real_length=False, reversed_=False, markers=None)
+        b = cp(11, 0.0, 10.0, 0.0, 5.0, "X", 0.0, grid_span_m=10.0,
+               length_m=10.0, use_real_length=False, reversed_=False)
+        np.testing.assert_allclose(a[0], b[0])
 
     def test_parse_elev_file_mixed_separators(self, ):
         import tempfile, os as _os

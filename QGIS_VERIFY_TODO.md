@@ -77,3 +77,27 @@ GPS). Nel gruppo **Navigazione** c'è ora "Quota per traccia".
    interpretazione colonna devono risultare **ripristinati**.
 5. Verifica d'uso: con le quote assegnate, la **Migrazione Kirchhoff
    topografica** (passo 4) deve usarle senza bisogno del `.gec`.
+
+---
+
+## Passo 9 — Modi marker + overlay nel Posizionamento Manuale (commit da pushare)
+
+Stesso dialog, gruppo **Navigazione** → "Modo posizionamento", e nuovo pannello
+a destra **"Radargramma + marker (profilo selezionato)"**.
+
+1. Selezionare una riga nella tabella profili: il pannello mostra il
+   radargramma di quel profilo (canale 0, scala di grigi).
+2. **Uniforme (griglia)** (default): nessun marker disegnato; il calcolo è
+   `linspace` come prima → risultato identico all'attuale.
+3. **Interval marker (passo scan fisso):** impostare "Scan per marker"
+   (0 = automatico, ~1/metro). **Atteso:** linee verticali rosse sui marker;
+   titolo/etichetta indicano quanti marker e quanti scan di **coda** oltre
+   l'ultimo marker vengono scartati ("sbordo"). Le coordinate delle tracce
+   vengono da dead‑reckoning fra i marker.
+4. **Artificial marker (N equidistanti):** impostare "N marker". **Atteso:**
+   N linee equidistanti; senza calibrazione ruota il risultato numerico è
+   ~uguale all'uniforme (è la conferma attesa, non un bug).
+5. Cambiare selezione / modo / parametro deve aggiornare subito il disegno.
+6. Riaprire il dialog: modo e parametro devono risultare **ripristinati**.
+7. Con `matplotlib` assente il pannello mostra un testo di fallback, il resto
+   del dialog funziona.

@@ -3262,6 +3262,14 @@ class GprProfileViewer(QMainWindow):
                         k = dlg._cb_elev_kind.findData(str(nav.get("elev_ref_kind", "x") or "x"))
                         if k >= 0:
                             dlg._cb_elev_kind.setCurrentIndex(k)
+                    if hasattr(dlg, "_cb_pos_mode"):
+                        pm = dlg._cb_pos_mode.findData(str(nav.get("pos_mode", "uniform") or "uniform"))
+                        if pm >= 0:
+                            dlg._cb_pos_mode.setCurrentIndex(pm)
+                        try:
+                            dlg._spin_pos_param.setValue(int(nav.get("pos_param", 0) or 0))
+                        except (TypeError, ValueError):
+                            pass
 
                 # Ripristina lo stato per-profilo (verso zig-zag, asse, offset,
                 # nome, lunghezza) salvato in precedenza — altrimenti si perde

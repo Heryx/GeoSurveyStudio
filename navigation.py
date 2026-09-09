@@ -123,6 +123,43 @@ def gps_trace_markers(rows) -> list[Marker]:
     return out
 
 
+POSITIONING_MODES = ("uniform", "interval", "artificial")
+
+
+def build_markers(
+    mode: str,
+    n_traces: int,
+    length_m: float,
+    *,
+    scans_per_mark: int | None = None,
+    n_marks: int | None = None,
+    field_indices=None,
+) -> "tuple[list[Marker], int]":
+    """Dispatcher UI-friendly per i modi di posizionamento.
+
+    - ``"uniform"``    → ``[]`` (nessun marker: il chiamante usa ``linspace``);
+    - ``"interval"``   → :func:`interval_markers` (passo ``scans_per_mark``);
+    - ``"artificial"`` → :func:`artificial_markers` (``n_marks`` equidistanti);
+    - ``"field"``      → :func:`field_markers` (indici scan noti).
+
+    Ritorna ``(markers, leftover)``; ``leftover`` (scan oltre l'ultimo marker,
+    la coda "sbordata") è > 0 solo per ``"interval"``.
+    """
+    m = str(mode or "uniform").lower()
+    n = int(n_traces)
+    L = float(length_m)
+    if m == "interval":
+        step = int(scans_per_mark) if scans_per_mark else 0
+        if step <= 0 and n >= 2 and L > 0.0:
+            step = max(1, int(round((n - 1) / max(L, 1e-9))))  # ~1 marker/metro
+        return interval_markers(n, max(1, step), unit_m=1.0)
+    if m == "artificial":
+        return artificial_markers(n, L, n_marks=n_marks), 0
+    if m == "field":
+        return field_markers(field_indices, length_m=L), 0
+    return [], 0
+
+
 # ---------------------------------------------------------------------------
 # dead-reckoning
 # ---------------------------------------------------------------------------

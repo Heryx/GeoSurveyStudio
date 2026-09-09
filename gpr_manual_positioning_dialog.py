@@ -41,9 +41,9 @@ except ImportError:
     HAS_MPL = False
 
 try:  # navigazione: primitive marker / dead-reckoning / stagger
-    from .navigation import reverse_along, stagger_shift
+    from .navigation import reverse_along, stagger_shift, dead_reckon_along, build_markers
 except ImportError:  # pragma: no cover
-    from navigation import reverse_along, stagger_shift
+    from navigation import reverse_along, stagger_shift, dead_reckon_along, build_markers
 
 
 def compute_positions(
@@ -62,6 +62,7 @@ def compute_positions(
     z_start: float = 0.0, z_end: float = 0.0,
     elev_ref: "np.ndarray | list | None" = None,
     elev_ref_kind: str = "x",
+    markers: "list | None" = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Calcola E/N/distanza cumulativa/quota per gli scan di un profilo.
 
@@ -77,6 +78,9 @@ def compute_positions(
       (interpola ``elev_ref``, array Nx2, contro la posizione lungo linea in
       metri se ``elev_ref_kind == "x"`` o contro l'indice di traccia se
       ``"trace"``).
+    - ``markers``         : se dato (lista di ``navigation.Marker`` con
+      ``pos_m``), le ascisse degli scan vengono da ``dead_reckon_along`` invece
+      che da ``linspace`` — dead-reckoning fra marker (modi interval/artificial).
 
     Ritorna ``(east, north, dist, elev)`` (array lunghi ``n_traces``).
     """
@@ -88,7 +92,12 @@ def compute_positions(
     span = float(grid_span_m) if float(grid_span_m) > 1e-9 else 1.0
     L = float(length_m) if (use_real_length and float(length_m) > 1e-9) else span
     # ascissa metrica lungo la linea, 0..L
-    along = np.linspace(0.0, L, n_t, dtype=np.float64)
+    if markers:
+        along = np.asarray(dead_reckon_along(markers, n_t), dtype=np.float64)
+        if not np.isfinite(along).all():
+            along = np.linspace(0.0, L, n_t, dtype=np.float64)
+    else:
+        along = np.linspace(0.0, L, n_t, dtype=np.float64)
     if reversed_:
         along = reverse_along(along, L)
     frac = np.clip(along / span, 0.0, 1.0)
@@ -186,10 +195,14 @@ class GprManualPositioningDialog(QDialog):
         # dict(prof=prof, orig_name=str, name=str, axis="X"|"Y", offset=float, reversed=bool, n_traces=int, length=float)
         self._profile_items = self._init_profile_items()
 
+        self._mk_data_cache: dict[int, np.ndarray] = {}
+
         self._build_ui()
         self._recalculate_spacing(auto_detect_dims=True)
         self._update_table_from_items()
         self._draw_preview()
+        self._on_pos_mode_changed()
+        self._draw_marker_preview()
 
     def _init_profile_items(self) -> list[dict]:
         items = []
@@ -349,6 +362,36 @@ class GprManualPositioningDialog(QDialog):
         self._spin_stagger.valueChanged.connect(self._on_nav_changed)
         nav_form.addRow("Stagger (linee invertite):", self._spin_stagger)
 
+        # --- Modo posizionamento tracce (uniforme / marker + dead-reckoning) ---
+        self._cb_pos_mode = QComboBox()
+        self._cb_pos_mode.addItem("Uniforme (griglia)", "uniform")
+        self._cb_pos_mode.addItem("Interval marker (passo scan fisso)", "interval")
+        self._cb_pos_mode.addItem("Artificial marker (N equidistanti)", "artificial")
+        self._cb_pos_mode.setToolTip(
+            "Uniforme: tracce spalmate uniformemente sulla lunghezza (assume\n"
+            "nessuno slittamento). Interval: un marker ogni N scan, la coda oltre\n"
+            "l'ultimo marker viene scartata (recupero acquisizioni 'sbordate').\n"
+            "Artificial: N marker equidistanti (≈ uniforme senza calibrazione ruota)."
+        )
+        self._cb_pos_mode.currentIndexChanged.connect(self._on_pos_mode_changed)
+        nav_form.addRow("Modo posizionamento:", self._cb_pos_mode)
+
+        self._spin_pos_param = QSpinBox()
+        self._spin_pos_param.setRange(0, 10_000_000)
+        self._spin_pos_param.setValue(0)
+        self._spin_pos_param.setToolTip(
+            "Interval: scan per marker (0 = automatico, ~1 marker/metro).\n"
+            "Artificial: numero di marker (0 = automatico, ~1/metro)."
+        )
+        self._spin_pos_param.valueChanged.connect(self._on_nav_changed)
+        self._lbl_pos_param = QLabel("Passo scan / N marker:")
+        nav_form.addRow(self._lbl_pos_param, self._spin_pos_param)
+
+        self._lbl_pos_info = QLabel("")
+        self._lbl_pos_info.setStyleSheet("color: #666;")
+        self._lbl_pos_info.setWordWrap(True)
+        nav_form.addRow("", self._lbl_pos_info)
+
         # --- Quota per traccia (per migrazione topografica / correzione statica) ---
         self._cb_elev_mode = QComboBox()
         self._cb_elev_mode.addItem("Nessuna quota", "none")
@@ -442,6 +485,7 @@ class GprManualPositioningDialog(QDialog):
         self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.itemChanged.connect(self._on_table_item_changed)
+        self._table.itemSelectionChanged.connect(self._draw_marker_preview)
         tbl_layout.addWidget(self._table)
 
         left_layout.addWidget(grp_table)
@@ -458,7 +502,7 @@ class GprManualPositioningDialog(QDialog):
         prev_layout = QVBoxLayout(grp_preview)
 
         if HAS_MPL:
-            self._fig = Figure(figsize=(5, 5), dpi=100)
+            self._fig = Figure(figsize=(5, 4), dpi=100)
             self._canvas_mpl = FigureCanvasQTAgg(self._fig)
             self._ax = self._fig.add_subplot(111)
             prev_layout.addWidget(self._canvas_mpl)
@@ -469,6 +513,21 @@ class GprManualPositioningDialog(QDialog):
             prev_layout.addWidget(lbl_no_mpl)
 
         right_layout.addWidget(grp_preview)
+
+        grp_marker = QGroupBox("Radargramma + marker (profilo selezionato)")
+        mk_layout = QVBoxLayout(grp_marker)
+        if HAS_MPL:
+            self._fig_mk = Figure(figsize=(5, 2.6), dpi=100)
+            self._canvas_mk = FigureCanvasQTAgg(self._fig_mk)
+            self._ax_mk = self._fig_mk.add_subplot(111)
+            mk_layout.addWidget(self._canvas_mk)
+        else:
+            self._fig_mk = None
+            self._canvas_mk = None
+            self._ax_mk = None
+            mk_layout.addWidget(QLabel("Anteprima non disponibile (matplotlib mancante)."))
+        right_layout.addWidget(grp_marker)
+
         splitter.addWidget(right_widget)
 
         splitter.setStretchFactor(0, 3)
@@ -663,6 +722,139 @@ class GprManualPositioningDialog(QDialog):
     def _on_nav_changed(self, *_a):
         self._update_table_from_items()
         self._draw_preview()
+        self._draw_marker_preview()
+
+    # ------------------------------------------------------------------
+    # Modo posizionamento (marker + dead-reckoning) e anteprima radargramma
+    # ------------------------------------------------------------------
+
+    def _pos_mode(self) -> str:
+        cb = getattr(self, "_cb_pos_mode", None)
+        return str(cb.currentData()) if cb is not None else "uniform"
+
+    def _on_pos_mode_changed(self, *_a):
+        lbl = getattr(self, "_lbl_pos_param", None)
+        spin = getattr(self, "_spin_pos_param", None)
+        if lbl is None or spin is None:
+            return
+        mode = self._pos_mode()
+        show_param = mode in ("interval", "artificial")
+        lbl.setVisible(show_param)
+        spin.setVisible(show_param)
+        if mode == "interval":
+            lbl.setText("Scan per marker (0 = auto):")
+        elif mode == "artificial":
+            lbl.setText("N marker (0 = auto):")
+        if getattr(self, "_table", None) is not None:
+            self._on_nav_changed()
+
+    def _markers_for_item(self, it: dict):
+        """(markers, leftover) per un profilo dato il modo posizionamento
+        corrente. ``length_m`` è la lunghezza effettiva usata da compute_positions."""
+        mode = self._pos_mode()
+        if mode == "uniform":
+            return [], 0
+        n_t = int(it.get("n_traces", 0) or 0)
+        use_real = bool(getattr(self, "_chk_real_length", None) and self._chk_real_length.isChecked())
+        span = abs(float(self._spin_x1.value()) - float(self._spin_x0.value())) \
+            if it.get("axis") == "X" else \
+            abs(float(self._spin_y1.value()) - float(self._spin_y0.value()))
+        span = span if span > 1e-9 else 1.0
+        L = float(it.get("length", span) or span) if (use_real and float(it.get("length", 0.0) or 0.0) > 1e-9) else span
+        p = int(self._spin_pos_param.value())
+        return build_markers(
+            mode, n_t, L,
+            scans_per_mark=(p or None) if mode == "interval" else None,
+            n_marks=(p or None) if mode == "artificial" else None,
+        )
+
+    def _selected_profile_index(self) -> int:
+        tbl = getattr(self, "_table", None)
+        if tbl is None:
+            return 0
+        rows = sorted({ix.row() for ix in tbl.selectedIndexes()})
+        if rows and 0 <= rows[0] < len(self._profile_items):
+            return rows[0]
+        return 0
+
+    def _marker_radargram_data(self, prof_idx: int):
+        """Radargramma (canale 0) del profilo, sottocampionato e in cache."""
+        if prof_idx in self._mk_data_cache:
+            return self._mk_data_cache[prof_idx]
+        try:
+            from .radargram_render import downsample_radargram
+        except ImportError:  # pragma: no cover
+            from radargram_render import downsample_radargram
+        arr = None
+        try:
+            prof = self._profiles[prof_idx]
+            chans = getattr(prof, "channels", None) or []
+            if chans and getattr(chans[0], "data", None) is not None:
+                d = np.asarray(chans[0].data, dtype=np.float32)
+                if d.ndim == 2 and d.size:
+                    arr = downsample_radargram(d)
+        except Exception:
+            arr = None
+        self._mk_data_cache[prof_idx] = arr
+        return arr
+
+    def _draw_marker_preview(self, *_a):
+        ax = getattr(self, "_ax_mk", None)
+        if ax is None or not HAS_MPL:
+            return
+        try:
+            from .radargram_render import draw_radargram
+        except ImportError:  # pragma: no cover
+            from radargram_render import draw_radargram
+
+        idx = self._selected_profile_index()
+        it = self._profile_items[idx] if 0 <= idx < len(self._profile_items) else None
+        ax.clear()
+        if it is None:
+            self._canvas_mk.draw_idle()
+            return
+
+        data = self._marker_radargram_data(idx)
+        n_t = int(it.get("n_traces", 0) or 0)
+        markers, leftover = self._markers_for_item(it)
+        mk_traces = [m.trace_idx for m in markers] if markers else None
+
+        if data is None:
+            ax.text(0.5, 0.5, "Dati radargramma non disponibili",
+                    ha="center", va="center", transform=ax.transAxes, color="#888")
+            ax.set_xticks([]); ax.set_yticks([])
+        else:
+            draw_radargram(
+                ax, data, marker_traces=mk_traces, n_traces_full=n_t or data.shape[1],
+                clear=False,
+            )
+            ax.set_xlabel("Traccia")
+            ax.set_ylabel("Campione")
+            title = f"{it.get('name', '')}  —  {n_t} tracce"
+            if self._pos_mode() != "uniform" and markers is not None:
+                title += f"  |  {len(markers)} marker"
+                if leftover > 0:
+                    title += f", coda {leftover} scan scartati"
+            ax.set_title(title, fontsize=9)
+
+        # riepilogo testuale sotto la combo
+        info = getattr(self, "_lbl_pos_info", None)
+        if info is not None:
+            if self._pos_mode() == "uniform":
+                info.setText("")
+            elif markers:
+                msg = f"{it.get('name','?')}: {len(markers)} marker su {n_t} scan"
+                if leftover > 0:
+                    msg += f"  ·  {leftover} scan oltre l'ultimo marker (scartati nello slicing)"
+                info.setText(msg)
+            else:
+                info.setText("Marker non calcolabili (controlla lunghezza / N tracce).")
+
+        try:
+            self._fig_mk.tight_layout()
+        except Exception:
+            pass
+        self._canvas_mk.draw_idle()
 
     def _elev_mode(self) -> str:
         cb = getattr(self, "_cb_elev_mode", None)
@@ -887,6 +1079,9 @@ class GprManualPositioningDialog(QDialog):
         z_end = float(self._spin_z_end.value())
         elev_ref_kind = str(self._cb_elev_kind.currentData() or "x")
         elev_file = str(self._le_elev_file.text()).strip()
+        pos_mode = self._pos_mode()
+        pos_param = int(self._spin_pos_param.value())
+
         elev_ref = None
         if elev_mode == "file":
             if not elev_file or not os.path.isfile(elev_file):
@@ -917,6 +1112,7 @@ class GprManualPositioningDialog(QDialog):
 
             if n_t > 0:
                 grid_span = (x1 - x0) if axis == "X" else (y1 - y0)
+                markers, _leftover = self._markers_for_item(it)
                 final_e, final_n, final_dist, final_elev = compute_positions(
                     n_t, x0, x1, y0, y1, axis, offset,
                     grid_span_m=grid_span,
@@ -927,6 +1123,7 @@ class GprManualPositioningDialog(QDialog):
                     geo_on=geo_on, e0=e0, n0=n0, az_deg=az_deg,
                     elev_mode=elev_mode, z_start=z_start, z_end=z_end,
                     elev_ref=elev_ref, elev_ref_kind=elev_ref_kind,
+                    markers=markers or None,
                 )
                 for ch in channels:
                     ch.easting = final_e.copy()
@@ -962,6 +1159,8 @@ class GprManualPositioningDialog(QDialog):
                 "z_end": z_end,
                 "elev_file": elev_file,
                 "elev_ref_kind": elev_ref_kind,
+                "pos_mode": pos_mode,
+                "pos_param": pos_param,
             },
             "profiles": configured_records,
         }
