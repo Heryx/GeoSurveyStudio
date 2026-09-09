@@ -4366,6 +4366,119 @@ class GprProfileViewer(QMainWindow):
         }
         return preset
 
+    # ------------------------------------------------------------------
+    # Persistenza dell'INTERO stato di processing nel progetto
+    # ------------------------------------------------------------------
+    def _collect_full_processing_state(self) -> dict:
+        """Ricetta completa della pipeline (parametri per-step + catena +
+        gain + iperbole), serializzabile in ``project.json``."""
+        try:
+            params = dict(self._current_processing_params())
+        except Exception:
+            params = {}
+        # niente array numpy (es. kirchhoff_elev_m: iniettato a runtime)
+        params = {k: v for k, v in params.items() if not isinstance(v, np.ndarray)}
+        try:
+            gain_hyper = self._collect_gain_hyper_preset()
+        except Exception:
+            gain_hyper = {}
+        return {"version": 1, "params": params, "gain_hyper": gain_hyper}
+
+    @staticmethod
+    def _set_widget_value(w, value) -> None:
+        if w is None or value is None:
+            return
+        try:
+            blocker = w.blockSignals(True)
+        except Exception:
+            blocker = None
+        try:
+            if isinstance(w, QComboBox):
+                idx = w.findData(value)
+                if idx < 0:
+                    idx = w.findText(str(value))
+                if idx >= 0:
+                    w.setCurrentIndex(idx)
+            elif isinstance(w, QCheckBox):
+                w.setChecked(bool(value))
+            elif isinstance(w, QSpinBox):
+                w.setValue(int(round(float(value))))
+            elif isinstance(w, QDoubleSpinBox):
+                w.setValue(float(value))
+        except Exception:
+            pass
+        finally:
+            if blocker is not None:
+                try:
+                    w.blockSignals(blocker)
+                except Exception:
+                    pass
+
+    def _apply_processing_widget_params(self, params: dict) -> None:
+        """Reimposta i valori numerici/scelta dei singoli step da un dict
+        piatto (inverso di ``_current_processing_params``). Gli *enable* non
+        vengono toccati qui: li ripristina la catena filtri."""
+        if not isinstance(params, dict) or not params:
+            return
+        # Controlli per-step Fase 1
+        for _sid, store in (getattr(self, "_phase1_controls", {}) or {}).items():
+            for key, w in (store or {}).items():
+                if key in params and self._is_qt_alive(w):
+                    self._set_widget_value(w, params[key])
+        # Step "pipeline" classici
+        mapping = {
+            "dewow_win": getattr(self, "_spin_dewow", None),
+            "tz_method": getattr(self, "_cb_tz_method", None),
+            "tz_mode": getattr(self, "_cb_tz_mode", None),
+            "tz_threshold": getattr(self, "_spin_tz_threshold", None),
+            "tz_backup_nsamp": getattr(self, "_spin_tz_backup", None),
+            "bg_mode": getattr(self, "_cb_bg_mode", None),
+            "bg_method": getattr(self, "_cb_bg_method", None),
+            "bg_window": getattr(self, "_spin_bg_window", None),
+            "bg_sample_start": getattr(self, "_spin_bg_sample_start", None),
+            "bg_sample_end": getattr(self, "_spin_bg_sample_end", None),
+            "mig_velocity_m_s": getattr(self, "_spin_mig_vel", None),
+            "mig_dx_m": getattr(self, "_spin_mig_dx", None),
+            "agc_win": getattr(self, "_spin_agc", None),
+            "agc_max_gain": getattr(self, "_spin_agc_max_gain", None),
+            "agc_sample_start": getattr(self, "_spin_agc_sample_start", None),
+            "bp_low_mhz": getattr(self, "_spin_bp_lo", None),
+            "bp_high_mhz": getattr(self, "_spin_bp_hi", None),
+        }
+        for key, w in mapping.items():
+            if key in params and self._is_qt_alive(w):
+                self._set_widget_value(w, params[key])
+        # taper bandpass: memorizzato come frazione, il widget è in percentuale
+        if "bp_taper_frac" in params and self._is_qt_alive(getattr(self, "_spin_bp_taper", None)):
+            try:
+                self._set_widget_value(self._spin_bp_taper, float(params["bp_taper_frac"]) * 100.0)
+            except Exception:
+                pass
+
+    def _apply_full_processing_state(self, state: dict) -> None:
+        """Ripristina l'intero stato di processing salvato nel progetto e
+        riprocessa una sola volta."""
+        if not isinstance(state, dict):
+            return
+        params = state.get("params") if isinstance(state.get("params"), dict) else {}
+        gain_hyper = state.get("gain_hyper") if isinstance(state.get("gain_hyper"), dict) else {}
+        self._syncing_filter_chain = True
+        try:
+            if gain_hyper:
+                try:
+                    self._apply_gain_hyper_preset(gain_hyper)
+                except Exception as exc:
+                    print(f"[GPR viewer][WARN] ripristino gain/iperbole fallito: {exc}")
+            self._apply_processing_widget_params(params)
+        finally:
+            self._syncing_filter_chain = False
+        try:
+            if self._raw_data is not None:
+                self._apply_processing()
+                self._request_preview_update(immediate=True)
+        except Exception:
+            pass
+
     def _apply_gain_hyper_preset(self, payload: dict):
         if not isinstance(payload, dict):
             raise ValueError("Preset non valido: struttura JSON non riconosciuta.")
@@ -5940,6 +6053,13 @@ class GprProfileViewer(QMainWindow):
             "ui_state": ui_state,
             # Preserve manual grid positioning params across sessions
             "grid_positioning": getattr(self, "_grid_positioning_params", None) or meta.get("grid_positioning"),
+            # Ricetta completa della pipeline: evita di riprocessare da zero a
+            # ogni riapertura del viewer.
+            "processing_state": (
+                self._collect_full_processing_state()
+                if self._is_qt_alive(getattr(self, "_filter_chain_widget", None))
+                else meta.get("processing_state")
+            ),
         }
         try:
             with open(paths["project_json"], "w", encoding="utf-8") as fh:
@@ -6092,6 +6212,12 @@ class GprProfileViewer(QMainWindow):
         self._prof_idx = 0
         self._load_current_profile()
         self._apply_gpr_processing_ui_state(meta.get("ui_state") or {})
+        try:
+            ps = meta.get("processing_state")
+            if isinstance(ps, dict) and ps:
+                self._apply_full_processing_state(ps)
+        except Exception as exc:
+            print(f"[GPR viewer][WARN] ripristino processing_state fallito: {exc}")
         self._update_slice_profile_info()
         try:
             ts_saved = self._path_from_gpr_processing_store(str(meta.get("last_timeslice") or ""))

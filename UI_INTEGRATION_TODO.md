@@ -68,6 +68,12 @@ generati da `_PHASE1_SPECS` / `_build_phase1_step_controls` in
    dello span vengono allineate al lato opposto (x1/y1) invece che rientrate
    dal lato di partenza (zig-zag di un'area rettangolare).
 
+**Fix** — persistenza dello stato di processing: la ricetta completa della
+pipeline (parametri per-step + ordine/enable catena + gain + iperbole) viene
+salvata in `GPR_Processing/project.json` (`processing_state`) e ri-applicata
+all'apertura del progetto, con un solo riprocessamento. Non serve più
+riprocessare tutto da zero a ogni riapertura del Profile Viewer.
+
 3b (dialog CMP semblance) **saltato** su richiesta utente (acquisizioni
 WARR/CMP di nicchia per l'archeologia). Le funzioni `cmp_semblance` /
 `nmo_correction` restano disponibili come API.
