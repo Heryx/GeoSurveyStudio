@@ -429,6 +429,59 @@ class _RangeGainCurveDialog(QDialog):
         self._redraw()
 
 
+class _BlitManager:
+    """Ridisegna solo gli artisti "animati" (cursore, A-scan) senza rifare l'immagine.
+
+    Il ricampionamento del radargramma costa ~100+ ms: farlo a ogni movimento
+    del mouse rende il cursore a scatti.  Dopo ogni draw completo salviamo lo
+    sfondo; il movimento del mouse ripristina lo sfondo e ridisegna solo gli
+    artisti registrati (matplotlib: "blitting").
+    """
+
+    def __init__(self, canvas):
+        self.canvas = canvas
+        self._bg = None
+        self._artists: list = []
+        self._cid = canvas.mpl_connect("draw_event", self._on_draw)
+        # Dopo un resize lo sfondo salvato ha la dimensione sbagliata.
+        canvas.mpl_connect("resize_event", lambda _e: self.invalidate())
+
+    def set_artists(self, artists) -> None:
+        self._artists = []
+        for art in artists:
+            if art is None:
+                continue
+            art.set_animated(True)
+            self._artists.append(art)
+
+    def _draw_animated(self) -> None:
+        fig = self.canvas.figure
+        for art in self._artists:
+            ax = getattr(art, "axes", None)
+            if ax is not None and not ax.get_visible():
+                continue
+            fig.draw_artist(art)
+
+    def _on_draw(self, event) -> None:
+        if event is not None and getattr(event, "canvas", self.canvas) is not self.canvas:
+            return
+        self._bg = self.canvas.copy_from_bbox(self.canvas.figure.bbox)
+        self._draw_animated()
+
+    def update(self) -> None:
+        """Aggiorna gli artisti animati; ripiega su un draw completo se serve."""
+        if self._bg is None:
+            self.canvas.draw_idle()
+            return
+        self.canvas.restore_region(self._bg)
+        self._draw_animated()
+        self.canvas.blit(self.canvas.figure.bbox)
+
+    def invalidate(self) -> None:
+        """Lo sfondo non e' piu' valido (resize, nuovo draw in arrivo)."""
+        self._bg = None
+
+
 class _PreviewSliceWorker(QObject):
     """Esegue compute_timeslice_preview() su un thread separato dalla GUI.
 
@@ -525,6 +578,11 @@ class GprProfileViewer(QMainWindow):
         self._bp_canvas = None
         self._wiggle_trace_idx: Optional[int] = None
         self._wiggle_depth_line = None
+        self._wiggle_raw_line = None
+        self._wiggle_fil_line = None
+        self._blit: Optional[_BlitManager] = None
+        self._im_key: Optional[tuple] = None
+        self._display_base_cache: Optional[tuple] = None
         self._fig_slice = None
         self._ax_slice = None
         self._canvas_slice = None
@@ -642,6 +700,35 @@ class GprProfileViewer(QMainWindow):
         except Exception:
             pass
 
+    def _refresh_blit_artists(self) -> None:
+        """Registra gli artisti che cambiano a ogni movimento del cursore."""
+        blit = getattr(self, "_blit", None)
+        if blit is None:
+            return
+        arts = [self._vline, self._hline]
+        if self._wiggle_fil_line is not None and getattr(self, "_ax_wiggle", None) is not None:
+            arts += [
+                self._wiggle_raw_line,
+                self._wiggle_fil_line,
+                self._wiggle_depth_line,
+                self._ax_wiggle.title,
+            ]
+        blit.set_artists(arts)
+
+    def _blit_update(self) -> None:
+        """Aggiorna cursore e A-scan senza ridisegnare il radargramma."""
+        canvas = getattr(self, "_canvas_mpl", None)
+        if not self._is_qt_alive(canvas):
+            return
+        blit = getattr(self, "_blit", None)
+        try:
+            if blit is None:
+                canvas.draw_idle()
+            else:
+                blit.update()
+        except Exception:
+            self._safe_draw_idle(canvas)
+
     def _reset_session_state(self):
         try:
             self._canvas_timer.stop()
@@ -668,6 +755,15 @@ class GprProfileViewer(QMainWindow):
         self._hyper_apex_x = None
         self._hyper_apex_depth = None
         self._wiggle_trace_idx = None
+        self._wiggle_depth_line = None
+        self._wiggle_raw_line = None
+        self._wiggle_fil_line = None
+        self._vline = None
+        self._hline = None
+        self._im = None
+        self._im_key = None
+        self._display_base_cache = None
+        self._refresh_blit_artists()
         self._slice_pan_anchor = None
 
         self._slice_catalog = []
@@ -1036,6 +1132,7 @@ class GprProfileViewer(QMainWindow):
             self._canvas_mpl.mpl_connect("button_press_event",  self._on_mouse_press)
             self._canvas_mpl.mpl_connect("axes_leave_event",    self._on_axes_leave)
             self._canvas_mpl.mpl_connect("scroll_event",        self._on_scroll_zoom)
+            self._blit = _BlitManager(self._canvas_mpl)
 
             left_host = QWidget()
             left_lay = QVBoxLayout(left_host)
@@ -1085,6 +1182,11 @@ class GprProfileViewer(QMainWindow):
         root.addLayout(center)
 
         self._lbl_status = QLabel("Importa un file .ogpr per iniziare.")
+        # Il testo cambia a ogni movimento del mouse: senza questo la larghezza
+        # minima segue il testo, la finestra si allarga/restringe e il canvas
+        # viene ridimensionato (= ridisegnato per intero) a ogni movimento.
+        self._lbl_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._lbl_status.setMinimumWidth(0)
         root.addWidget(self._lbl_status)
 
     def _dock_settings(self):
@@ -4943,7 +5045,6 @@ class GprProfileViewer(QMainWindow):
         if proc.ndim != 2 or proc.size <= 0:
             return None
 
-        proc_disp = proc.astype(np.float32, copy=True)
         # The range-gain is applied inside the pipeline (pre_agc_gain step) only
         # when the checkbox is currently checked AND the pipeline was actually run
         # with that parameter. We detect this by checking both the current UI state
@@ -4952,11 +5053,24 @@ class GprProfileViewer(QMainWindow):
         chk_rg_on = bool(getattr(self, "_chk_range_gain", None) and self._chk_range_gain.isChecked())
         last_pre_agc = bool(getattr(self, "_last_pipeline_params", {}).get("pre_agc_gain", False))
         pre_agc_in_proc = chk_rg_on and last_pre_agc
+        depth_gain = None
         if not pre_agc_in_proc:
             # Apply depth gain as display-only transform BEFORE normalize_display.
-            depth_gain = self._build_depth_range_gain(int(proc_disp.shape[0]))
+            depth_gain = self._build_depth_range_gain(int(proc.shape[0]))
+        gain_key = None if depth_gain is None else np.asarray(depth_gain).tobytes()
+
+        # La normalizzazione (percentile su tutto il radargramma) non dipende dal
+        # gain scalare/manuale, applicati dopo: si riusa finche' non cambiano il
+        # dato processato (identita' dell'array) o il range-gain.
+        cache = self._display_base_cache
+        if cache is not None and cache[0] is self._proc_data and cache[1] == gain_key:
+            base = cache[2]
+        else:
+            proc_disp = proc
             if depth_gain is not None:
-                proc_disp = (proc_disp * depth_gain).astype(np.float32, copy=False)
+                proc_disp = (proc * depth_gain).astype(np.float32, copy=False)
+            base = normalize_display(proc_disp).astype(np.float32, copy=False)
+            self._display_base_cache = (self._proc_data, gain_key, base)
 
         # Normalize to ±1 range first, then apply display gains on top.
         # The scalar gain and manual_gain are applied AFTER normalization so that
@@ -4967,7 +5081,6 @@ class GprProfileViewer(QMainWindow):
         # The burst zone is now attenuated by pre_agc_gain (TVG) before AGC,
         # so the amplitude is already uniform across the full profile here.
         # No special zeroing of the burst zone is needed.
-        base = normalize_display(proc_disp).astype(np.float32, copy=False)
 
         # Scalar display gain (brightness knob).
         gain = float(self._spin_gain.value()) if hasattr(self, "_spin_gain") else 1.0
@@ -5005,7 +5118,8 @@ class GprProfileViewer(QMainWindow):
             except Exception:
                 pass
 
-        return np.clip(disp, -1.0, 1.0).astype(np.float32, copy=False)
+        # `disp` e' sempre un array nuovo (mai `base`): clip in place.
+        return np.clip(disp, -1.0, 1.0, out=disp).astype(np.float32, copy=False)
 
     def _apply_gain_only(self):
         if self._proc_data is None:
@@ -5031,7 +5145,8 @@ class GprProfileViewer(QMainWindow):
             f"gain={gain:.1f}x  "
             f"range_gain={'on' if self._chk_range_gain.isChecked() else 'off'}"
         )
-        self._redraw()
+        if not self._refresh_image_only():
+            self._redraw()
 
     @staticmethod
     def _clamp_axis_limits(
@@ -5304,13 +5419,8 @@ class GprProfileViewer(QMainWindow):
             out[i] = np.interp(uniform, d, disp[i]).astype(np.float32)
         return out
 
-    def _redraw(self):
-        if not HAS_MPL or self._disp_data is None:
-            return
-        prof = self._profiles[self._prof_idx]
-        ch   = prof.channel(self._ch_idx)
-        cmap = self._cb_cmap.currentText()
-
+    def _image_geometry(self, prof) -> tuple[np.ndarray, float, float]:
+        """(asse distanze, dist_max, depth_max) dell'immagine del radargramma."""
         dist_arr = self._display_distance_axis(prof, int(self._disp_data.shape[1]))
         if dist_arr.size and np.isfinite(dist_arr).any():
             dist_max = float(np.nanmax(dist_arr))
@@ -5325,6 +5435,50 @@ class GprProfileViewer(QMainWindow):
         depth_max = depth_base * (n_out / n_orig) if n_orig > 0 else depth_base
         if not np.isfinite(depth_max) or depth_max <= 0:
             depth_max = max(1.0, float(n_out))
+        return dist_arr, dist_max, depth_max
+
+    def _image_key(self, dist_max: float, depth_max: float) -> tuple:
+        """Cio' che, se invariato, permette di aggiornare solo i pixel dell'immagine."""
+        interp = "bilinear"
+        if getattr(self, "_cb_interp", None) is not None:
+            interp = str(self._cb_interp.currentData() or "bilinear")
+        return (
+            tuple(self._disp_data.shape),
+            round(float(dist_max), 9),
+            round(float(depth_max), 9),
+            self._cb_cmap.currentText(),
+            interp,
+        )
+
+    def _refresh_image_only(self) -> bool:
+        """Aggiorna i soli pixel (es. dopo un cambio di gain) senza ricostruire gli assi.
+
+        Restituisce False se la geometria/colormap sono cambiate e serve un
+        `_redraw()` completo.
+        """
+        im = getattr(self, "_im", None)
+        key = getattr(self, "_im_key", None)
+        if (
+            im is None or key is None or not HAS_MPL
+            or self._disp_data is None or not self._profiles
+            or getattr(im, "axes", None) is not self._ax
+        ):
+            return False
+        prof = self._profiles[self._prof_idx]
+        dist_arr, dist_max, depth_max = self._image_geometry(prof)
+        if self._image_key(dist_max, depth_max) != key:
+            return False
+        im.set_data(self._resample_disp_to_uniform_grid(self._disp_data, dist_arr))
+        self._safe_draw_idle(self._canvas_mpl)
+        return True
+
+    def _redraw(self):
+        if not HAS_MPL or self._disp_data is None:
+            return
+        prof = self._profiles[self._prof_idx]
+        ch   = prof.channel(self._ch_idx)
+        cmap = self._cb_cmap.currentText()
+        dist_arr, dist_max, depth_max = self._image_geometry(prof)
 
         # Resample to uniform distance grid so imshow is not geometrically distorted
         # by variable survey speed (non-uniform trace spacing).
@@ -5355,8 +5509,12 @@ class GprProfileViewer(QMainWindow):
             vmin=vmin, vmax=vmax,
             extent=[0, dist_max, depth_max, 0],
             interpolation=interpolation_mode,
+            # Interpolare i dati prima della colormap: stesso risultato visivo
+            # ma ~2.7x piu' veloce a ogni draw (zoom, pan, gain).
+            interpolation_stage="data",
             resample=True,
         )
+        self._im_key = self._image_key(dist_max, depth_max)
         x_full = (0.0, dist_max)
         y_full = (depth_max, 0.0)
         if self._view_xlim is None:
@@ -5402,6 +5560,7 @@ class GprProfileViewer(QMainWindow):
         self._apply_wiggle_visibility_layout()
         self._sync_xpan_slider()
         self._update_wiggle_plot(draw=False, force=True)
+        self._refresh_blit_artists()
         self._profile_view_initialized = True
         self._safe_draw_idle(self._canvas_mpl)
         self._redraw_slice_view()
@@ -5421,6 +5580,20 @@ class GprProfileViewer(QMainWindow):
         if not np.isfinite(depth_max) or depth_max <= 0:
             depth_max = max(1.0, float(n_out))
         return float(depth_max)
+
+    @staticmethod
+    def _nearest_index(sorted_values: np.ndarray, x: float) -> int:
+        """Indice del valore piu' vicino a x in un vettore ordinato crescente."""
+        n = int(sorted_values.size)
+        if n <= 1:
+            return 0
+        i = int(np.searchsorted(sorted_values, x))
+        if i <= 0:
+            return 0
+        if i >= n:
+            return n - 1
+        # searchsorted da' il vicino a destra: scegli il piu' vicino dei due.
+        return i if (sorted_values[i] - x) < (x - sorted_values[i - 1]) else i - 1
 
     def _cursor_metrics(self):
         if (
@@ -5459,11 +5632,10 @@ class GprProfileViewer(QMainWindow):
             distances = np.maximum.accumulate(distances)
 
         depth_max = self._depth_max_display(prof)
-        idx_t = int(np.searchsorted(distances, float(self._cursor_x)))
-        idx_t = int(np.clip(idx_t, 0, max(0, n_tr - 1)))
-        n_s = int(self._disp_data.shape[0])
-        idx_s = int(np.rint((float(self._cursor_z) / max(depth_max, 1e-9)) * max(0, n_s - 1)))
-        idx_s = int(np.clip(idx_s, 0, max(0, n_s - 1)))
+        idx_t = self._nearest_index(distances, float(self._cursor_x))
+        idx_s = self._depth_to_sample_index(float(self._cursor_z), depth_max)
+        if idx_s is None:
+            return None
 
         amp = None
         try:
@@ -5499,6 +5671,36 @@ class GprProfileViewer(QMainWindow):
             "depth_max_m": depth_max,
         }
 
+    def _wiggle_reset_artists(self) -> None:
+        """Dimentica gli artisti dell'A-scan (asse svuotato o dati assenti)."""
+        self._wiggle_trace_idx = None
+        self._wiggle_depth_line = None
+        self._wiggle_raw_line = None
+        self._wiggle_fil_line = None
+        self._refresh_blit_artists()
+
+    def _wiggle_show_empty(self, draw: bool) -> None:
+        axw = self._ax_wiggle
+        axw.clear()
+        axw.set_xticks([])
+        axw.set_yticks([])
+        self._wiggle_reset_artists()
+        if draw:
+            self._safe_draw_idle(self._canvas_mpl)
+
+    @staticmethod
+    def _wiggle_scale(trace: np.ndarray) -> float:
+        """Ampiezza di normalizzazione (99-esimo percentile) di una traccia."""
+        finite = np.isfinite(trace)
+        if not finite.any():
+            return 1.0
+        vals = np.abs(trace[finite])
+        try:
+            scale = float(np.percentile(vals, 99.0))
+        except Exception:
+            scale = float(vals.max())
+        return scale if (np.isfinite(scale) and scale > 1e-9) else 1.0
+
     def _update_wiggle_plot(self, draw: bool = True, force: bool = False):
         if not HAS_MPL or not hasattr(self, "_ax_wiggle"):
             return
@@ -5515,13 +5717,7 @@ class GprProfileViewer(QMainWindow):
             except Exception:
                 pass
         if self._disp_data is None or not self._profiles:
-            axw.clear()
-            axw.set_xticks([])
-            axw.set_yticks([])
-            self._wiggle_trace_idx = None
-            self._wiggle_depth_line = None
-            if draw:
-                self._safe_draw_idle(self._canvas_mpl)
+            self._wiggle_show_empty(draw)
             return
 
         metrics = self._cursor_metrics()
@@ -5537,13 +5733,7 @@ class GprProfileViewer(QMainWindow):
         filt_src = self._proc_data if self._proc_data is not None else self._disp_data
         raw_src = self._raw_data if self._raw_data is not None else filt_src
         if filt_src is None or raw_src is None:
-            axw.clear()
-            axw.set_xticks([])
-            axw.set_yticks([])
-            self._wiggle_trace_idx = None
-            self._wiggle_depth_line = None
-            if draw:
-                self._safe_draw_idle(self._canvas_mpl)
+            self._wiggle_show_empty(draw)
             return
 
         idx_t_f = int(np.clip(idx_t, 0, max(0, int(filt_src.shape[1]) - 1)))
@@ -5551,13 +5741,7 @@ class GprProfileViewer(QMainWindow):
         trace_f = np.asarray(filt_src[:, idx_t_f], dtype=np.float64)
         trace_r = np.asarray(raw_src[:, idx_t_r], dtype=np.float64)
         if trace_f.size <= 0 or trace_r.size <= 0:
-            axw.clear()
-            axw.set_xticks([])
-            axw.set_yticks([])
-            self._wiggle_trace_idx = None
-            self._wiggle_depth_line = None
-            if draw:
-                self._safe_draw_idle(self._canvas_mpl)
+            self._wiggle_show_empty(draw)
             return
 
         # Align raw to filtered length without distorting waveform:
@@ -5573,81 +5757,80 @@ class GprProfileViewer(QMainWindow):
             trace_r_plot[:n_raw] = trace_r
         trace_f_plot = trace_f[:n]
         depth_axis = np.linspace(0.0, float(depth_max), n, dtype=np.float64)
-        can_incremental = (
-            (not bool(force))
-            and self._wiggle_trace_idx is not None
-            and int(self._wiggle_trace_idx) == int(idx_t)
+        y_line = float(depth_axis[idx_s]) if 0 <= idx_s < depth_axis.size else None
+
+        have_lines = (
+            self._wiggle_raw_line is not None
+            and self._wiggle_fil_line is not None
             and self._wiggle_depth_line is not None
         )
-
-        if can_incremental:
-            if 0 <= idx_s < depth_axis.size:
-                y = float(depth_axis[idx_s])
-                try:
-                    self._wiggle_depth_line.set_ydata([y, y])
-                except Exception:
-                    can_incremental = False
-            if can_incremental and draw:
-                self._safe_draw_idle(self._canvas_mpl)
-            if can_incremental:
-                return
-
-        # Full redraw only when trace index or data changes.
-        axw.clear()
-        finite_fil = np.isfinite(trace_f_plot)
-        finite_raw = np.isfinite(trace_r_plot)
-        scale_fil = 1.0
-        if finite_fil.any():
-            try:
-                scale_fil = float(np.nanpercentile(np.abs(trace_f_plot[finite_fil]), 99.0))
-            except Exception:
-                scale_fil = float(np.nanmax(np.abs(trace_f_plot[finite_fil])))
-        if (not np.isfinite(scale_fil)) or scale_fil <= 1e-9:
-            scale_fil = 1.0
-
-        scale_raw = 1.0
-        if finite_raw.any():
-            try:
-                scale_raw = float(np.nanpercentile(np.abs(trace_r_plot[finite_raw]), 99.0))
-            except Exception:
-                scale_raw = float(np.nanmax(np.abs(trace_r_plot[finite_raw])))
-        if (not np.isfinite(scale_raw)) or scale_raw <= 1e-9:
-            scale_raw = 1.0
+        # Stessa traccia: si sposta solo la linea di profondita'.
+        if (
+            (not force)
+            and have_lines
+            and self._wiggle_trace_idx is not None
+            and int(self._wiggle_trace_idx) == int(idx_t)
+        ):
+            if y_line is not None:
+                self._wiggle_depth_line.set_ydata([y_line, y_line])
+            if draw:
+                self._blit_update()
+            return
 
         # Separate normalization keeps RAW visible/stable across filter toggles.
-        fil_norm = np.nan_to_num(trace_f_plot / scale_fil, nan=0.0, posinf=0.0, neginf=0.0)
-        raw_norm = np.nan_to_num(trace_r_plot / scale_raw, nan=0.0, posinf=0.0, neginf=0.0)
-
-        axw.plot(raw_norm, depth_axis, color="#dc5050", lw=0.9, alpha=0.45, antialiased=True)
-        axw.plot(fil_norm, depth_axis, color="#50dc78", lw=0.9, alpha=0.95, antialiased=True)
-        self._wiggle_depth_line = None
-        if 0 <= idx_s < depth_axis.size:
-            self._wiggle_depth_line = axw.axhline(
-                float(depth_axis[idx_s]),
-                color="goldenrod",
-                lw=0.8,
-                ls="--",
-            )
-        axw.set_ylim(float(depth_max), 0.0)
-        xlim = float(np.nanmax(np.abs(np.r_[raw_norm, fil_norm]))) if raw_norm.size > 0 else 1.0
+        fil_norm = np.nan_to_num(
+            trace_f_plot / self._wiggle_scale(trace_f_plot), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        raw_norm = np.nan_to_num(
+            trace_r_plot / self._wiggle_scale(trace_r_plot), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        xlim = float(np.max(np.abs(np.r_[raw_norm, fil_norm]))) if raw_norm.size > 0 else 1.0
         if (not np.isfinite(xlim)) or xlim <= 0.1:
             xlim = 1.0
         xlim = float(np.clip(xlim * 1.05, 0.5, 5.0))
+
+        if force or not have_lines:
+            # Parte statica (sfondo, zero, spine) + artisti che poi si aggiornano
+            # con set_data: il "clear()" completo a ogni traccia costava molto.
+            axw.clear()
+            axw.set_facecolor("#1a1a1a")
+            axw.axvline(0.0, color="#555555", lw=0.5)
+            axw.set_xticks([])
+            axw.set_yticks([])
+            axw.set_xlabel("")
+            axw.set_ylabel("")
+            axw.grid(False)
+            for spine in axw.spines.values():
+                spine.set_edgecolor("#333333")
+                spine.set_linewidth(0.5)
+            (self._wiggle_raw_line,) = axw.plot(
+                raw_norm, depth_axis, color="#dc5050", lw=0.9, alpha=0.45, antialiased=True
+            )
+            (self._wiggle_fil_line,) = axw.plot(
+                fil_norm, depth_axis, color="#50dc78", lw=0.9, alpha=0.95, antialiased=True
+            )
+            self._wiggle_depth_line = axw.axhline(
+                y_line if y_line is not None else 0.0,
+                color="goldenrod", lw=0.8, ls="--", visible=y_line is not None,
+            )
+            # L'asse Y e' condiviso col radargramma: lo si legge, non lo si
+            # impone (altrimenti azzererebbe lo zoom in profondita').
+            y0, y1 = self._ax.get_ylim()
+            axw.set_ylim(y0, y1)
+            self._refresh_blit_artists()
+        else:
+            self._wiggle_raw_line.set_data(raw_norm, depth_axis)
+            self._wiggle_fil_line.set_data(fil_norm, depth_axis)
+            if y_line is not None:
+                self._wiggle_depth_line.set_ydata([y_line, y_line])
+                self._wiggle_depth_line.set_visible(True)
+            else:
+                self._wiggle_depth_line.set_visible(False)
         axw.set_xlim(-xlim, xlim)
         axw.set_title(f"A-scan T{idx_t}", fontsize=7, pad=2)
-        axw.set_xlabel("")
-        axw.set_ylabel("")
-        axw.set_xticks([])
-        axw.set_yticks([])
-        axw.grid(False)
-        axw.axvline(0.0, color="#555555", lw=0.5)
-        axw.set_facecolor("#1a1a1a")
-        for spine in axw.spines.values():
-            spine.set_edgecolor("#333333")
-            spine.set_linewidth(0.5)
         self._wiggle_trace_idx = int(idx_t)
         if draw:
-            self._safe_draw_idle(self._canvas_mpl)
+            self._blit_update()
 
     # ------------------------------------------------------------------
     # Cursore
@@ -5680,35 +5863,41 @@ class GprProfileViewer(QMainWindow):
             else:
                 self._canvas_mpl.unsetCursor()
 
-    def _sample_from_ydata(self, ydata: float) -> int | None:
-        """Converte la coordinata Y del canvas (profondita') in indice sample."""
-        if self._disp_data is None:
+    def _depth_to_sample_index(self, depth_m: float, depth_max: float | None = None) -> int | None:
+        """Profondita' del canvas (m) -> indice sample nel dato mostrato.
+
+        Unica conversione usata da cursore e pick: usa l'asse di profondita'
+        *visualizzato* (che si accorcia dopo il time-zero), non quello del
+        profilo originale.
+        """
+        if self._disp_data is None or not self._profiles:
             return None
         n_s = int(self._disp_data.shape[0])
         if n_s <= 0:
             return None
-        prof = self._profiles[self._prof_idx] if self._profiles else None
-        if prof is None:
-            return None
+        if depth_max is None:
+            depth_max = self._depth_max_display(self._profiles[self._prof_idx])
         try:
-            depth_max = float(getattr(prof, "depth_m", None) or 0.0)
-            if depth_max <= 0.0:
-                return None
-            # ydata è in metri; convertiamo in indice sample
-            frac = float(ydata) / depth_max
-            idx = int(round(frac * (n_s - 1)))
-            return max(0, min(n_s - 1, idx))
-        except Exception:
+            frac = float(depth_m) / max(float(depth_max), 1e-9)
+        except (TypeError, ValueError):
             return None
+        if not np.isfinite(frac):
+            return None
+        return int(np.clip(int(np.rint(frac * (n_s - 1))), 0, n_s - 1))
+
+    def _sample_from_ydata(self, ydata: float) -> int | None:
+        """Converte la coordinata Y del canvas (profondita') in indice sample."""
+        return self._depth_to_sample_index(ydata)
 
     def _on_mouse_move(self, event):
         if event.inaxes != self._ax or self._disp_data is None:
             return
         self._cursor_x = event.xdata
         self._cursor_z = event.ydata
-        self._update_cursor_lines()
+        self._update_cursor_lines(draw=False)
         self._update_wiggle_plot(draw=False)
         self._update_status()
+        self._blit_update()
         self._canvas_timer.start()
 
     def _on_mouse_press(self, event):
@@ -5728,6 +5917,7 @@ class GprProfileViewer(QMainWindow):
                 return
 
             self._update_wiggle_plot(draw=False)
+            self._blit_update()
             if bool(getattr(event, "dblclick", False)) and bool(self._chk_hyperbola.isChecked()):
                 self._set_hyperbola_apex_from_cursor()
             self._update_dial()
@@ -5773,16 +5963,17 @@ class GprProfileViewer(QMainWindow):
     def _on_axes_leave(self, event):
         if self._vline: self._vline.set_visible(False)
         if self._hline: self._hline.set_visible(False)
-        self._safe_draw_idle(self._canvas_mpl)
+        self._blit_update()
 
-    def _update_cursor_lines(self):
+    def _update_cursor_lines(self, draw: bool = True):
         if self._vline and self._cursor_x is not None:
             self._vline.set_xdata([self._cursor_x])
             self._vline.set_visible(True)
         if self._hline and self._cursor_z is not None:
             self._hline.set_ydata([self._cursor_z])
             self._hline.set_visible(True)
-        self._safe_draw_idle(self._canvas_mpl)
+        if draw:
+            self._blit_update()
 
     def _update_status(self):
         if not self._profiles:
@@ -5858,8 +6049,9 @@ class GprProfileViewer(QMainWindow):
         self._suppress_3d_depth_sync = True
         try:
             self._cursor_z = depth
-            self._update_cursor_lines()
+            self._update_cursor_lines(draw=False)
             self._update_wiggle_plot(draw=False)
+            self._blit_update()
             self._update_status()
             self._update_dial()
             self._emit_cursor_moved()
