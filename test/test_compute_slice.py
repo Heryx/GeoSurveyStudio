@@ -37,7 +37,9 @@ except Exception:
 class ComputeSliceTest(unittest.TestCase):
     def setUp(self):
         self.profiles = _make_profiles()
-        # small, deterministic spec
+        # small, deterministic spec. interp="idw" pins the LEGACY engine these
+        # tests describe (z-levels are window centres); the default "bin" engine
+        # is covered by test_slice_engine.py.
         self.spec = SliceSpec(
             z_min_m=0.0,
             z_max_m=1.2,
@@ -47,6 +49,7 @@ class ComputeSliceTest(unittest.TestCase):
             search_radius_m=0.4,
             blanking_radius_m=0.0,
             smooth_lowpass=0,
+            interp="idw",
         ).resolve(self.profiles)
 
     def test_type_guard(self):

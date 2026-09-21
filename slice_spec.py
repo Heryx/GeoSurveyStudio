@@ -20,12 +20,21 @@ import json
 FORMAT = "rasterlinker_slicespec_v1"
 
 AMPLITUDE_MODES = ("abs_mean", "rms", "env_peak", "signed_mean", "max_abs")
-INTERP_METHODS = ("idw", "kriging")
+# "bin"  = every channel at its own position + binned/normalised-convolution
+#          gridding (slice_engine, the default; no IDW bull's-eyes, fast);
+# "idw"  = the legacy profile-centre-line IDW path (compute_ogpr_slice_grids);
+# "kriging" is reserved and not implemented.
+INTERP_METHODS = ("bin", "idw", "kriging")
 SMOOTH_LOWPASS_VALUES = (0, 3, 5)
+# Level equalisation applied before gridding: "channel" removes the per-channel
+# gain differences of array radars (stripes along the tracks), "profile" only
+# equalises whole swaths, "none" leaves the amplitudes untouched.
+BALANCE_MODES = ("channel", "profile", "none")
 
-# amplitude_mode -> (extraction_mode, use_hilbert) for the OGPR pipeline.
-# rms / max_abs have no dedicated pipeline path yet and fall back to the
-# rectified ("las_like") extraction; this is flagged by resolve() diagnostics.
+# amplitude_mode -> (extraction_mode, use_hilbert) for the LEGACY (idw) OGPR
+# pipeline only; the "bin" engine implements every mode natively.
+# rms / max_abs have no dedicated legacy path and fall back to the rectified
+# ("las_like") extraction.
 _AMPLITUDE_MAP = {
     "abs_mean": ("las_like", False),
     "rms": ("las_like", False),
@@ -49,13 +58,14 @@ class SliceSpec:
     # --- amplitude extraction -----------------------------------------------
     amplitude_mode: str = "abs_mean"
     source_variant: str = "raw"           # pipeline variant id or "raw"
-    velocity_m_s: float = 1.0e8
+    velocity_m_s: float | None = None     # None -> each profile's own velocity
+    balance: str = "channel"              # "channel" | "profile" | "none"
     # --- gridding ---------------------------------------------------------
     resolution_m: float = 0.10
-    interp: str = "idw"
+    interp: str = "bin"
     search_radius_m: float | None = None  # None -> auto from interline spacing
     blanking_radius_m: float = 0.0
-    smooth_lowpass: int = 0               # 0 | 3 | 5 (low-pass kernel size)
+    smooth_lowpass: int = 3               # 0 | 3 | 5 (low-pass kernel size)
     bg_horizontal: bool = False           # rimuove bande orizzontali (media per riga)
     bg_vertical: bool = False             # rimuove bande verticali (media per colonna)
     bg_clip_pct: float = 95.0             # percentile: i target forti non entrano nel background
@@ -72,6 +82,10 @@ class SliceSpec:
             )
         if self.interp not in INTERP_METHODS:
             raise SliceSpecError(f"interp {self.interp!r} not in {INTERP_METHODS}")
+        if self.balance not in BALANCE_MODES:
+            raise SliceSpecError(f"balance {self.balance!r} not in {BALANCE_MODES}")
+        if self.velocity_m_s is not None and not float(self.velocity_m_s) > 0.0:
+            raise SliceSpecError("velocity_m_s must be > 0 or None (auto)")
         if float(self.thickness_m) <= 0.0:
             raise SliceSpecError("thickness_m must be > 0")
         if not (0.0 <= float(self.overlap) <= 0.9):
@@ -112,7 +126,7 @@ class SliceSpec:
 
     def is_resolved(self) -> bool:
         return self.z_max_m is not None and (
-            self.interp != "idw" or self.search_radius_m is not None
+            self.interp not in ("idw", "bin") or self.search_radius_m is not None
         )
 
     # ------------------------------------------------------------------
@@ -143,7 +157,7 @@ class SliceSpec:
                 )
 
         radius = self.search_radius_m
-        if radius is None and self.interp == "idw":
+        if radius is None and self.interp in ("idw", "bin"):
             radius = _auto_interline_radius(profiles)
 
         epsg = self.crs_epsg
@@ -212,6 +226,12 @@ class SliceSpec:
         if fmt is not None and fmt != FORMAT:
             raise SliceSpecError(f"unknown SliceSpec format {fmt!r} (expected {FORMAT})")
         known = {f.name for f in fields(cls)}
+        data = dict(data)
+        if "balance" not in data and data.get("interp") == "idw":
+            # Spec saved before the "bin" engine existed (no "balance" field):
+            # "idw" back then just meant "the default", so move it to the new
+            # default instead of pinning old projects to the dotted IDW result.
+            data["interp"] = "bin"
         spec = cls(**{k: v for k, v in data.items() if k in known})
         spec.validate()
         return spec
@@ -237,6 +257,8 @@ class SliceSpec:
         ex_mode = str(meta.get("extraction_mode", "las_like"))
         use_hil = bool(meta.get("use_hilbert", False))
         amplitude_mode = rev.get((ex_mode, use_hil), "abs_mean")
+        if meta.get("amplitude_mode") in AMPLITUDE_MODES:  # written by slice_engine
+            amplitude_mode = str(meta["amplitude_mode"])
 
         radius = meta.get("radius")
         try:
@@ -251,7 +273,7 @@ class SliceSpec:
             overlap=float(meta.get("overlap_fraction", 0.5) or 0.0),
             amplitude_mode=amplitude_mode,
             resolution_m=float(meta.get("resolution", 0.10) or 0.10),
-            interp="idw",
+            interp=("bin" if meta.get("engine") == "bin" else "idw"),
             search_radius_m=radius,
             blanking_radius_m=float(meta.get("blanking_distance_m", 0.0) or 0.0),
             crs_epsg=(int(crs_epsg) if crs_epsg is not None else None),

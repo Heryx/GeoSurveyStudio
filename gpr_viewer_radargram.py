@@ -396,6 +396,7 @@ class RadargramViewMixin:
         )
         if not self._refresh_image_only():
             self._redraw()
+        self._apply_pending_cursor()
 
     @staticmethod
     def _clamp_axis_limits(
@@ -889,6 +890,10 @@ class RadargramViewMixin:
         self._draw_hyperbola_overlay(prof, dist_max, depth_max)
         self._vline = self._ax.axvline(x=0, color="yellow", lw=1, visible=False)
         self._hline = self._ax.axhline(y=0, color="cyan",   lw=1, linestyle="--", visible=False)
+        if self._pinned_cursor and self._cursor_x is not None and self._cursor_z is not None:
+            # cursore impostato dal clic sulla time-slice: sopravvive ai ridisegni
+            # finche' il mouse non entra nel radargramma.
+            self._update_cursor_lines(draw=False)
         self._apply_wiggle_visibility_layout()
         self._sync_xpan_slider()
         self._update_wiggle_plot(draw=False, force=True)
@@ -1016,7 +1021,8 @@ class RadargramViewMixin:
         axw = self._ax_wiggle
         axw.clear()
         axw.set_xticks([])
-        axw.set_yticks([])
+        # Asse y condiviso col radargramma: set_yticks([]) cancellerebbe anche i suoi tick.
+        axw.tick_params(axis="y", left=False, labelleft=False)
         self._wiggle_reset_artists()
         if draw:
             self._safe_draw_idle(self._canvas_mpl)
@@ -1129,7 +1135,7 @@ class RadargramViewMixin:
             axw.set_facecolor("#1a1a1a")
             axw.axvline(0.0, color="#555555", lw=0.5)
             axw.set_xticks([])
-            axw.set_yticks([])
+            axw.tick_params(axis="y", left=False, labelleft=False)
             axw.set_xlabel("")
             axw.set_ylabel("")
             axw.grid(False)
@@ -1225,6 +1231,7 @@ class RadargramViewMixin:
     def _on_mouse_move(self, event):
         if event.inaxes != self._ax or self._disp_data is None:
             return
+        self._pinned_cursor = False
         self._cursor_x = event.xdata
         self._cursor_z = event.ydata
         self._update_cursor_lines(draw=False)
@@ -1469,7 +1476,7 @@ class RadargramViewMixin:
             pt_canvas, True
         )
 
-    def _draw_profile_line_on_canvas(self):
+    def _draw_profile_line_on_canvas(self, pan_if_hidden: bool = False):
         if not self._profiles or self.iface is None:
             return
         prof   = self._profiles[self._prof_idx]
@@ -1477,8 +1484,8 @@ class RadargramViewMixin:
         canvas = self.iface.mapCanvas()
         if self._rb_line is None:
             self._rb_line = QgsRubberBand(canvas, QgsWkbTypes.LineGeometry)
-            self._rb_line.setColor(QColor(255, 165, 0))
-            self._rb_line.setWidth(2)
+            self._rb_line.setColor(QColor(255, 120, 0))
+            self._rb_line.setWidth(4)
             self._rb_line.setVisible(True)
         else:
             self._rb_line.reset(QgsWkbTypes.LineGeometry)
@@ -1503,3 +1510,13 @@ class RadargramViewMixin:
                 pt_canvas,
                 i == len(e_use) - 1
             )
+        if pan_if_hidden:
+            # Profilo fuori dalla vista della mappa: la linea "non si vede" anche se disegnata.
+            # Solo pan (mai zoom): la scala scelta dall'utente resta.
+            try:
+                box = self._rb_line.asGeometry().boundingBox()
+                if not canvas.extent().intersects(box):
+                    canvas.setCenter(box.center())
+                    canvas.refresh()
+            except Exception as exc:
+                self._note_swallowed("centratura mappa sul profilo", exc)

@@ -291,6 +291,67 @@ Punti di innesto già mappati:
 - Eliminare `_apply_idw` / `_make_geotransform` / `_write_tif_*` locali → usare
   `slicing` + `raster_io` (già estratti in Fase A).
 
+## 3ter. Fase G — motore "bin" (2026-09-21): puntini, colormap, preview lenta
+
+Segnalazione dell'utente (rilievo SUASA, array IDS a 19 canali): puntini
+regolari sulle slice, colormap non cambiabile, preview molto lenta. Diagnosi con
+i dati reali (25 swath `.npz`, variante `Array1_presetIDS`):
+
+- **Puntini** = collana di celle isolate lungo ogni linea di rilievo. Causa:
+  `_process_profiles` mediava coordinate *e* ampiezze dei 19 canali su una sola
+  linea centrale per swath (4 cm di passo laterale, ~0.75 m di swath buttati) e
+  poi IDW (peso `1/d^p`, singolare sui punti) interpolava tutto il resto.
+- **Profondita' sbagliata**: `_depth_to_sample_range` usava `righe/depth_max`, ma
+  dopo time-zero + `_align_2d_arrays_for_stack` le matrici hanno 865-1024 righe
+  (non 985): la slice "4.08 m" mostrava cio' che il radargramma ha a ~3.6 m.
+  `SliceSpec.velocity_m_s` non era usata da nessuno.
+- **Bande lungo le tracce** (mediane per canale da 0.19 a 0.65): nascoste dalla
+  media dei canali, emergono appena si usa la risoluzione vera dell'array.
+- **Colormap**: `_cb_slice_cmap` stava nell'"Avanzato" legacy, nascosto dalla
+  Fase D. Stesso problema per il clip percentile. Lo spessore della preview
+  leggeva uno spinbox nascosto non collegato al pannello.
+- **Preview lenta**: 13.6 s (IDW a ball query con ciclo Python per cella +
+  `_process_profiles` completo a ogni cursore) e la prima volta la GUI restava
+  bloccata leggendo ~1 GB di `.npz` nel thread principale.
+
+Fatto:
+
+- `slicing.py`: `window_amplitude` (5 modi veri: `signed_mean` ora ha il segno,
+  `abs_mean` e' davvero la media di |a|, `env_peak` = picco dell'inviluppo su
+  finestra + contesto), `window_sample_range`/`depth_per_sample_m` (profondita' =
+  `riga * dt * v / 2`, come l'asse del radargramma), `grid_binned` (splat
+  bilineare + convoluzione gaussiana normalizzata a due scale + chiusura dei
+  buchi con EDT: niente KD-tree, niente cicli per cella).
+- `slice_engine.py` (nuovo): ogni canale alla sua posizione, equalizzazione per
+  canale/profilo (`SliceSpec.balance`), finestre `[z_min + i*passo, +spessore]`
+  interamente dentro `[z_min, z_max]`, `(grids, meta)` compatibile con
+  `compute_ogpr_slice_grids` (tif, manifest, 3D invariati). Georef esatta
+  (`y_max = y_min + (n_y-1)*res`: il legacy poteva sfasare di una cella).
+- `SliceSpec`: `interp` default `"bin"` (`"idw"` = percorso legacy, invariato e
+  testato), `balance`, `velocity_m_s=None` = velocita' del profilo, low-pass
+  default 3x3. Uno spec salvato prima di questa fase (senza `balance`) con
+  `interp="idw"` passa a `"bin"` al caricamento.
+- Preview: ~0.2 s a caldo (era 13.6 s); la variante si legge nel thread di
+  lavoro, una sola volta (`_preview_loading_key`), con cache.
+- UI: colormap + anteprima + contrasto (clip %) visibili nel tab Slicing e
+  salvati nel progetto (`ui_state.slice_style`); spessore del pannello e'
+  l'unica fonte (`_sync_thickness_from_panel`); combo Interpolazione/
+  Bilanciamento/Velocita' auto nel pannello.
+- Output: il `.qml` accanto ai GeoTIFF e' ora `singlebandpseudocolor` con la
+  colormap e il clip scelti (11 stop; fallback al grigio se la colormap non e'
+  risolvibile). Vale anche per le slice filtrate/rototraslate.
+- Test: `test/test_slice_engine.py` (37, headless) e `test/test_viewer_timeslice.py`
+  (9, Qt offscreen sotto QGIS). Verifica su dati reali dentro QGIS 3.36: 60
+  slice 0-6 m in 11 s, il 100% delle tracce cade su pixel validi, QML caricato.
+
+Non fatto / da valutare:
+
+- Fase E (leggere il manifest per catalogo/gruppi/3D) e Fase F (adapter LAS/CSV)
+  restano come sopra.
+- Stretch comune a tutto il set (oggi ogni slice ha il proprio 2-98 %).
+- Denoise fisico oltre la gaussiana (es. filtro lungo-traccia, kriging).
+- I nomi file `slice_NNNN_zX_XXXX.tif` (centro della finestra) non sono cambiati.
+
 ## 4. Ordine consigliato e rischio
 - A, B, C (core): ✅ fatte. Rischio basso, testate headless.
 - D: medio-alto (pannello grande `gpr_profile_viewer.py`), isolabile in

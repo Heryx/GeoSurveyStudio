@@ -26,6 +26,7 @@ from qgis.PyQt.QtWidgets import (
 
 from .slice_spec import (
     AMPLITUDE_MODES,
+    BALANCE_MODES,
     INTERP_METHODS,
     SMOOTH_LOWPASS_VALUES,
     SliceSpec,
@@ -39,7 +40,16 @@ _AMPLITUDE_LABELS = {
     "signed_mean": "Media con segno (signed_mean)",
     "max_abs": "Max |ampiezza| (max_abs)",
 }
-_INTERP_LABELS = {"idw": "IDW", "kriging": "Kriging (non implementato)"}
+_INTERP_LABELS = {
+    "bin": "Binning + gaussiana (consigliata)",
+    "idw": "IDW (classico, lascia puntini)",
+    "kriging": "Kriging (non implementato)",
+}
+_BALANCE_LABELS = {
+    "channel": "Per canale (toglie le strisce)",
+    "profile": "Per profilo",
+    "none": "Nessuna",
+}
 
 # velocity is entered in cm/ns (typical GPR unit); SliceSpec stores m/s.
 _CM_NS_TO_M_S = 1.0e7
@@ -93,8 +103,24 @@ class SliceSpecPanel(QWidget):
         form.addRow("Variante sorgente:", self.cb_source_variant)
 
         self.sp_velocity = self._dspin(10.0, 1.0, 30.0, 0.5, " cm/ns")
-        self.sp_velocity.setToolTip("velocità onda EM (per conversione tempo→profondità)")
-        form.addRow("Velocità:", self.sp_velocity)
+        self.sp_velocity.setToolTip(
+            "Velocità onda EM per la conversione tempo→profondità.\n"
+            "Con 'auto' si usa quella di ogni profilo, cioè la stessa dell'asse\n"
+            "profondità del radargramma."
+        )
+        self.chk_velocity_auto = QCheckBox("auto (dal profilo)")
+        self.chk_velocity_auto.setChecked(True)
+        form.addRow("Velocità:", self._with_auto(self.sp_velocity, self.chk_velocity_auto))
+
+        self.cb_balance = QComboBox()
+        for m in BALANCE_MODES:
+            self.cb_balance.addItem(_BALANCE_LABELS.get(m, m), m)
+        self.cb_balance.setToolTip(
+            "Riporta allo stesso livello i canali dell'array prima dell'interpolazione.\n"
+            "Canali con guadagno/accoppiamento diverso producono strisce lungo le\n"
+            "tracce: 'Per canale' le elimina, 'Per profilo' equalizza solo gli swath."
+        )
+        form.addRow("Bilanciamento:", self.cb_balance)
 
         # --- gridding ---------------------------------------------------
         self.sp_resolution = self._dspin(0.10, 0.01, 10.0, 0.01, " m")
@@ -106,9 +132,19 @@ class SliceSpecPanel(QWidget):
         idx_krig = self.cb_interp.findData("kriging")
         if idx_krig >= 0:
             self.cb_interp.model().item(idx_krig).setEnabled(False)
+        self.cb_interp.setToolTip(
+            "Binning + gaussiana: ogni traccia di ogni canale alla sua posizione,\n"
+            "media per cella e riempimento dei vuoti. Niente puntini, molto veloce.\n"
+            "IDW: metodo classico sulla linea centrale dello swath; lascia una\n"
+            "collana di puntini lungo le linee di rilievo."
+        )
         form.addRow("Interpolazione:", self.cb_interp)
 
         self.sp_search_radius = self._dspin(1.0, 0.01, 500.0, 0.05, " m")
+        self.sp_search_radius.setToolTip(
+            "Distanza massima su cui si colmano i vuoti fra le linee\n"
+            "(si chiudono buchi larghi fino al doppio del raggio)."
+        )
         self.chk_radius_auto = QCheckBox("auto (spaziatura interlinea)")
         self.chk_radius_auto.setChecked(True)
         form.addRow("Raggio ricerca:", self._with_auto(self.sp_search_radius, self.chk_radius_auto))
@@ -133,6 +169,12 @@ class SliceSpecPanel(QWidget):
         self.cb_smooth = QComboBox()
         for v in SMOOTH_LOWPASS_VALUES:
             self.cb_smooth.addItem("nessuno" if v == 0 else f"{v}×{v}", v)
+        self.cb_smooth.setCurrentIndex(max(0, self.cb_smooth.findData(SliceSpec().smooth_lowpass)))
+        self.cb_smooth.setToolTip(
+            "Ulteriore lisciatura gaussiana della slice finita. Con la risoluzione\n"
+            "piena dell'array (4 cm) il rumore incoerente si vede: 3×3 è un buon\n"
+            "compromesso, 5×5 lo riduce ancora."
+        )
         form.addRow("Low-pass finale:", self.cb_smooth)
 
         # --- crs ------------------------------------------------------------
@@ -174,9 +216,10 @@ class SliceSpecPanel(QWidget):
                    self.sp_velocity, self.sp_resolution, self.sp_search_radius,
                    self.sp_blanking, self.sp_bg_clip):
             sp.valueChanged.connect(self._on_changed)
-        for cb in (self.cb_amplitude, self.cb_interp, self.cb_smooth):
+        for cb in (self.cb_amplitude, self.cb_interp, self.cb_smooth, self.cb_balance):
             cb.currentIndexChanged.connect(self._on_changed)
-        for chk in (self.chk_z_max_auto, self.chk_radius_auto, self.chk_bg_h, self.chk_bg_v):
+        for chk in (self.chk_z_max_auto, self.chk_radius_auto, self.chk_velocity_auto,
+                    self.chk_bg_h, self.chk_bg_v):
             chk.toggled.connect(self._on_changed)
         self.cb_source_variant.currentTextChanged.connect(self._on_changed)
         self.le_crs_epsg.textChanged.connect(self._on_changed)
@@ -208,6 +251,7 @@ class SliceSpecPanel(QWidget):
     def _sync_enabled(self):
         self.sp_z_max.setEnabled(not self.chk_z_max_auto.isChecked())
         self.sp_search_radius.setEnabled(not self.chk_radius_auto.isChecked())
+        self.sp_velocity.setEnabled(not self.chk_velocity_auto.isChecked())
 
     def _on_changed(self, *_):
         self._sync_enabled()
@@ -232,7 +276,9 @@ class SliceSpecPanel(QWidget):
             overlap=round(float(self.sp_overlap.value()) / 100.0, 4),
             amplitude_mode=str(self.cb_amplitude.currentData() or "abs_mean"),
             source_variant=(self.cb_source_variant.currentText().strip() or "raw"),
-            velocity_m_s=float(self.sp_velocity.value()) * _CM_NS_TO_M_S,
+            velocity_m_s=(None if self.chk_velocity_auto.isChecked()
+                          else float(self.sp_velocity.value()) * _CM_NS_TO_M_S),
+            balance=str(self.cb_balance.currentData() or "channel"),
             resolution_m=float(self.sp_resolution.value()),
             interp=str(self.cb_interp.currentData() or "idw"),
             search_radius_m=(None if self.chk_radius_auto.isChecked()
@@ -261,7 +307,10 @@ class SliceSpecPanel(QWidget):
             self.sp_overlap.setValue(float(spec.overlap) * 100.0)
             self._set_combo(self.cb_amplitude, spec.amplitude_mode)
             self._set_source_variant(str(spec.source_variant or "raw"))
-            self.sp_velocity.setValue(float(spec.velocity_m_s) * _M_S_TO_CM_NS)
+            self.chk_velocity_auto.setChecked(spec.velocity_m_s is None)
+            if spec.velocity_m_s is not None:
+                self.sp_velocity.setValue(float(spec.velocity_m_s) * _M_S_TO_CM_NS)
+            self._set_combo(self.cb_balance, spec.balance)
             self.sp_resolution.setValue(float(spec.resolution_m))
             self._set_combo(self.cb_interp, spec.interp)
             self.chk_radius_auto.setChecked(spec.search_radius_m is None)

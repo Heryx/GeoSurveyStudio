@@ -6,6 +6,7 @@ import os
 from PyQt5.QtWidgets import QDialog, QInputDialog, QMessageBox
 from qgis.core import QgsProject, QgsRasterLayer
 from qgis.gui import QgsProjectionSelectionDialog
+from .raster_io import apply_embedded_style
 from .timeslice_validation_dialog import choose_timeslice_import_action
 
 
@@ -108,6 +109,7 @@ class ProjectManagerTimesliceImportMixin:
                 continue
             if not raster_layer.crs().isValid() and target_crs.isValid():
                 raster_layer.setCrs(target_crs)
+            apply_embedded_style(raster_layer)
             QgsProject.instance().addMapLayer(raster_layer, False)
             target_group.addLayer(raster_layer)
             existing_sources.add(path)

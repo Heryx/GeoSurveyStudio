@@ -664,5 +664,76 @@ class ShortProfileKeepsFullImageTest(_ViewerTestBase):
         self.assertEqual(int(v._im.get_array().shape[1]), v._disp_data.shape[1])
 
 
+class SanitizeGainBreakpointsTest(unittest.TestCase):
+    """Il tetto del range gain (motore) non e' piu' 100."""
+
+    @unittest.skipUnless(HAS_VIEWER, "gpr_processing non importabile")
+    def test_gain_above_100_is_kept(self):
+        pts = _PROC._sanitize_gain_breakpoints([[0.0, 0.3], [0.5, 800.0], [1.0, 5000.0]])
+        self.assertEqual(pts[:, 1].tolist(), [0.3, 800.0, 5000.0])
+        g = _PROC._build_pre_agc_gain(
+            101, {"pre_agc_breakpoints": [[0.0, 0.3], [1.0, 5000.0]]}
+        )
+        self.assertAlmostEqual(float(g[-1, 0]), 5000.0, places=1)
+
+    @unittest.skipUnless(HAS_VIEWER, "gpr_processing non importabile")
+    def test_ceiling_is_still_enforced(self):
+        pts = _PROC._sanitize_gain_breakpoints([[0.0, 1.0], [1.0, 1e12]])
+        self.assertEqual(float(pts[-1, 1]), _PROC.RANGE_GAIN_MAX)
+
+
+@unittest.skipUnless(HAS_MPL and HAS_VIEWER, "matplotlib/viewer non disponibili")
+class RangeGainCurveLimitTest(_ViewerTestBase):
+    def _dialog(self, **kw):
+        dlg = _CM._RangeGainCurveDialog(max_points=16, **kw)
+        self._pump(30)   # smaltisce il draw_idle del costruttore prima che il dialogo sparisca
+        self.addCleanup(lambda: (dlg.close(), self._pump(30)))
+        return dlg
+
+    def test_interior_peak_is_not_flattened_to_the_deep_value(self):
+        v = self.v
+        v._chk_range_gain.setChecked(True)
+        self._pump(50)
+        # picco a meta' profondita', fondo piu' basso (per non amplificare il rumore)
+        v._on_range_gain_curve_live_changed(np.array([[0.0, 0.3], [0.5, 50.0], [1.0, 20.0]]))
+        self._pump(50)
+        sent = v._current_processing_params()["pre_agc_breakpoints"]
+        self.assertEqual([p[1] for p in sent], [0.3, 50.0, 20.0])
+        self.assertAlmostEqual(float(v._build_depth_range_gain(101)[50, 0]), 50.0, places=3)
+
+    def test_gain_above_100_reaches_the_pipeline_and_the_display(self):
+        v = self.v
+        v._chk_range_gain.setChecked(True)
+        self.assertGreaterEqual(v._spin_gain_deep.maximum(), 1e5)
+        v._spin_gain_deep.setValue(2500.0)
+        self._pump(50)
+        self.assertEqual(v._current_processing_params()["pre_agc_breakpoints"][-1][1], 2500.0)
+        self.assertAlmostEqual(float(v._build_depth_range_gain(64)[-1, 0]), 2500.0, places=1)
+
+    def test_editor_axis_follows_the_curve_and_keeps_points_above_100(self):
+        pts = np.array([[0.0, 0.3], [0.4, 300.0], [1.0, 40.0]])
+        dlg = self._dialog(points=pts)
+        self.assertEqual(dlg.points()[:, 1].tolist(), [0.3, 300.0, 40.0])   # niente clip a 100
+        self.assertGreaterEqual(dlg.gain_max(), 600.0)                       # asse auto, sopra i punti
+        self.assertTrue(dlg._chk_log.isChecked())                            # decadi -> scala log
+        # il picking funziona anche con l'asse log: ogni punto e' il piu' vicino a se stesso
+        dlg._canvas.draw()
+        for i, (depth, gain) in enumerate(dlg.points()):
+            idx, dist = dlg._nearest_idx(gain, depth)
+            self.assertEqual(idx, i)
+            self.assertLess(dist, 1e-6)
+
+    def test_editor_stays_linear_for_small_gains(self):
+        dlg = self._dialog(points=np.array([[0.0, 1.0], [1.0, 6.0]]))
+        self.assertFalse(dlg._chk_log.isChecked())
+        self.assertEqual(dlg.gain_max(), 20.0)
+
+    def test_editor_manual_axis_does_not_clip_points(self):
+        dlg = self._dialog(points=np.array([[0.0, 1.0], [1.0, 500.0]]), gain_max=50.0)
+        self.assertFalse(dlg._chk_auto_axis.isChecked())
+        self.assertEqual(float(dlg.points()[-1, 1]), 500.0)
+        self.assertGreaterEqual(dlg.gain_max(), 500.0)   # l'asse non nasconde il punto
+
+
 if __name__ == "__main__":
     unittest.main()

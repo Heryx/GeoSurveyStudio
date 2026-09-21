@@ -2320,6 +2320,11 @@ def _step_fingerprint(
     return (step, bool(p.get(step)), input_shape)
 
 
+# Tetto del range gain (120 dB): l'attenuazione GPR e' esponenziale e sul dato
+# grezzo supera facilmente i 60-80 dB, quindi un limite di 100 (40 dB) non basta.
+RANGE_GAIN_MAX = 1.0e6
+
+
 def _sanitize_gain_breakpoints(points) -> np.ndarray:
     rows = []
     if isinstance(points, np.ndarray):
@@ -2339,7 +2344,7 @@ def _sanitize_gain_breakpoints(points) -> np.ndarray:
         rows.append(
             (
                 float(np.clip(x, 0.0, 1.0)),
-                float(np.clip(y, 0.0, 100.0)),
+                float(np.clip(y, 0.0, RANGE_GAIN_MAX)),
             )
         )
     if len(rows) < 2:
@@ -2370,7 +2375,7 @@ def _build_pre_agc_gain(n_samples: int, p: dict) -> np.ndarray:
         g = np.interp(t, pts[:, 0], pts[:, 1])
     else:
         g = g0 + (g1 - g0) * t
-    g = np.clip(g, 0.0, 1e6).astype(np.float32, copy=False)
+    g = np.clip(g, 0.0, RANGE_GAIN_MAX).astype(np.float32, copy=False)
     return g.reshape(-1, 1)
 
 

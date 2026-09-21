@@ -1,5 +1,6 @@
 import os
 
+from .raster_io import apply_embedded_style
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QFont
 from qgis.PyQt.QtWidgets import (
@@ -878,7 +879,7 @@ class CatalogGroupMixin:
             self.on_group_selection_changed()
         return found
 
-    def _quick_import_timeslices_for_group(self, project_root, group, on_finished=None):
+    def _quick_import_timeslices_for_group(self, project_root, group, on_finished=None, file_paths=None):
         def _finish(result):
             if callable(on_finished):
                 try:
@@ -888,12 +889,13 @@ class CatalogGroupMixin:
                 return None
             return result
 
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self.dlg,
-            "Select Time-slice raster files",
-            "",
-            "Rasters (*.tif *.tiff *.png *.jpg *.jpeg *.asc *.img);;All files (*.*)",
-        )
+        if file_paths is None:
+            file_paths, _ = QFileDialog.getOpenFileNames(
+                self.dlg,
+                "Select Time-slice raster files",
+                "",
+                "Rasters (*.tif *.tiff *.png *.jpg *.jpeg *.asc *.img);;All files (*.*)",
+            )
         if not file_paths:
             return _finish({"cancelled": False, "imported": 0, "skipped": 0})
 
@@ -1014,7 +1016,7 @@ class CatalogGroupMixin:
                 QMessageBox.warning(self.dlg, "Import running", "A group import is already running.")
                 return _finish({"cancelled": True, "imported": 0, "skipped": skipped})
             self._group_import_active = True
-            if hasattr(self.dlg, "createGroupButton"):
+            if self.dlg is not None and hasattr(self.dlg, "createGroupButton"):
                 self.dlg.createGroupButton.setEnabled(False)
 
             def _on_task_done(done_task, _ok):
@@ -1023,7 +1025,7 @@ class CatalogGroupMixin:
                     _finish(result)
                 finally:
                     self._group_import_active = False
-                    if hasattr(self.dlg, "createGroupButton"):
+                    if self.dlg is not None and hasattr(self.dlg, "createGroupButton"):
                         self.dlg.createGroupButton.setEnabled(True)
 
             start_task_with_progress_dialog(
@@ -1046,6 +1048,29 @@ class CatalogGroupMixin:
             "Create Group - Import Images",
         )
         return _finish(_finalize(import_task))
+
+    def import_slice_files_as_group(self, project_root, group_name, file_paths, on_done=None):
+        """Registra dei GeoTIFF gia' pronti (es. dal profile viewer) come gruppo
+        del catalogo e li carica sotto "GeoSurvey Studio" nel layer tree, dove
+        lo slider li pilota come tutti gli altri gruppi."""
+        group, _created = create_raster_group(project_root, group_name)
+
+        def _on_result(result):
+            imported = int((result or {}).get("imported", 0))
+            if imported > 0:
+                self._get_or_create_plugin_qgis_group(group_name)
+            if self.dlg is not None:
+                self.populate_group_list()
+            if imported > 0:
+                if self.dlg is not None:
+                    self._select_group_item_by_id(group.get("id"))
+                self.load_raster(show_message=False)
+            if callable(on_done):
+                on_done(result or {})
+
+        self._quick_import_timeslices_for_group(
+            project_root, group, on_finished=_on_result, file_paths=list(file_paths)
+        )
 
     def create_group(self):
         group_name = self.dlg.groupNameEdit.text().strip()
@@ -1170,6 +1195,8 @@ class CatalogGroupMixin:
                             raster_layer.loadNamedStyle(style_path)
                         except Exception:
                             pass
+                    else:
+                        apply_embedded_style(raster_layer)
                     QgsProject.instance().addMapLayer(raster_layer, False)
                     qgis_group.addLayer(raster_layer)
                     existing_sources.add(path)

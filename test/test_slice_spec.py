@@ -224,10 +224,11 @@ class ComputeWithSpecTest(unittest.TestCase):
         self.profiles = _ogpr_test._make_profiles()
 
     def test_spec_matches_equivalent_kwargs(self):
+        # interp="idw" pins the legacy engine this test is about (default is "bin").
         spec = SliceSpec(
             z_min_m=0.0, z_max_m=1.2, thickness_m=0.30, overlap=0.0,
             amplitude_mode="abs_mean", resolution_m=0.20, search_radius_m=0.40,
-            blanking_radius_m=0.0, smooth_lowpass=0,
+            blanking_radius_m=0.0, smooth_lowpass=0, interp="idw",
         )
         grids_spec, meta_spec = ogpr.compute_ogpr_slice_grids(
             profiles=self.profiles, idw_mode="fast", min_points=1,

@@ -71,6 +71,7 @@ from .gpr_processing import (
     normalize_display,
     _normalize_display_vmax,
     manual_gain,
+    RANGE_GAIN_MAX,
     auto_tune_params,
     multifreq_blend,
     log_exception,
@@ -161,20 +162,45 @@ def _populate_cmap_combo(cb, *, current=None):
 refresh_gpr_cmaps()
 
 
-class _RangeGainCurveDialog(QDialog):
-    """Interactive breakpoint editor for range gain curve."""
+def _nice_ceil(value: float) -> float:
+    """Arrotonda per eccesso a 1-2-5 x 10^n (per un asse "tondo")."""
+    v = float(value)
+    if not np.isfinite(v) or v <= 0.0:
+        return 1.0
+    base = 10.0 ** np.floor(np.log10(v))
+    for m in (1.0, 2.0, 5.0, 10.0):
+        if v <= m * base * (1.0 + 1e-9):
+            return float(m * base)
+    return float(10.0 * base)
 
-    def __init__(self, points, max_points=16, gain_max=100.0, on_curve_changed=None, parent=None):
+
+class _RangeGainCurveDialog(QDialog):
+    """Interactive breakpoint editor for range gain curve.
+
+    Il gain dei punti arriva fino a ``RANGE_GAIN_MAX``. L'asse X si adatta da solo
+    alla curva ("Auto") e passa a scala log quando il gain copre piu' decadi:
+    l'attenuazione GPR e' esponenziale, la compensazione richiede decine di dB.
+    """
+
+    _AUTO_HEADROOM = 2.0     # l'asse auto e' ~2x il gain massimo dei punti
+    _LOG_FROM_MAX = 30.0     # sopra questo gain massimo la scala log parte da sola
+
+    def __init__(self, points, max_points=16, gain_max=None, on_curve_changed=None, parent=None):
         super().__init__(parent, Qt.Window)
         self.setWindowTitle("Range Gain Curve")
-        self.resize(620, 420)
+        self.resize(620, 460)
         self._max_points = int(max(2, min(32, max_points)))
         self._on_curve_changed = on_curve_changed
-        self._gain_max = float(np.clip(float(gain_max), 1.0, 100.0))
         self._drag_idx = None
         self._selected_idx = None
         self._did_drag = False
+        self._log_user_set = False
+        self._view_max = 10.0   # asse in uso; lo fissa _redraw
         self._points = self._sanitize(points)
+        # gain_max esplicito = asse manuale; None = automatico.
+        self._manual_max = (
+            float(np.clip(float(gain_max), 1.0, RANGE_GAIN_MAX)) if gain_max is not None else 10.0
+        )
 
         root = QVBoxLayout(self)
 
@@ -204,21 +230,35 @@ class _RangeGainCurveDialog(QDialog):
         gain_row = QHBoxLayout()
         gain_row.addWidget(QLabel("Gain max:"))
         self._spin_gain_max = QDoubleSpinBox()
-        self._spin_gain_max.setRange(1.0, 100.0)
+        self._spin_gain_max.setRange(1.0, RANGE_GAIN_MAX)
         self._spin_gain_max.setSingleStep(1.0)
         self._spin_gain_max.setDecimals(1)
-        self._spin_gain_max.setValue(self._gain_max)
+        self._spin_gain_max.setValue(self._manual_max)
+        self._spin_gain_max.setToolTip("Estremo dell'asse del gain (solo scala del grafico, non limita i punti).")
         self._spin_gain_max.valueChanged.connect(self._on_gain_max_changed)
         gain_row.addWidget(self._spin_gain_max)
+        self._chk_auto_axis = QCheckBox("Auto")
+        self._chk_auto_axis.setToolTip("Adatta l'asse del gain alla curva.")
+        self._chk_auto_axis.setChecked(gain_max is None)
+        self._chk_auto_axis.toggled.connect(self._on_auto_axis_toggled)
+        gain_row.addWidget(self._chk_auto_axis)
+        self._chk_log = QCheckBox("Scala log")
+        self._chk_log.setToolTip(
+            "Asse gain logaritmico (lineare sotto 1): utile quando la curva passa da <1 a centinaia."
+        )
+        self._chk_log.setChecked(self._axis_max() >= self._LOG_FROM_MAX)
+        self._chk_log.toggled.connect(self._on_log_toggled)
+        gain_row.addWidget(self._chk_log)
         gain_row.addStretch(1)
         root.addLayout(gain_row)
+        self._spin_gain_max.setEnabled(not self._chk_auto_axis.isChecked())
 
         step_row = QHBoxLayout()
         step_row.addWidget(QLabel("Step:"))
         self._spin_step = QDoubleSpinBox()
-        self._spin_step.setRange(0.01, 1.0)
+        self._spin_step.setRange(0.01, RANGE_GAIN_MAX)
         self._spin_step.setSingleStep(0.01)
-        self._spin_step.setValue(0.05)
+        self._spin_step.setValue(0.05 if self._axis_max() <= 10.0 else _nice_ceil(self._axis_max() / 100.0))
         self._spin_step.setDecimals(2)
         step_row.addWidget(self._spin_step)
         self._btn_step_up = QPushButton("▲ Gain +")
@@ -252,7 +292,7 @@ class _RangeGainCurveDialog(QDialog):
                 clean.append(
                     (
                         float(np.clip(x, 0.0, 1.0)),
-                        float(np.clip(y, 0.0, self._gain_max)),
+                        float(np.clip(y, 0.0, RANGE_GAIN_MAX)),
                     )
                 )
         if not clean:
@@ -284,28 +324,57 @@ class _RangeGainCurveDialog(QDialog):
     def points(self):
         return self._points.astype(np.float64, copy=True)
 
+    def _axis_max_auto(self) -> float:
+        top = float(np.max(self._points[:, 1])) if self._points.size else 1.0
+        return float(min(RANGE_GAIN_MAX, _nice_ceil(max(10.0, self._AUTO_HEADROOM * top))))
+
+    def _axis_max(self) -> float:
+        """Estremo dell'asse gain: mai sotto i punti, cosi' restano tutti visibili."""
+        if self._chk_auto_axis.isChecked():
+            return self._axis_max_auto()
+        top = float(np.max(self._points[:, 1])) if self._points.size else 1.0
+        return float(min(RANGE_GAIN_MAX, max(self._manual_max, _nice_ceil(1.05 * top))))
+
     def gain_max(self) -> float:
-        return float(self._gain_max)
+        return float(self._axis_max())
 
     def _emit_changed(self):
         if callable(self._on_curve_changed):
             try:
-                self._on_curve_changed(self.points(), float(self._gain_max))
+                self._on_curve_changed(self.points(), float(self._axis_max()))
             except Exception:
                 pass
 
-    def _redraw(self):
+    def _apply_auto_log(self):
+        """Attiva la scala log da sola quando il gain esce dalla zona "lineare"."""
+        if self._log_user_set or not hasattr(self, "_chk_log"):
+            return
+        want = float(np.max(self._points[:, 1])) >= self._LOG_FROM_MAX
+        if want != self._chk_log.isChecked():
+            self._chk_log.blockSignals(True)
+            try:
+                self._chk_log.setChecked(want)
+            finally:
+                self._chk_log.blockSignals(False)
+
+    def _redraw(self, rescale: bool = True):
         if not HAS_MPL or self._ax is None or self._canvas is None:
             return
+        if rescale:
+            self._apply_auto_log()
+            self._view_max = self._axis_max()
+        xmax = self._view_max
         self._ax.clear()
         p = self._points
         # X=gain, Y=depth fraction (0 top, 1 bottom).
+        if self._chk_log.isChecked():
+            self._ax.set_xscale("symlog", linthresh=1.0)
         self._ax.plot(p[:, 1], p[:, 0], color="#2d6ba3", lw=1.4)
         self._ax.scatter(p[:, 1], p[:, 0], s=40, color="#c0392b", zorder=3)
-        self._ax.set_xlim(0.0, float(self._gain_max))
+        self._ax.set_xlim(0.0, xmax)
         self._ax.set_ylim(1.0, 0.0)
         self._ax.grid(True, ls=":", lw=0.5, alpha=0.7)
-        self._ax.set_xlabel("Gain")
+        self._ax.set_xlabel("Gain (log)" if self._chk_log.isChecked() else "Gain")
         self._ax.set_ylabel("Depth fraction")
         self._ax.set_title(f"Breakpoints: {len(p)}/{self._max_points}")
         if self._selected_idx is not None:
@@ -327,21 +396,24 @@ class _RangeGainCurveDialog(QDialog):
         self._canvas.draw_idle()
 
     def _nearest_idx(self, x, y):
+        """Punto piu' vicino a (gain=x, depth=y), con distanza in frazione d'asse.
+
+        La distanza si misura sullo schermo, cosi' vale anche con l'asse log.
+        """
         p = self._points
-        if p.shape[0] <= 0:
+        if p.shape[0] <= 0 or self._ax is None:
             return None, 1e9
-        # x=gain, y=depth fraction
-        x_span = max(1e-6, float(np.nanmax(p[:, 1]) - np.nanmin(p[:, 1])))
-        dx = (p[:, 1] - float(x)) / x_span
-        dy = (p[:, 0] - float(y))
-        d = np.sqrt(dx * dx + dy * dy)
+        to_axes = self._ax.transAxes.inverted()
+        pts = to_axes.transform(self._ax.transData.transform(np.column_stack([p[:, 1], p[:, 0]])))
+        q = to_axes.transform(self._ax.transData.transform([[float(x), float(y)]]))[0]
+        d = np.hypot(pts[:, 0] - q[0], pts[:, 1] - q[1])
         idx = int(np.argmin(d))
         return idx, float(d[idx])
 
     def _on_press(self, event):
         if event is None or event.inaxes != self._ax or event.xdata is None or event.ydata is None:
             return
-        gain = float(np.clip(event.xdata, 0.0, self._gain_max))
+        gain = float(np.clip(event.xdata, 0.0, self._view_max))
         depth = float(np.clip(event.ydata, 0.0, 1.0))
         idx, dist = self._nearest_idx(gain, depth)
 
@@ -379,7 +451,7 @@ class _RangeGainCurveDialog(QDialog):
         if event is None or event.inaxes != self._ax or event.xdata is None or event.ydata is None:
             return
         i = int(self._drag_idx)
-        gain = float(np.clip(event.xdata, 0.0, self._gain_max))
+        gain = float(np.clip(event.xdata, 0.0, self._view_max))
         depth = float(np.clip(event.ydata, 0.0, 1.0))
         p = self._points.copy()
         if i == 0:
@@ -398,11 +470,16 @@ class _RangeGainCurveDialog(QDialog):
         self._points = self._sanitize(p)
         self._did_drag = True
         self._emit_changed()
-        self._redraw()
+        # Durante il drag l'asse resta fermo: se si adattasse a ogni movimento il
+        # punto sfuggirebbe al mouse (asse auto = ~2x il massimo dei punti).
+        self._redraw(rescale=False)
 
     def _on_release(self, _event):
+        was_dragging = self._drag_idx is not None
         self._did_drag = False
         self._drag_idx = None
+        if was_dragging:
+            self._redraw()
 
     def _move_selected(self, delta: float):
         if self._selected_idx is None:
@@ -411,15 +488,30 @@ class _RangeGainCurveDialog(QDialog):
         p = self._points.copy()
         if i < 0 or i >= len(p):
             return
-        p[i, 1] = float(np.clip(p[i, 1] + float(delta), 0.0, self._gain_max))
+        p[i, 1] = float(np.clip(p[i, 1] + float(delta), 0.0, RANGE_GAIN_MAX))
         self._points = self._sanitize(p)
         self._emit_changed()
         self._redraw()
 
     def _on_gain_max_changed(self, value: float):
-        self._gain_max = float(np.clip(float(value), 1.0, 100.0))
-        self._points = self._sanitize(self._points)
-        self._emit_changed()
+        # Solo la scala del grafico: i punti non vengono toccati.
+        self._manual_max = float(np.clip(float(value), 1.0, RANGE_GAIN_MAX))
+        self._redraw()
+
+    def _on_auto_axis_toggled(self, checked: bool):
+        self._spin_gain_max.setEnabled(not checked)
+        if not checked:
+            # Riparte dall'asse che si sta vedendo, non da un valore scollegato.
+            self._manual_max = float(np.clip(self._axis_max_auto(), 1.0, RANGE_GAIN_MAX))
+            self._spin_gain_max.blockSignals(True)
+            try:
+                self._spin_gain_max.setValue(self._manual_max)
+            finally:
+                self._spin_gain_max.blockSignals(False)
+        self._redraw()
+
+    def _on_log_toggled(self, _checked: bool):
+        self._log_user_set = True
         self._redraw()
 
     def _on_reset(self):
@@ -491,13 +583,17 @@ class _PreviewSliceWorker(QObject):
     timeslice.
     """
 
-    finished = pyqtSignal(int, object, object, str)  # request_id, grid, extent, error
+    # request_id, grid, extent, error, load_result. ``load_result`` e' None se i
+    # profili erano gia' in memoria; altrimenti ("ok", profili) / ("fail", None)
+    # dopo il caricamento della variante da disco fatto in questo thread.
+    finished = pyqtSignal(int, object, object, str, object)
 
     def __init__(self, request_id: int, profiles, z_from, z_to, resolution, chain_order, kwargs,
-                 spec=None):
+                 spec=None, loader=None):
         super().__init__()
         self._request_id = int(request_id)
         self._profiles = profiles
+        self._loader = loader
         self._z_from = z_from
         self._z_to = z_to
         self._resolution = resolution
@@ -506,12 +602,21 @@ class _PreviewSliceWorker(QObject):
         self._spec = spec
 
     def run(self):
+        load_result = None
         try:
+            if self._profiles is None and self._loader is not None:
+                # Lettura dei .npz della variante (~1 GB): qui, non nel thread GUI.
+                try:
+                    self._profiles = self._loader()
+                except Exception:
+                    load_result = ("fail", None)
+                    raise
+                load_result = ("ok", self._profiles)
             if self._spec is not None:
-                # Fase D: spec-native preview (single window), same code path
-                # as the final generation but with cheap knobs: fast kNN IDW,
-                # no NoData fill, no diagnostics. The final "Salva gruppo" run
-                # still uses the quality settings from the spec.
+                # Spec-native preview (single window), same code path as the
+                # final generation. For interp="bin" (default) the engine is
+                # already fast; the idw_mode/fill_nodata knobs only cheapen the
+                # legacy interp="idw" path. No diagnostics either way.
                 from .gpr_ogpr_slicer import compute_slice_preview
                 grid, extent = compute_slice_preview(
                     self._profiles, self._spec, self._z_from, self._z_to,
@@ -530,9 +635,9 @@ class _PreviewSliceWorker(QObject):
                     chain_order=self._chain_order,
                     **self._kwargs,
                 )
-            self.finished.emit(self._request_id, grid, extent, "")
+            self.finished.emit(self._request_id, grid, extent, "", load_result)
         except Exception as exc:
-            self.finished.emit(self._request_id, None, None, str(exc))
+            self.finished.emit(self._request_id, None, None, str(exc), load_result)
 
 
 def _run_pipeline_job(job: dict) -> np.ndarray:

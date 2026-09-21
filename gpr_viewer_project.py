@@ -363,6 +363,12 @@ class ProjectPersistenceMixin:
                 ui_state["slice_spec"] = _panel.get_spec().to_dict()
             except Exception:
                 pass
+        try:
+            _style = self._slice_display_style()
+            if _style:
+                ui_state["slice_style"] = _style
+        except Exception:
+            pass
         if last_timeslice is None:
             try:
                 outdir = str(self._le_slice_outdir.text() or "").strip()
@@ -502,6 +508,22 @@ class ProjectPersistenceMixin:
                 panel.set_spec(SliceSpec.from_dict(spec_d))
         except Exception as exc:
             print(f"[GPR viewer][WARN] ripristino SliceSpec fallito: {exc}")
+        try:
+            style = ui_state.get("slice_style")
+            if isinstance(style, dict):
+                cb = getattr(self, "_cb_slice_cmap", None)
+                name = str(style.get("cmap") or "").strip()
+                if name and self._is_qt_alive(cb):
+                    idx = cb.findText(name)
+                    if idx >= 0:
+                        cb.setCurrentIndex(idx)
+                for key, attr in (("clip_lo", "_spin_slice_vmin_pct"),
+                                  ("clip_hi", "_spin_slice_vmax_pct")):
+                    sp = getattr(self, attr, None)
+                    if key in style and self._is_qt_alive(sp):
+                        sp.setValue(float(style[key]))
+        except Exception as exc:
+            print(f"[GPR viewer][WARN] ripristino stile timeslice fallito: {exc}")
 
     def _try_import_saved_gpr_processing_project(self, force: bool = False) -> bool:
         if self._profiles and (not bool(force)):

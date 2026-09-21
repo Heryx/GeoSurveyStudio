@@ -209,6 +209,34 @@ def _radar_data_is_suspicious(arr: np.ndarray, kind: str) -> bool:
     return False
 
 
+def _check_radar_volume_content(radar_3d: np.ndarray) -> None:
+    """Rifiuta volumi radar privi di informazione (esportazione difettosa).
+
+    radar_3d ha shape (n_slices, n_channels, n_samples).  Due casi:
+    - tutto zero;
+    - una sola traccia per canale ripetuta identica su tutte le slice
+      (con piu' di una slice): nessuna variazione lungo il profilo.
+    """
+    if radar_3d.size == 0:
+        return
+    if not np.any(radar_3d):
+        raise OgprReadError(
+            f"il volume radar e' interamente a zero. Il file ha la dimensione "
+            "attesa ma non contiene dati radar: l'esportazione OGPR e' difettosa, "
+            "riesportare il file da GeosurveyStudio (o usare i dati grezzi originali)."
+        )
+    n_slices = radar_3d.shape[0]
+    if n_slices > 1 and all(
+        np.array_equal(radar_3d[:, ch, :], np.broadcast_to(radar_3d[0, ch, :], radar_3d[:, ch, :].shape))
+        for ch in range(radar_3d.shape[1])
+    ):
+        raise OgprReadError(
+            f"tutte le {n_slices} slice del volume radar sono identiche "
+            "(una sola traccia ripetuta per canale). Nessun segnale utilizzabile: "
+            "l'esportazione OGPR e' difettosa, riesportare il file da GeosurveyStudio."
+        )
+
+
 def _decode_radar_volume(
     radar_raw: bytes,
     exp_count: int,
@@ -599,6 +627,7 @@ def read_ogpr(path: str, verify_md5: bool = False) -> OgprProfile:
                 )
             parse_warnings.extend(radar_warnings)
             radar_3d = radar_flat.reshape((n_slices, n_channels, n_samples))
+            _check_radar_volume_content(radar_3d)
 
             # Sample Geolocations
             g_offset = int(geo_desc["byteOffset"])

@@ -18,6 +18,7 @@ from .gpr_viewer_common import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QInputDialog,
     QLineEdit,
     QMessageBox,
     QSpinBox,
@@ -287,6 +288,7 @@ class TimesliceViewMixin:
     def _update_slice_crosshair_overlay(self, draw: bool = True) -> bool:
         if self._ax_slice is None or self._slice_im is None:
             return False
+        self._update_slice_track_overlay()
         m = self._cursor_metrics()
         if not m:
             return False
@@ -337,6 +339,46 @@ class TimesliceViewMixin:
                     self._spin_slice_vmin_pct.blockSignals(False)
         self._redraw_slice_view(force=True)
         self._request_preview_update(immediate=False)
+
+    def _slice_display_style(self) -> dict:
+        """Colormap + clip percentili scelti per le timeslice.
+
+        Sono gli stessi valori usati dalla preview; finiscono anche nel .qml
+        scritto accanto ai GeoTIFF, cosi' in QGIS le slice hanno lo stesso
+        aspetto che vedi nel viewer."""
+        style = {}
+        cb = getattr(self, "_cb_slice_cmap", None)
+        if cb is not None and self._is_qt_alive(cb):
+            name = str(cb.currentText() or "").strip()
+            if name:
+                style["cmap"] = name
+        for key, attr in (("clip_lo", "_spin_slice_vmin_pct"), ("clip_hi", "_spin_slice_vmax_pct")):
+            sp = getattr(self, attr, None)
+            if sp is not None and self._is_qt_alive(sp):
+                style[key] = float(sp.value())
+        return style
+
+    def _sync_thickness_from_panel(self, *_):
+        """Lo spessore vive nel pannello parametri: il vecchio spinbox nascosto
+        (usato da navigator e finestra di preview) lo segue, cosi' preview e
+        "Salva gruppo" usano sempre lo stesso spessore."""
+        panel = getattr(self, "_slice_spec_panel", None)
+        spin = getattr(self, "_spin_slice_thickness", None)
+        if panel is None or spin is None:
+            return
+        if not (self._is_qt_alive(panel) and self._is_qt_alive(spin)):
+            return
+        try:
+            value = float(panel.sp_thickness.value())
+        except Exception:
+            return
+        if abs(float(spin.value()) - value) < 1e-9:
+            return
+        spin.blockSignals(True)
+        try:
+            spin.setValue(value)
+        finally:
+            spin.blockSignals(False)
 
     def _preview_resolution_m(self) -> float:
         quality = "medium"
@@ -431,7 +473,12 @@ class TimesliceViewMixin:
 
     def _preview_source_profiles(self):
         """Profili per la preview: la variante sorgente del pannello (come la
-        generazione finale), con cache; altrimenti i profili grezzi correnti."""
+        generazione finale), con cache; altrimenti i profili grezzi correnti.
+
+        Ritorna ``(profili, nome_variante, loader, chiave_cache)``. Se la variante
+        non e' ancora in cache ``profili`` e' ``None`` e ``loader`` e' una
+        funzione che la legge da disco: va eseguita nel thread di lavoro (sono
+        ~1 GB di .npz: sul thread GUI la finestra resterebbe bloccata)."""
         panel = getattr(self, "_slice_spec_panel", None)
         name = ""
         if panel is not None and self._is_qt_alive(panel):
@@ -441,22 +488,17 @@ class TimesliceViewMixin:
                 name = ""
         d = self._variant_dir_for_name(name)
         if not d:
-            return list(self._profiles or []), ""
+            return list(self._profiles or []), "", None, None
         npzs = sorted(glob.glob(os.path.join(d, "*.npz")))
         try:
             key = (d, len(npzs), max(os.path.getmtime(f) for f in npzs),
                    int(getattr(self, "_geometry_rev", 0)))
         except Exception:
-            return list(self._profiles or []), ""
+            return list(self._profiles or []), "", None, None
         cache = getattr(self, "_preview_variant_cache", None)
         if cache is not None and cache[0] == key:
-            return cache[1], name
-        try:
-            profs = self._load_variant_profiles(npzs)
-        except Exception:
-            return list(self._profiles or []), ""
-        self._preview_variant_cache = (key, profs)
-        return profs, name
+            return cache[1], name, None, key
+        return None, name, (lambda: self._load_variant_profiles(npzs)), key
 
     def _on_toggle_preview_mode(self, checked: bool):
         self._preview_mode_active = bool(checked)
@@ -562,8 +604,18 @@ class TimesliceViewMixin:
 
         z_from, z_to = self._preview_depth_window()
         res = self._preview_resolution_m()
-        prev_profiles, prev_variant = self._preview_source_profiles()
-        if not prev_profiles:
+        prev_profiles, prev_variant, prev_loader, prev_key = self._preview_source_profiles()
+        if prev_profiles is None and prev_loader is not None:
+            # Variante non ancora in memoria: la legge il thread di lavoro. Una
+            # sola lettura alla volta (sono ~1 GB): se e' gia' in corso, si
+            # riparte appena finisce invece di lanciarne un'altra.
+            if getattr(self, "_preview_loading_key", None) == prev_key:
+                self._preview_reload_pending = True
+                return
+            resolve_profiles = list(self._profiles or [])  # stessa geometria della variante
+        else:
+            resolve_profiles = prev_profiles
+        if not resolve_profiles:
             return
         slice_params = dict(self.get_slice_params() or {})
         chain_order = list(self._current_chain_order() or [])
@@ -573,7 +625,7 @@ class TimesliceViewMixin:
         _panel = getattr(self, "_slice_spec_panel", None)
         if _panel is not None and self._is_qt_alive(_panel):
             try:
-                preview_spec = _panel.get_spec().resolve(prev_profiles)
+                preview_spec = _panel.get_spec().resolve(resolve_profiles)
             except Exception as exc:
                 self._set_preview_busy(False, f"Parametri slice non validi: {exc}")
                 return
@@ -646,7 +698,14 @@ class TimesliceViewMixin:
         request_id = self._preview_request_id
         self._preview_signature = sig
         self._preview_pending_zwindow = (float(z_from), float(z_to))
-        self._set_preview_busy(True)
+        if prev_profiles is None:
+            self._preview_loading_key = prev_key
+            self._preview_reload_pending = False
+            self._set_preview_busy(
+                True, f"Carico la variante '{prev_variant}' (solo la prima volta)..."
+            )
+        else:
+            self._set_preview_busy(True)
 
         old_thread = getattr(self, "_preview_thread", None)
         if self._is_qt_alive(old_thread):
@@ -658,7 +717,7 @@ class TimesliceViewMixin:
         thread = QThread(self)
         worker = _PreviewSliceWorker(
             request_id, prev_profiles, float(z_from), float(z_to), float(res), chain_order, kwargs,
-            spec=preview_spec,
+            spec=preview_spec, loader=prev_loader,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -670,7 +729,19 @@ class TimesliceViewMixin:
         self._preview_worker = worker
         thread.start()
 
-    def _on_preview_worker_finished(self, request_id: int, grid, extent, error: str):
+    def _on_preview_worker_finished(self, request_id: int, grid, extent, error: str,
+                                    load_result=None):
+        if load_result is not None:
+            # Il thread ha letto la variante da disco: va in cache anche se la
+            # richiesta e' stata superata, altrimenti la prossima la rileggerebbe.
+            status, profs = load_result
+            key = getattr(self, "_preview_loading_key", None)
+            self._preview_loading_key = None
+            if status == "ok" and profs is not None and key is not None:
+                self._preview_variant_cache = (key, profs)
+            if getattr(self, "_preview_reload_pending", False):
+                self._preview_reload_pending = False
+                self._request_preview_update(immediate=True)
         if int(request_id) != int(self._preview_request_id):
             return  # superato da una richiesta di preview piu' recente
         self._set_preview_busy(False)
@@ -1022,9 +1093,20 @@ class TimesliceViewMixin:
             )
         except Exception:
             self._slice_pan_anchor = None
+        self._slice_press_px = (float(event.x), float(event.y))
 
-    def _on_slice_release(self, _event):
+    def _on_slice_release(self, event):
         self._slice_pan_anchor = None
+        press, self._slice_press_px = self._slice_press_px, None
+        if (
+            press is None or event is None or event.inaxes != self._ax_slice
+            or int(getattr(event, "button", 0) or 0) != 1
+            or event.xdata is None or event.ydata is None
+        ):
+            return
+        # Clic senza trascinare (il trascinamento e' il pan): puntatore inverso.
+        if abs(float(event.x) - press[0]) <= 4.0 and abs(float(event.y) - press[1]) <= 4.0:
+            self._on_slice_click(float(event.xdata), float(event.ydata))
 
     def _on_slice_mouse_move(self, event):
         if event is None or event.inaxes != self._ax_slice:
@@ -1133,6 +1215,19 @@ class TimesliceViewMixin:
         except Exception:
             pass
 
+    def _imported_slice_qgis_group(self):
+        """Sottogruppo di "GeoSurvey Studio" creato dall'ultimo Import to Canvas."""
+        name = str(getattr(self, "_imported_slice_group_name", "") or "").strip()
+        if not name:
+            return None
+        root = QgsProject.instance().layerTreeRoot()
+        for top in root.children():
+            if hasattr(top, "name") and top.name() == "GeoSurvey Studio":
+                for g in top.children():
+                    if hasattr(g, "findGroup") and hasattr(g, "name") and g.name() == name:
+                        return g
+        return None
+
     def _update_timeslice_visibility_in_canvas(self):
         if not bool(getattr(self, "_chk_timeslice_sync", None) and self._chk_timeslice_sync.isChecked()):
             return
@@ -1161,8 +1256,7 @@ class TimesliceViewMixin:
         idx = min(centers, key=lambda p: abs(p[1] - target))[0]
 
         try:
-            root = QgsProject.instance().layerTreeRoot()
-            qgis_group = root.findGroup("GPR Timeslices")
+            qgis_group = self._imported_slice_qgis_group()
             if qgis_group is None:
                 return
 
@@ -1567,6 +1661,24 @@ class TimesliceViewMixin:
                 continue
         self._safe_set_text(self._lbl_slice_profiles, f"{n_prof} profili  |  ~{total_traces} tracce")
 
+    def _restamp_slice_styles(self, tifs) -> None:
+        """Riscrive il .qml accanto a ogni GeoTIFF con colormap e percentili
+        attuali del viewer, cosi' in QGIS le slice hanno lo stesso aspetto
+        della preview anche se il set e' stato generato con un altro stile."""
+        style = self._slice_display_style()
+        if not style.get("cmap"):
+            return
+        try:
+            from .raster_io import read_tif_singleband, write_qml_singleband
+        except Exception:
+            return
+        for tif in tifs:
+            try:
+                grid = read_tif_singleband(tif)[0]
+                write_qml_singleband(tif, grid, style)
+            except Exception:
+                continue
+
     def _import_slices_to_canvas(self):
         outdir = str(getattr(self, "_le_slice_outdir", None).text() if hasattr(self, "_le_slice_outdir") else "").strip()
         if not outdir:
@@ -1581,43 +1693,46 @@ class TimesliceViewMixin:
             QMessageBox.information(self, "Import Timeslice", "Nessun GeoTIFF trovato nella cartella output.")
             return
 
-        root = QgsProject.instance().layerTreeRoot()
-        existing = root.findGroup("GPR Timeslices")
-        if existing is not None:
-            try:
-                root.removeChildNode(existing)
-            except Exception:
-                pass
-        group = root.addGroup("GPR Timeslices")
+        plugin = self.plugin
+        if plugin is None or not hasattr(plugin, "import_slice_files_as_group"):
+            QMessageBox.warning(self, "Import Timeslice", "Plugin GeoSurvey Studio non disponibile.")
+            return
+        project_root = str(plugin._active_project_root() or "").strip()
+        if not project_root:
+            ans = QMessageBox.question(
+                self, "Import Timeslice",
+                "Nessun progetto GeoSurvey Studio collegato.\n"
+                "Aprire il Project Manager per aprire o creare un progetto?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if ans == QMessageBox.Yes:
+                self._open_project_manager()
+            return
 
-        added = 0
-        for tif in tifs:
-            name = os.path.splitext(os.path.basename(tif))[0]
-            rl = QgsRasterLayer(tif, name)
-            if not rl.isValid():
-                continue
-            QgsProject.instance().addMapLayer(rl, False)
-            group.addLayer(rl)
-            added += 1
-
-        for i, child in enumerate(group.children()):
-            try:
-                child.setItemVisibilityChecked(i == 0)
-            except Exception:
-                pass
-
-        if self.iface is not None and self.iface.mapCanvas() is not None:
-            try:
-                self.iface.mapCanvas().refresh()
-            except Exception:
-                pass
-        self._safe_set_text(
-            self._lbl_status,
-            f"Import completato: {added} layer nel gruppo 'GPR Timeslices'."
+        default_name = os.path.basename(os.path.normpath(outdir)) or "gpr_slices"
+        group_name, ok = QInputDialog.getText(
+            self, "Import Timeslice",
+            "Nome del sottogruppo da creare in GeoSurvey Studio:",
+            text=default_name,
         )
-        if added <= 0:
-            QMessageBox.warning(self, "Import Timeslice", "Nessun layer valido importato.")
-        else:
+        group_name = str(group_name or "").strip()
+        if not ok or not group_name:
+            return
+
+        self._restamp_slice_styles(tifs)
+
+        def _done(result):
+            added = int(result.get("imported", 0))
+            if added > 0:
+                self._imported_slice_group_name = group_name
+            self._safe_set_text(
+                self._lbl_status,
+                f"Import completato: {added} layer nel sottogruppo '{group_name}' di GeoSurvey Studio.",
+            )
+            if added <= 0:
+                if not result.get("cancelled"):
+                    QMessageBox.warning(self, "Import Timeslice", "Nessun layer importato.")
+                return
             try:
                 dz = float(self._spin_slice_thickness.value())
             except Exception:
@@ -1626,6 +1741,8 @@ class TimesliceViewMixin:
             self._save_gpr_processing_project_meta(
                 last_timeslice=self._path_to_gpr_processing_store(outdir),
             )
+
+        plugin.import_slice_files_as_group(project_root, group_name, tifs, on_done=_done)
 
     @staticmethod
     def _set_combo_to_data(combo: QComboBox, value) -> None:
@@ -1739,7 +1856,7 @@ class TimesliceViewMixin:
                 out_path = os.path.join(out_dir, os.path.basename(tif))
                 write_tif_singleband(out, out_path, x_min, y_min, y_max, res, epsg or 0)
                 try:
-                    write_qml_singleband(out_path, out)
+                    write_qml_singleband(out_path, out, self._slice_display_style())
                 except Exception:
                     pass
                 n_ok += 1
@@ -1963,7 +2080,7 @@ class TimesliceViewMixin:
                 out_path = os.path.join(out_dir, name)
                 write_tif_singleband(arr, out_path, x0, y0, y_top, cell, epsg_out or 0)
                 try:
-                    write_qml_singleband(out_path, arr)
+                    write_qml_singleband(out_path, arr, self._slice_display_style())
                 except Exception:
                     pass
                 zf, zt, zc = meta if meta else (float(i), float(i), float(i))
@@ -2091,7 +2208,7 @@ class TimesliceViewMixin:
                 out_path = os.path.join(out_dir, os.path.basename(tif))
                 write_tif_singleband(oarr, out_path, x0, y0, y_top, cell, epsg or 0)
                 try:
-                    write_qml_singleband(out_path, oarr)
+                    write_qml_singleband(out_path, oarr, self._slice_display_style())
                 except Exception:
                     pass
                 stats_by_name[os.path.basename(tif)] = sm.compute_slice_stats(oarr)
@@ -2510,6 +2627,7 @@ class TimesliceViewMixin:
                 out = spec_to_legacy_params(
                     spec, channel=-1, combine_method="mean",
                     open_3d_on_complete=open_3d,
+                    style=self._slice_display_style(),
                 )
                 return out
             except Exception as exc:

@@ -5,6 +5,12 @@ Estratto da gpr_profile_viewer.py senza modifiche ai metodi."""
 
 from __future__ import annotations
 
+import threading
+import time
+
+from qgis.PyQt.QtCore import QEventLoop
+
+from .gpr_variant_runner import run_channels
 from .gpr_viewer_common import (
     QCheckBox,
     QComboBox,
@@ -19,26 +25,132 @@ from .gpr_viewer_common import (
     QLineEdit,
     QMenu,
     QMessageBox,
+    QObject,
+    QProgressBar,
     QPushButton,
     QSpinBox,
+    QThread,
     QTimer,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
     Qt,
-    apply_pipeline,
     glob,
     json,
     list_variants,
+    log_exception,
     multifreq_blend,
     np,
     os,
+    pyqtSignal,
     read_variant_manifest,
     save_processed_profile_npz,
     shutil,
     write_variant_manifest,
 )
+
+
+def _fmt_duration(seconds: float) -> str:
+    s = max(0, int(round(seconds)))
+    if s >= 3600:
+        return f"{s // 3600} h {(s % 3600) // 60:02d} min"
+    if s >= 60:
+        return f"{s // 60} min {s % 60:02d} s"
+    return f"{s} s"
+
+
+class _VariantSaveWorker(QObject):
+    """Esegue il salvataggio della variante fuori dal thread della GUI.
+
+    Orchestra `run_channels` (pool di processi, ripiego seriale): i canali si
+    calcolano in parallelo, i profili completi si scrivono su disco qui."""
+
+    progress = pyqtSignal(int, int, int)  # canali fatti, canali totali, profili salvati
+    finished = pyqtSignal(object)         # dict di run_channels
+
+    def __init__(self, counts, make_payload, on_profile_done):
+        super().__init__()
+        self._counts = counts
+        self._make_payload = make_payload
+        self._on_profile_done = on_profile_done
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def run(self) -> None:
+        try:
+            result = run_channels(
+                self._counts, self._make_payload, self._on_profile_done,
+                on_progress=lambda done, total, saved, _pi: self.progress.emit(done, total, saved),
+                is_cancelled=self._cancel.is_set,
+            )
+        except Exception as exc:
+            try:
+                log_exception("salvataggio variante", exc)
+            except Exception:
+                pass
+            result = {"fatal": str(exc), "errors": {}, "cancelled": False, "mode": "seriale",
+                      "workers": 1, "note": "", "elapsed": 0.0, "done": 0, "total": 0}
+        self.finished.emit(result)
+
+
+class _VariantProgressDialog(QDialog):
+    """Avanzamento del salvataggio: resta aperto e responsivo, annullabile.
+
+    Non si chiude da solo ne' con Esc/X: l'annullamento e' una richiesta che il
+    worker onora al canale successivo, e la finestra resta finche' non ha finito."""
+
+    cancel_requested = pyqtSignal()
+
+    def __init__(self, parent, total: int):
+        super().__init__(parent)
+        self.setWindowTitle("Salva variante")
+        self.setWindowModality(Qt.ApplicationModal)
+        self.setMinimumWidth(480)
+        self._finished = False
+        lay = QVBoxLayout(self)
+        self._lbl = QLabel("Avvio del calcolo in parallelo...")
+        self._lbl.setWordWrap(True)
+        lay.addWidget(self._lbl)
+        self._bar = QProgressBar()
+        self._bar.setRange(0, max(1, int(total)))
+        self._bar.setValue(0)
+        lay.addWidget(self._bar)
+        self._btn = QPushButton("Annulla")
+        self._btn.clicked.connect(self._request_cancel)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(self._btn)
+        lay.addLayout(row)
+
+    def _request_cancel(self) -> None:
+        if self._finished or not self._btn.isEnabled():
+            return
+        self._btn.setEnabled(False)
+        self._lbl.setText("Annullamento in corso...\nI profili gia' scritti restano su disco.")
+        self.cancel_requested.emit()
+
+    def set_progress(self, done: int, text: str) -> None:
+        if not self._btn.isEnabled():
+            return  # annullamento richiesto: non sovrascrivere il messaggio
+        self._bar.setValue(int(done))
+        self._lbl.setText(text)
+
+    def finish(self) -> None:
+        self._finished = True
+        self.close()
+
+    def reject(self) -> None:
+        self._request_cancel()
+
+    def closeEvent(self, event) -> None:
+        if self._finished:
+            event.accept()
+        else:
+            event.ignore()
+            self._request_cancel()
 
 
 class VariantsMixin:
@@ -213,6 +325,11 @@ class VariantsMixin:
         davvero i dati filtrati su disco, cosi' da poterli riusare per le
         time-slice e confrontare varianti diverse.
         """
+        if getattr(self, "_variant_job", None) is not None:
+            QMessageBox.information(
+                self, "Salva variante", "Un salvataggio di variante e' gia' in corso."
+            )
+            return
         if not self._profiles:
             QMessageBox.information(
                 self, "Salva variante", "Importa almeno un profilo .ogpr prima."
@@ -259,62 +376,27 @@ class VariantsMixin:
                 return
         os.makedirs(variant_dir, exist_ok=True)
 
-        from PyQt5.QtWidgets import QProgressDialog
-        from PyQt5.QtCore import Qt as _Qt
-
         n = len(self._profiles)
-        prog = QProgressDialog("Salvataggio variante in corso...", "Annulla", 0, n, self)
-        prog.setWindowModality(_Qt.WindowModal)
-        prog.setMinimumDuration(0)
-        prog.setValue(0)
-
         max_ch = max((int(getattr(p_, "n_channels", 0) or 0) for p_ in self._profiles), default=0)
         bg_refs = {ci: self._grid_bg_reference(params, ci) for ci in range(max_ch)}
 
-        files = []
-        errors = []
-        for i, prof in enumerate(self._profiles):
-            if prog.wasCanceled():
-                break
-            try:
-                proc_by_ch = []
-                idx_by_ch = []
-                any_idx = False
-                for ci in range(int(getattr(prof, "n_channels", 0) or 0)):
-                    raw = np.asarray(prof.channel(ci).data, dtype=np.float32)
-                    tidx = self._trace_indices_for(int(raw.shape[1]))
-                    trimmed = not (tidx.size == raw.shape[1] and np.array_equal(tidx, np.arange(raw.shape[1])))
-                    if trimmed:
-                        raw = raw[:, tidx]
-                        any_idx = True
-                    idx_by_ch.append(tidx if trimmed else None)
-                    p_ch = params
-                    if params.get("kirchhoff") and params.get("kirchhoff_topo"):
-                        p_ch = dict(params)
-                        elev = self._profile_channel_elevation(prof, ci)
-                        try:
-                            if trimmed and elev is not None and len(elev) > int(np.max(tidx)):
-                                elev = np.asarray(elev)[tidx]
-                        except Exception:
-                            pass
-                        p_ch["kirchhoff_elev_m"] = elev
-                    out = apply_pipeline(
-                        raw, p_ch, dt_ns=prof.dt_ns,
-                        bg_reference_trace=bg_refs.get(ci),
-                        normalize_output=False, chain_order=chain,
-                    )
-                    proc_by_ch.append(out)
-                if proc_by_ch:
-                    fp = save_processed_profile_npz(
-                        variant_dir, prof, proc_by_ch, params, chain,
-                        view_geom=self._view_geom_sig(),
-                        trace_indices_by_channel=(idx_by_ch if any_idx else None),
-                    )
-                    files.append(fp)
-            except Exception as e:
-                errors.append(f"{os.path.basename(getattr(prof, 'path', '?'))}: {e}")
-            prog.setValue(i + 1)
-        prog.setValue(n)
+        # Trim/flip di ogni canale: leggono i controlli Qt, quindi si calcolano qui
+        # (thread della GUI) e il worker riceve solo indici gia' pronti.
+        view_geom = self._view_geom_sig()
+        plan = []
+        for prof in self._profiles:
+            per_channel = []
+            for ci in range(int(getattr(prof, "n_channels", 0) or 0)):
+                n_cols = int(np.asarray(prof.channel(ci).data).shape[1])
+                tidx = self._trace_indices_for(n_cols)
+                trimmed = not (tidx.size == n_cols and np.array_equal(tidx, np.arange(n_cols)))
+                per_channel.append((tidx, trimmed))
+            plan.append(per_channel)
+
+        job = self._run_variant_channels(variant_dir, params, chain, view_geom, bg_refs, plan)
+        files = job["files"]
+        errors = job["errors"]
+        cancelled = bool(job["cancelled"])
 
         if files:
             try:
@@ -338,17 +420,34 @@ class VariantsMixin:
             except Exception:
                 pass
             self._refresh_slice_variant_choices()
+        how = (f"{job['workers']} calcoli in parallelo" if job["mode"] == "processi" else "in serie")
+        took = f"{_fmt_duration(job['elapsed'])}, {how}"
+        note = f"\n\n{job['note']}." if job.get("note") else ""
+        self._safe_set_text(
+            self._lbl_status,
+            f"Variante '{variant}': {len(files)}/{n} profili"
+            + (" (annullata)" if cancelled else "") + f" - {took}."
+            + (f" {job['note']}." if job.get("note") else ""),
+        )
         if errors:
             QMessageBox.warning(
                 self, "Salva variante",
-                f"Salvati {len(files)}/{n} profili.\nErrori:\n" + "\n".join(errors[:8]),
+                ("Annullato. " if cancelled else "")
+                + f"Salvati {len(files)}/{n} profili.\nErrori:\n" + "\n".join(errors[:8]) + note,
             )
+        elif cancelled:
+            if not quiet:
+                QMessageBox.information(
+                    self, "Salva variante",
+                    f"Salvataggio annullato: {len(files)}/{n} profili scritti in\n{variant_dir}",
+                )
         elif files and quiet:
             pass
         elif files:
             QMessageBox.information(
                 self, "Salva variante",
-                f"Variante '{variant}' salvata: {len(files)} profili in\n{variant_dir}",
+                f"Variante '{variant}' salvata: {len(files)} profili in\n{variant_dir}\n\n"
+                f"Tempo: {took}.{note}",
             )
         else:
             QMessageBox.warning(self, "Salva variante", "Nessun profilo salvato.")
@@ -361,6 +460,113 @@ class VariantsMixin:
         except Exception:
             pass
         return variant if files else None
+
+    def _run_variant_channels(self, variant_dir, params, chain, view_geom, bg_refs, plan) -> dict:
+        """Calcola e scrive i profili della variante fuori dal thread della GUI.
+
+        I canali girano in parallelo in processi separati (vedi
+        gpr_variant_runner); la GUI resta libera e la finestra di avanzamento
+        permette di annullare tra un canale e l'altro. La funzione resta
+        SINCRONA per chi la chiama (chiusura del viewer, time-slice dal grezzo):
+        aspetta con un event loop locale, senza bloccare la GUI.
+
+        Ritorna: files (nell'ordine dei profili), errors (righe "profilo: motivo"),
+        cancelled, mode, workers, note, elapsed.
+        """
+        profiles = list(self._profiles)
+        counts = [len(per_channel) for per_channel in plan]
+        total = int(sum(counts))
+        topo = bool(params.get("kirchhoff") and params.get("kirchhoff_topo"))
+        files_by_idx: dict = {}
+
+        def make_payload(pi, ci):
+            prof = profiles[pi]
+            tidx, trimmed = plan[pi][ci]
+            raw = np.asarray(prof.channel(ci).data, dtype=np.float32)
+            if trimmed:
+                raw = raw[:, tidx]
+            p_ch = params
+            if topo:
+                p_ch = dict(params)
+                elev = self._profile_channel_elevation(prof, ci)
+                try:
+                    if trimmed and elev is not None and len(elev) > int(np.max(tidx)):
+                        elev = np.asarray(elev)[tidx]
+                except Exception:
+                    pass
+                p_ch["kirchhoff_elev_m"] = elev
+            return (raw, p_ch, prof.dt_ns, bg_refs.get(ci), chain)
+
+        def on_profile_done(pi, proc_by_ch):
+            idx_by_ch = [tidx if trimmed else None for tidx, trimmed in plan[pi]]
+            files_by_idx[pi] = save_processed_profile_npz(
+                variant_dir, profiles[pi], proc_by_ch, params, chain,
+                view_geom=view_geom,
+                trace_indices_by_channel=(idx_by_ch if any(t for _i, t in plan[pi]) else None),
+            )
+
+        dlg = _VariantProgressDialog(self, total)
+        worker = _VariantSaveWorker(counts, make_payload, on_profile_done)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        loop = QEventLoop(self)
+        self._variant_job = {
+            "dlg": dlg, "loop": loop, "t0": time.perf_counter(),
+            "n_profiles": sum(1 for c in counts if c > 0), "result": None,
+        }
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_variant_job_progress)
+        worker.finished.connect(self._on_variant_job_finished)
+        dlg.cancel_requested.connect(lambda: worker.cancel())
+        try:
+            thread.start()
+            dlg.show()
+            loop.exec_()
+        finally:
+            result = (self._variant_job or {}).get("result")
+            self._variant_job = None
+            thread.quit()
+            thread.wait(10000)
+            dlg.finish()
+            dlg.deleteLater()
+            worker.deleteLater()
+            thread.deleteLater()
+
+        result = result or {"errors": {}, "cancelled": True, "mode": "seriale", "workers": 1,
+                            "note": "", "elapsed": 0.0}
+        errors = []
+        for pi in sorted(result.get("errors", {})):
+            name = os.path.basename(str(getattr(profiles[pi], "path", "?")))
+            errors.append(f"{name}: {result['errors'][pi]}")
+        if result.get("fatal"):
+            errors.append(f"errore imprevisto: {result['fatal']}")
+        return {
+            "files": [files_by_idx[i] for i in sorted(files_by_idx)],
+            "errors": errors,
+            "cancelled": bool(result.get("cancelled")),
+            "mode": result.get("mode", "seriale"),
+            "workers": int(result.get("workers", 1) or 1),
+            "note": str(result.get("note", "") or ""),
+            "elapsed": float(result.get("elapsed", 0.0) or 0.0),
+        }
+
+    def _on_variant_job_progress(self, done: int, total: int, saved: int) -> None:
+        st = getattr(self, "_variant_job", None)
+        if not st:
+            return
+        elapsed = time.perf_counter() - st["t0"]
+        text = (f"Canali elaborati: {done}/{total}  -  profili scritti: {saved}/{st['n_profiles']}\n"
+                f"Trascorso: {_fmt_duration(elapsed)}")
+        if 0 < done < total:
+            text += f"  -  rimanente stimato: circa {_fmt_duration(elapsed / done * (total - done))}"
+        st["dlg"].set_progress(done, text)
+
+    def _on_variant_job_finished(self, result) -> None:
+        st = getattr(self, "_variant_job", None)
+        if not st:
+            return
+        st["result"] = result
+        st["loop"].quit()
 
     def _survey_time_zero_check(self, params: dict):
         """Se il time-zero e' attivo confronta la superficie rilevata tra i profili.

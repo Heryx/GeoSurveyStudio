@@ -218,20 +218,184 @@ _QML_MULTIBAND = textwrap.dedent("""\
 """)
 
 
-def write_qml_singleband(tif_path: str, grid: np.ndarray) -> None:
-    """Write .qml sidecar using a 2-98 percentile stretch of the grid."""
+_QML_PSEUDOCOLOR = """\
+<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
+<qgis version="3.0" styleCategories="AllStyleCategories">
+  <pipe>
+    <provider><resampling enabled="false" maxOversampling="2"
+      zoomedInResamplingMethod="nearestNeighbour"
+      zoomedOutResamplingMethod="nearestNeighbour"/></provider>
+    <rasterrenderer type="singlebandpseudocolor" band="1" opacity="1" alphaBand="-1"
+                    classificationMin="{vmin}" classificationMax="{vmax}" nodataColor="">
+      <rasterTransparency/>
+      <minMaxOrigin>
+        <limits>None</limits>
+        <extent>WholeRaster</extent>
+        <statAccuracy>Estimated</statAccuracy>
+        <cumulativeCutLower>0.02</cumulativeCutLower>
+        <cumulativeCutUpper>0.98</cumulativeCutUpper>
+        <stdDevFactor>2</stdDevFactor>
+      </minMaxOrigin>
+      <rastershader>
+        <colorrampshader colorRampType="INTERPOLATED" classificationMode="1" clip="0"
+                         minimumValue="{vmin}" maximumValue="{vmax}" labelPrecision="4">
+{items}
+        </colorrampshader>
+      </rastershader>
+    </rasterrenderer>
+    <brightnesscontrast brightness="0" contrast="0" gamma="1"/>
+    <huesaturation saturation="0" grayscaleMode="0" colorizeOn="0"/>
+    <rasterresampler maxOversampling="2"/>
+  </pipe>
+  <blendMode>0</blendMode>
+</qgis>
+"""
+
+
+def colormap_hex_stops(name: str, n: int = 11):
+    """``n`` evenly spaced ``#rrggbb`` colours of a matplotlib colormap.
+
+    Returns ``None`` when the colormap cannot be resolved (matplotlib missing or
+    unknown name), so callers can fall back to the grayscale style.
+    """
+    try:
+        import matplotlib
+        try:
+            cm = matplotlib.colormaps[str(name)]
+        except Exception:
+            from matplotlib import cm as _cm
+            cm = _cm.get_cmap(str(name))
+        return [
+            "#%02x%02x%02x" % tuple(int(round(255 * c)) for c in cm(i / (n - 1))[:3])
+            for i in range(int(n))
+        ]
+    except Exception:
+        return None
+
+
+def slice_stretch(grid: np.ndarray, clip_lo: float = 2.0, clip_hi: float = 98.0):
+    """``(vmin, vmax)`` from percentile clipping, always ``vmax > vmin``."""
     finite = grid[np.isfinite(grid)]
     if finite.size == 0:
-        vmin, vmax = 0.0, 1.0
+        return 0.0, 1.0
+    lo = float(np.clip(clip_lo, 0.0, 49.0))
+    hi = float(np.clip(clip_hi, 51.0, 100.0))
+    vmin = float(np.percentile(finite, lo))
+    vmax = float(np.percentile(finite, hi))
+    if not vmax > vmin:
+        vmax = vmin + 1e-6
+    return vmin, vmax
+
+
+def write_qml_singleband(tif_path: str, grid: np.ndarray, style: dict | None = None) -> None:
+    """Write the .qml sidecar of a slice GeoTIFF.
+
+    ``style`` (optional) is ``{"cmap": <matplotlib name>, "clip_lo": p, "clip_hi": p}``:
+    the stretch is the ``clip_lo``-``clip_hi`` percentile range (default 2-98) and,
+    when ``cmap`` resolves, the raster is rendered with that colour ramp so QGIS
+    shows the slice the way it looked in the viewer. Without a usable ``cmap`` the
+    classic grayscale style is written.
+    """
+    style = dict(style or {})
+    vmin, vmax = slice_stretch(
+        grid, float(style.get("clip_lo", 2.0)), float(style.get("clip_hi", 98.0))
+    )
+    stops = colormap_hex_stops(style["cmap"]) if style.get("cmap") else None
+    if stops:
+        n = len(stops)
+        items = "\n".join(
+            '          <item alpha="255" value="{v!r}" label="{v:.4g}" color="{c}"/>'.format(
+                v=float(vmin + (vmax - vmin) * i / (n - 1)), c=c
+            )
+            for i, c in enumerate(stops)
+        )
+        qml = _QML_PSEUDOCOLOR.format(vmin=vmin, vmax=vmax, items=items)
     else:
-        vmin = float(np.percentile(finite, 2))
-        vmax = float(np.percentile(finite, 98))
-        if vmax <= vmin:
-            vmax = vmin + 1e-6
-    qml = _QML_SINGLEBAND.format(vmin=vmin, vmax=vmax)
+        qml = _QML_SINGLEBAND.format(vmin=vmin, vmax=vmax)
     qml_path = os.path.splitext(tif_path)[0] + ".qml"
     with open(qml_path, "w", encoding="utf-8") as f:
         f.write(qml)
+    # Lo stile viaggia anche dentro il GeoTIFF: il .qml si perde quando il file
+    # viene copiato nel progetto o spostato.
+    embed_style_in_tif(tif_path, vmin, vmax, stops)
+
+
+_STYLE_KEYS = ("GPR_STYLE_VMIN", "GPR_STYLE_VMAX", "GPR_STYLE_COLORS")
+
+
+def embed_style_in_tif(tif_path: str, vmin: float, vmax: float, colors=None) -> bool:
+    """Store the display stretch (and colour stops) as GDAL metadata inside the
+    GeoTIFF itself. ``colors`` = list of ``#rrggbb`` (None -> grayscale)."""
+    try:
+        from osgeo import gdal
+        ds = gdal.Open(str(tif_path), gdal.GA_Update)
+        if ds is None:
+            return False
+        ds.SetMetadataItem("GPR_STYLE_VMIN", repr(float(vmin)))
+        ds.SetMetadataItem("GPR_STYLE_VMAX", repr(float(vmax)))
+        ds.SetMetadataItem("GPR_STYLE_COLORS", ",".join(colors) if colors else "")
+        ds.FlushCache()
+        ds = None
+        return True
+    except Exception:
+        return False
+
+
+def read_embedded_style(tif_path: str):
+    """``(vmin, vmax, colors)`` embedded by :func:`embed_style_in_tif`, or None."""
+    try:
+        from osgeo import gdal
+        ds = gdal.Open(str(tif_path), gdal.GA_ReadOnly)
+        if ds is None:
+            return None
+        md = ds.GetMetadata() or {}
+        ds = None
+        if "GPR_STYLE_VMIN" not in md or "GPR_STYLE_VMAX" not in md:
+            return None
+        cols = [c for c in (md.get("GPR_STYLE_COLORS") or "").split(",") if c]
+        return float(md["GPR_STYLE_VMIN"]), float(md["GPR_STYLE_VMAX"]), cols
+    except Exception:
+        return None
+
+
+def apply_embedded_style(layer) -> bool:
+    """Apply the style embedded in the layer's GeoTIFF (pseudocolor ramp or
+    grayscale stretch). Returns False when the file carries no style."""
+    try:
+        src = str(layer.source()).split("|")[0]
+        info = read_embedded_style(src)
+        if not info:
+            return False
+        vmin, vmax, cols = info
+        if not vmax > vmin:
+            vmax = vmin + 1e-6
+        from qgis.core import (
+            QgsColorRampShader, QgsRasterShader, QgsSingleBandPseudoColorRenderer,
+        )
+        from PyQt5.QtGui import QColor
+        if not cols:
+            cols = ["#000000", "#ffffff"]
+        n = len(cols)
+        items = [
+            QgsColorRampShader.ColorRampItem(
+                float(vmin + (vmax - vmin) * i / (n - 1)), QColor(c),
+                "{:.4g}".format(vmin + (vmax - vmin) * i / (n - 1)),
+            )
+            for i, c in enumerate(cols)
+        ]
+        ramp = QgsColorRampShader(vmin, vmax)
+        ramp.setColorRampType(QgsColorRampShader.Interpolated)
+        ramp.setClip(False)
+        ramp.setColorRampItemList(items)
+        shader = QgsRasterShader()
+        shader.setRasterShaderFunction(ramp)
+        renderer = QgsSingleBandPseudoColorRenderer(layer.dataProvider(), 1, shader)
+        renderer.setClassificationMin(vmin)
+        renderer.setClassificationMax(vmax)
+        layer.setRenderer(renderer)
+        return True
+    except Exception:
+        return False
 
 
 def write_qml_multiband(tif_path, mn_r, mx_r, mn_g, mx_g, mn_b, mx_b):

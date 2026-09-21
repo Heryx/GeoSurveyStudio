@@ -1575,6 +1575,22 @@ def compute_slice(
         raise TypeError("spec deve essere una slice_spec.SliceSpec")
     rspec = spec if spec.is_resolved() else spec.resolve(profiles)
 
+    if rspec.interp == "bin":
+        # Default engine: every channel at its own position, binned gridding.
+        # The legacy IDW kwargs in ``extra`` (idw_mode, fill_nodata, ...) do not
+        # apply to it and are ignored; progress/cancel/diagnostics are honoured.
+        from .slice_engine import compute_grids
+
+        return compute_grids(
+            profiles, rspec,
+            channel=channel,
+            single_window=single_window,
+            resolution_override=resolution_override,
+            progress_callback=extra.get("progress_callback"),
+            cancel_event=extra.get("cancel_event"),
+            emit_diagnostics=bool(extra.get("emit_diagnostics", True)),
+        )
+
     if single_window is not None:
         try:
             z0, z1 = sorted(float(v) for v in single_window)
@@ -1737,6 +1753,16 @@ def compute_ogpr_slice_grids(
         if not isinstance(spec, _SliceSpec):
             raise TypeError("spec must be a slice_spec.SliceSpec instance")
         resolved_spec = spec if spec.is_resolved() else spec.resolve(profiles)
+        if resolved_spec.interp == "bin":
+            from .slice_engine import compute_grids
+
+            return compute_grids(
+                profiles, resolved_spec,
+                channel=channel,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+                emit_diagnostics=emit_diagnostics,
+            )
         _sk = resolved_spec.to_compute_kwargs()
         z_min = _sk.get("z_min", z_min)
         z_max = _sk.get("z_max", z_max)
@@ -2282,8 +2308,13 @@ def write_grids_to_tifs(
     meta: dict,
     output_dir: str,
     epsg: int | None = None,
+    style: dict | None = None,
 ) -> list[dict]:
-    """Write precomputed grids to disk as GeoTIFF + QML sidecar."""
+    """Write precomputed grids to disk as GeoTIFF + QML sidecar.
+
+    ``style`` = ``{"cmap": ..., "clip_lo": ..., "clip_hi": ...}`` colours the QML
+    like the viewer (see ``raster_io.write_qml_singleband``).
+    """
     _validate_grid_georef_meta(meta)
     os.makedirs(output_dir, exist_ok=True)
     results = []
@@ -2302,7 +2333,7 @@ def write_grids_to_tifs(
         tif_path = os.path.join(output_dir, tif_name)
 
         _write_tif_singleband(grid, tif_path, x_min, y_min, y_max, res, epsg)
-        _write_qml_singleband(tif_path, grid)
+        _write_qml_singleband(tif_path, grid, style)
 
         results.append({
             "path": tif_path,

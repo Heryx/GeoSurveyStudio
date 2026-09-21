@@ -433,6 +433,7 @@ class OgprSliceBuildTask(CallbackTask):
                 self.meta,
                 self.output_dir,
                 epsg=epsg_to_write,
+                style=self.extra_slice_params.get("style"),
             )
             write_s = max(0.0, perf_counter() - t0)
             # Fase D/B: drop a sliceset.json manifest next to the GeoTIFFs so

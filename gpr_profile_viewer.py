@@ -56,6 +56,7 @@ from .gpr_viewer_common import (
     QgsMessageLog,
     QgsRubberBand,
     Qt,
+    RANGE_GAIN_MAX,
     _BlitManager,
     _PipelineWorker,
     _PreviewSliceWorker,
@@ -78,17 +79,21 @@ from .gpr_viewer_common import (
     refresh_gpr_cmaps,
     sip,
 )
+from .gpr_viewer_navigator import NavigatorMixin
 from .gpr_viewer_radargram import RadargramViewMixin
 from .gpr_viewer_timeslice import TimesliceViewMixin
 from .gpr_viewer_variants import VariantsMixin
 from .gpr_viewer_project import ProjectPersistenceMixin
+from .gpr_viewer_presets import PresetsMixin
 
 
 class GprProfileViewer(
+    NavigatorMixin,
     RadargramViewMixin,
     TimesliceViewMixin,
     VariantsMixin,
     ProjectPersistenceMixin,
+    PresetsMixin,
     QMainWindow,
 ):
     cursor_moved = pyqtSignal(float, float, float)  # easting, northing, depth
@@ -425,6 +430,18 @@ class GprProfileViewer(
         amp = float(np.nanpercentile(np.abs(arr), 95)) if arr.size else 0.0
         return nz_ratio * 10.0 + std + amp * 1e-3
 
+    def _cached_channel_score(self, prof, ci: int) -> float:
+        """_channel_signal_score memorizzato per profilo/canale (stesso array = stesso valore)."""
+        data = prof.channel(ci).data
+        cache = self.__dict__.setdefault("_score_cache", {})
+        key = (id(prof), int(ci))
+        hit = cache.get(key)
+        if hit is not None and hit[0] is data:
+            return hit[1]
+        score = self._channel_signal_score(data)
+        cache[key] = (data, score)
+        return score
+
     # ------------------------------------------------------------------
     # UI
     # ------------------------------------------------------------------
@@ -495,19 +512,23 @@ class GprProfileViewer(
         central = QWidget(self)
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
+        self._nav_build_dock()
 
         tb = QToolBar()
         act_open = QAction("\U0001f4c2  Importa profili", self)
         act_open.triggered.connect(self.import_files)
         tb.addAction(act_open)
+        tb.addAction(self._nav_toggle_action())
 
         act_prev = QAction("\u25c4 Profilo", self)
         act_prev.triggered.connect(self._prev_profile)
         tb.addAction(act_prev)
 
+        # Etichetta "n/N nome": non e' piu' in toolbar (ci pensa la combo) ma resta
+        # come testo interrogabile da chi legge il profilo corrente.
         self._lbl_profile = QLabel("\u2014")
-        self._lbl_profile.setMinimumWidth(200)
-        tb.addWidget(self._lbl_profile)
+        self._lbl_profile.hide()
+        self._nav_add_toolbar_widgets(tb)
 
         act_next = QAction("Profilo \u25ba", self)
         act_next.triggered.connect(self._next_profile)
@@ -570,7 +591,7 @@ class GprProfileViewer(
         self._spin_vertical_exag = QDoubleSpinBox()
         self._spin_vertical_exag.setRange(0.5, 20.0)
         self._spin_vertical_exag.setSingleStep(0.5)
-        self._spin_vertical_exag.setValue(5.0)
+        self._spin_vertical_exag.setValue(2.0)   # come IQMaps (aspetto 1:2)
         self._spin_vertical_exag.setDecimals(1)
         self._spin_vertical_exag.setEnabled(bool(self._chk_real_aspect.isChecked()))
         self._spin_vertical_exag.setToolTip(
@@ -1598,7 +1619,16 @@ class GprProfileViewer(
             enabled = dict(self._filter_chain_widget.get_enabled_map() or {})
         except Exception:
             return
+        self._apply_chain_enabled_to_controls(enabled)
 
+        if self._raw_data is not None:
+            self._apply_processing_async()
+            self._request_preview_update(immediate=False)
+
+    def _apply_chain_enabled_to_controls(self, enabled: dict) -> None:
+        """Riporta gli enable della catena sulle caselle `_chk_*` lette dal processing
+        (senza riprocessare)."""
+        prev_sync = bool(self._syncing_filter_chain)
         self._syncing_filter_chain = True
         try:
             if self._is_qt_alive(getattr(self, "_chk_dewow", None)):
@@ -1623,11 +1653,7 @@ class GprProfileViewer(
             if self._is_qt_alive(getattr(self, "_chk_manual_gain", None)):
                 self._chk_manual_gain.setChecked(bool(enabled.get("manual_gain", self._chk_manual_gain.isChecked())))
         finally:
-            self._syncing_filter_chain = False
-
-        if self._raw_data is not None:
-            self._apply_processing_async()
-            self._request_preview_update(immediate=False)
+            self._syncing_filter_chain = prev_sync
 
     def _on_filter_chain_source_toggled(self, _value=None):
         self._sync_filter_chain_from_controls()
@@ -1635,6 +1661,8 @@ class GprProfileViewer(
     def _build_processing_panel(self):
         grp = QGroupBox("Processing")
         fl  = QFormLayout(grp)
+
+        self._build_preset_controls(fl)
 
         # Auto-tune
         self._btn_auto_tune = QPushButton("Auto-tune parametri")
@@ -2047,7 +2075,7 @@ class GprProfileViewer(
             "Gain in funzione della profondita' per recuperare riflessioni profonde."
         )
         self._spin_gain_surface = QDoubleSpinBox()
-        self._spin_gain_surface.setRange(0.0, 100.0)
+        self._spin_gain_surface.setRange(0.0, RANGE_GAIN_MAX)
         self._spin_gain_surface.setSingleStep(0.1)
         self._spin_gain_surface.setValue(0.3)
         self._spin_gain_surface.setEnabled(False)
@@ -2055,13 +2083,19 @@ class GprProfileViewer(
             "Gain minimo della curva TVG (profondita' superficiale)."
         )
         self._spin_gain_deep = QDoubleSpinBox()
-        self._spin_gain_deep.setRange(0.0, 100.0)
+        self._spin_gain_deep.setRange(0.0, RANGE_GAIN_MAX)
         self._spin_gain_deep.setSingleStep(0.5)
         self._spin_gain_deep.setValue(6.0)
         self._spin_gain_deep.setEnabled(False)
         self._spin_gain_deep.setToolTip(
             "Gain massimo della curva TVG (profondita' profonda)."
         )
+        for _sp in (self._spin_gain_surface, self._spin_gain_deep):
+            # Il gain va da <1 a centinaia: il passo segue l'ordine di grandezza.
+            try:
+                _sp.setStepType(QDoubleSpinBox.AdaptiveDecimalStepType)
+            except Exception:
+                pass
         self._btn_range_gain_curve = QPushButton("Edit curve...")
         self._btn_range_gain_curve.setEnabled(False)
         self._btn_range_gain_curve.clicked.connect(self._open_range_gain_curve_editor)
@@ -2529,10 +2563,9 @@ class GprProfileViewer(
         fl_slice_adv.setSpacing(4)
         fl_slice_adv.addRow("Preset:",             self._cb_slice_preset)
         fl_slice_adv.addRow("  azione:",           self._btn_slice_preset_apply)
-        fl_slice_adv.addRow("Slice colormap:",     self._cb_slice_cmap)
-        fl_slice_adv.addRow("  anteprima:",        self._lbl_slice_cmap_preview)
-        fl_slice_adv.addRow("Slice clip min %:",   self._spin_slice_vmin_pct)
-        fl_slice_adv.addRow("Slice clip max %:",   self._spin_slice_vmax_pct)
+        # Colormap e clip della timeslice NON stanno piu' qui: l'"Avanzato" e'
+        # nascosto quando c'e' il pannello SliceSpec, e la colormap risultava
+        # irraggiungibile. Vedi le righe "Colormap"/"Contrasto" sotto il pannello.
         fl_slice_adv.addRow("Potenza IDW (p):",    self._spin_slice_idw_power)
         fl_slice_adv.addRow("Overlap slice:",      self._spin_slice_overlap_pct)
         fl_slice_adv.addRow("Blanking (m):",       self._spin_slice_blanking_m)
@@ -2685,7 +2718,7 @@ class GprProfileViewer(
 
         btn_slice_import = QPushButton("Import to Canvas")
         btn_slice_import.setToolTip(
-            "Importa i GeoTIFF timeslice dalla cartella output nel gruppo 'GPR Timeslices'."
+            "Importa i GeoTIFF timeslice dalla cartella output come sottogruppo di GeoSurvey Studio (nome a scelta, progetto collegato richiesto)."
         )
         btn_slice_import.clicked.connect(self._import_slices_to_canvas)
         fl_slice.addRow(btn_slice_import)
@@ -2742,6 +2775,7 @@ class GprProfileViewer(
             from .slice_spec_panel import SliceSpecPanel
 
             self._slice_spec_panel = SliceSpecPanel()
+            self._slice_spec_panel.spec_changed.connect(self._sync_thickness_from_panel)
             self._slice_spec_panel.spec_changed.connect(
                 lambda: self._request_preview_update(immediate=False)
             )
@@ -2761,6 +2795,33 @@ class GprProfileViewer(
         except Exception as _exc:
             self._slice_spec_panel = None
             print(f"[GPR viewer][WARN] SliceSpecPanel non inizializzato: {_exc}")
+
+        # Aspetto della timeslice: colormap + contrasto. Valgono per la preview
+        # e per il .qml scritto accanto ai GeoTIFF (stesso aspetto in QGIS).
+        self._cb_slice_cmap.setToolTip(
+            "Colormap delle timeslice (indipendente da quella del radargramma).\n"
+            "Vale per la preview e per lo stile dei GeoTIFF salvati."
+        )
+        self._spin_slice_vmin_pct.setSuffix(" %")
+        self._spin_slice_vmax_pct.setSuffix(" %")
+        self._spin_slice_vmin_pct.setToolTip(
+            "Percentile sotto il quale i valori saturano al colore minimo."
+        )
+        self._spin_slice_vmax_pct.setToolTip(
+            "Percentile sopra il quale i valori saturano al colore massimo."
+        )
+        _clip_row = QWidget()
+        _clip_lay = QHBoxLayout(_clip_row)
+        _clip_lay.setContentsMargins(0, 0, 0, 0)
+        _clip_lay.setSpacing(4)
+        _clip_lay.addWidget(self._spin_slice_vmin_pct, 1)
+        _clip_lay.addWidget(QLabel("–"), 0)
+        _clip_lay.addWidget(self._spin_slice_vmax_pct, 1)
+        _disp_row = 3 if self._slice_spec_panel is not None else 2
+        fl_slice.insertRow(_disp_row, "Colormap:", self._cb_slice_cmap)
+        fl_slice.insertRow(_disp_row + 1, "", self._lbl_slice_cmap_preview)
+        fl_slice.insertRow(_disp_row + 2, "Contrasto:", _clip_row)
+        self._sync_thickness_from_panel()
 
         proc_content = QWidget()
         proc_layout = QVBoxLayout(proc_content)
@@ -3248,14 +3309,10 @@ class GprProfileViewer(
     # ------------------------------------------------------------------
 
     def _prev_profile(self):
-        if self._profiles:
-            self._prof_idx = max(0, self._prof_idx - 1)
-            self._load_current_profile(deferred=True)
+        self._select_profile(self._prof_idx - 1)
 
     def _next_profile(self):
-        if self._profiles:
-            self._prof_idx = min(len(self._profiles) - 1, self._prof_idx + 1)
-            self._load_current_profile(deferred=True)
+        self._select_profile(self._prof_idx + 1)
 
     def keyPressEvent(self, event):
         key = int(event.key()) if event is not None else 0
@@ -3275,6 +3332,8 @@ class GprProfileViewer(
             self._reload_data(deferred=True)
             # Auto reset zoom on channel change (same behavior as Reset Zoom button).
             self._reset_zoom()
+            self._sync_navigator()
+            self._update_slice_track_overlay()
 
     def _current_channel_elevation(self):
         """Quote per traccia del profilo/canale corrente, allineate al numero
@@ -3349,11 +3408,12 @@ class GprProfileViewer(
         self._trim_end_traces = int(end)
         self._reload_data(deferred=True)
 
-    def _load_current_profile(self, deferred: bool = False):
+    def _load_current_profile(self, deferred: bool = False, channel: Optional[int] = None):
         if not self._profiles:
             self._update_slice_profile_info()
             return
         prof = self._profiles[self._prof_idx]
+        self._refresh_preset_controls(prof)
         # Reset zoom when changing profile to avoid carrying tiny previous windows.
         self._view_xlim = None
         self._view_ylim = None
@@ -3368,21 +3428,28 @@ class GprProfileViewer(
             return
         self._cb_channel.blockSignals(True)
         self._safe_cb_clear(self._cb_channel)
+        # _safe_cb_clear riabilita i segnali: senza questo addItem/setCurrentIndex
+        # richiamano _on_channel_changed (2 ricaricamenti + ridisegni in piu').
+        self._cb_channel.blockSignals(True)
         for i in range(prof.n_channels):
             self._cb_channel.addItem(f"Ch {i}")
 
         # Seleziona automaticamente il canale con segnale migliore.
         best_idx = 0
         best_score = -1.0
-        for i in range(prof.n_channels):
+        # channel=...: canale imposto da chi chiama (sidebar, clic sulla time-slice).
+        forced = channel is not None and 0 <= int(channel) < int(prof.n_channels)
+        for i in range(0 if forced else prof.n_channels):
             try:
-                score = self._channel_signal_score(prof.channel(i).data)
+                score = self._cached_channel_score(prof, i)
             except Exception as exc:
                 self._note_swallowed(f"punteggio segnale del canale {i}", exc)
                 score = -1.0
             if score > best_score:
                 best_score = score
                 best_idx = i
+        if forced:
+            best_idx = int(channel)
         self._ch_idx = int(best_idx)
         self._cb_channel.setCurrentIndex(self._ch_idx)
         try:
@@ -3403,12 +3470,14 @@ class GprProfileViewer(
         self._reload_data(deferred=deferred)
         # Auto reset zoom on profile change (same behavior as Reset Zoom button).
         self._reset_zoom()
-        if self._ch_idx != 0:
+        if self._ch_idx != 0 and not forced:
             self._safe_set_text(
                 self._lbl_status,
                 f"Canale auto-selezionato: Ch {self._ch_idx} (segnale migliore)."
             )
-        self._draw_profile_line_on_canvas()
+        self._draw_profile_line_on_canvas(pan_if_hidden=True)
+        self._sync_navigator()
+        self._update_slice_track_overlay()
 
     def _trace_indices_for(self, n_t: int) -> np.ndarray:
         """Indici delle tracce visibili (trim + flip) per un profilo di n_t tracce."""
@@ -4046,16 +4115,13 @@ class GprProfileViewer(
 
     def _sanitize_range_gain_breakpoints(self, points):
         arr = np.asarray(points if points is not None else [], dtype=np.float64).reshape(-1, 2)
-        gain_max = float(
-            getattr(self, "_spin_gain_deep", None).value()
-            if hasattr(self, "_spin_gain_deep")
-            else 100.0
-        )
-        gain_max = float(np.clip(gain_max, 1.0, 100.0))
+        # Il tetto e' assoluto: non dipende dal gain "deep", altrimenti un punto
+        # interno piu' alto dell'ultimo (picco a media profondita') verrebbe
+        # appiattito al valore di fondo.
         rows = []
         for x, y in arr:
             if np.isfinite(x) and np.isfinite(y):
-                rows.append((float(np.clip(x, 0.0, 1.0)), float(np.clip(y, 0.0, gain_max))))
+                rows.append((float(np.clip(x, 0.0, 1.0)), float(np.clip(y, 0.0, RANGE_GAIN_MAX))))
         if not rows:
             rows = [(0.0, float(self._spin_gain_surface.value())), (1.0, float(self._spin_gain_deep.value()))]
         rows.sort(key=lambda p: p[0])
@@ -4135,12 +4201,7 @@ class GprProfileViewer(
         self._apply_range_gain_change()
 
     def _on_range_gain_curve_live_changed(self, points, gain_max=None):
-        if gain_max is not None and hasattr(self, "_spin_gain_deep"):
-            self._updating_range_gain_controls = True
-            try:
-                self._spin_gain_deep.setValue(float(np.clip(float(gain_max), 1.0, 100.0)))
-            finally:
-                self._updating_range_gain_controls = False
+        # `gain_max` e' solo la scala dell'asse dell'editor: non tocca i controlli.
         self._range_gain_breakpoints = self._sanitize_range_gain_breakpoints(points)
         self._sync_range_gain_spins_from_breakpoints()
         if self._chk_range_gain.isChecked():
@@ -4154,7 +4215,6 @@ class GprProfileViewer(
         dlg = _RangeGainCurveDialog(
             points=original,
             max_points=16,
-            gain_max=float(np.clip(self._spin_gain_deep.value(), 1.0, 100.0)),
             on_curve_changed=self._on_range_gain_curve_live_changed,
             parent=self,
         )
@@ -4551,7 +4611,11 @@ class GprProfileViewer(
                     if enabled:
                         fcw.set_enabled_map({str(k): bool(v) for k, v in enabled.items()},
                                             emit_signal=False)
-                    self._on_filter_chain_widget_changed()
+                    # Non _on_filter_chain_widget_changed(): con il flag di sync gia'
+                    # attivo uscirebbe subito e le caselle _chk_* resterebbero indietro.
+                    self._apply_chain_enabled_to_controls(
+                        dict(fcw.get_enabled_map() or {})
+                    )
                 except Exception as exc:
                     print(f"[GPR viewer][WARN] catena filtri: {exc}")
             self._apply_processing_widget_params(params)
@@ -5135,6 +5199,11 @@ class GprProfileViewer(
             except Exception:
                 pass
             self._timeslice_dock = None
+        if self._nav_dock is not None:
+            try:
+                self._save_dock_state(self._nav_dock, "navigator")
+            except Exception:
+                pass
         for rb in (self._rb_point, self._rb_line, self._rb_crosshair_h, self._rb_crosshair_v):
             if rb is not None:
                 try:

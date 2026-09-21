@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 """Shared time-slice numeric core: amplitude extraction, depth windowing and
-IDW gridding helpers.
+gridding helpers.
 
-Extracted verbatim from ``gpr_ogpr_slicer.py`` (Fase A of the time-slice
-redesign) so every slice generator shares one implementation. Behaviour is
-unchanged; only the module location moved.
+The legacy helpers (``_envelope``, ``_depth_to_sample_range``, the ``_bin_with_idw*``
+family, ...) were extracted verbatim from ``gpr_ogpr_slicer.py`` (Fase A of the
+time-slice redesign) so every slice generator shares one implementation.
+
+The "binned gridding" section (``window_amplitude``, ``window_sample_range``,
+``grid_binned``, ...) is the numeric core of ``slice_engine`` - the default
+engine that replaced IDW for array data. It is pure NumPy/SciPy and is covered
+by ``test/test_slice_engine.py``.
 
 SciPy is imported lazily inside the functions that need it.
 """
@@ -187,6 +192,203 @@ def _blanking_mask_from_distance(
 # ---------------------------------------------------------------------------
 # IDW helpers
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Binned gridding (replaces IDW as the default): splat + normalised convolution
+# ---------------------------------------------------------------------------
+#
+# Why not IDW: with 1/d^p weights every grid cell that happens to sit next to a
+# sample takes (almost) that single sample's value, while cells between samples
+# are blurred averages. On a track-based survey this leaves a "string of beads"
+# along every line (isolated one-cell dots), which is exactly what the array
+# GPR time-slices showed. Here every sample is instead *splatted* onto the four
+# surrounding nodes with bilinear weights (so density is uniform and no sample
+# can dominate), the accumulated field is smoothed with a Gaussian normalised by
+# the accumulated weights (normalised convolution), and holes between lines
+# are filled from a wider Gaussian, blended in smoothly. No KD-tree, no Python
+# loop over cells: a 90k-cell slice takes ~0.1 s.
+
+AMPLITUDE_WINDOW_MODES = ("abs_mean", "rms", "env_peak", "signed_mean", "max_abs")
+_HILBERT_PAD = 48  # samples of context around the window for the envelope
+
+
+def depth_per_sample_m(dt_ns: float, velocity_m_s: float) -> float:
+    """Two-way-travel depth increment of one sample: ``dt * v / 2`` (metres).
+
+    Returns 0.0 when either input is not a positive finite number.
+    """
+    try:
+        dt = float(dt_ns)
+        v = float(velocity_m_s)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (np.isfinite(dt) and np.isfinite(v)) or dt <= 0.0 or v <= 0.0:
+        return 0.0
+    return dt * 1e-9 * v / 2.0
+
+
+def window_sample_range(
+    z_from: float, z_to: float, dz_sample: float, n_samples: int,
+) -> tuple[int, int]:
+    """Sample rows covering the depth window ``[z_from, z_to]``.
+
+    Depth is ``row * dz_sample`` (row 0 = time zero). Unlike
+    ``_depth_to_sample_range`` this does not assume the matrix spans the whole
+    nominal depth range, so a matrix cropped by time-zero alignment or channel
+    stacking still maps depth correctly. Returns ``(0, 0)`` for an empty window.
+    """
+    if n_samples <= 0 or not (dz_sample > 0.0):
+        return 0, 0
+    z0 = max(0.0, min(float(z_from), float(z_to)))
+    z1 = max(0.0, max(float(z_from), float(z_to)))
+    lo = int(np.floor(z0 / dz_sample + 1e-9))
+    hi = int(np.ceil(z1 / dz_sample - 1e-9))
+    if hi <= lo:
+        hi = lo + 1
+    if lo >= n_samples:
+        return 0, 0
+    return lo, min(hi, n_samples)
+
+
+def window_amplitude(data: np.ndarray, s_lo: int, s_hi: int, mode: str) -> np.ndarray:
+    """One amplitude value per trace over the sample rows ``[s_lo, s_hi)``.
+
+    ``data`` is a ``(n_samples, n_traces)`` radargram. Modes:
+    ``abs_mean`` mean(|a|), ``rms`` sqrt(mean(a^2)), ``max_abs`` max(|a|),
+    ``signed_mean`` mean(a), ``env_peak`` max of the Hilbert envelope (computed
+    on the window plus a few samples of context, so it is not distorted at the
+    window edges and never touches the rest of the trace).
+    """
+    if mode not in AMPLITUDE_WINDOW_MODES:
+        raise ValueError(f"amplitude mode {mode!r} not in {AMPLITUDE_WINDOW_MODES}")
+    n_s = int(data.shape[0])
+    s_lo = max(0, int(s_lo))
+    s_hi = min(n_s, int(s_hi))
+    if s_hi <= s_lo:
+        return np.full(int(data.shape[1]), np.nan, dtype=np.float64)
+    if mode == "env_peak":
+        a = max(0, s_lo - _HILBERT_PAD)
+        b = min(n_s, s_hi + _HILBERT_PAD)
+        env = _envelope(data[a:b])
+        return env[s_lo - a:s_hi - a].max(axis=0).astype(np.float64)
+    seg = data[s_lo:s_hi]
+    if mode == "abs_mean":
+        return np.abs(seg).mean(axis=0, dtype=np.float64)
+    if mode == "rms":
+        return np.sqrt(np.mean(np.square(seg, dtype=np.float64), axis=0))
+    if mode == "max_abs":
+        return np.abs(seg).max(axis=0).astype(np.float64)
+    return seg.mean(axis=0, dtype=np.float64)  # signed_mean
+
+
+def _splat_bilinear(x, y, v, x_min, y_min, n_x, n_y, resolution):
+    """Accumulate ``sum(w*v)`` and ``sum(w)`` on the grid nodes (bilinear weights)."""
+    fx = (x - x_min) / resolution
+    fy = (y - y_min) / resolution
+    ix = np.floor(fx).astype(np.int64)
+    iy = np.floor(fy).astype(np.int64)
+    tx = fx - ix
+    ty = fy - iy
+    n_cells = int(n_x) * int(n_y)
+    s = np.zeros(n_cells, dtype=np.float64)
+    w = np.zeros(n_cells, dtype=np.float64)
+    for dx, wx in ((0, 1.0 - tx), (1, tx)):
+        for dy, wy in ((0, 1.0 - ty), (1, ty)):
+            jx = ix + dx
+            jy = iy + dy
+            ok = (jx >= 0) & (jx < n_x) & (jy >= 0) & (jy < n_y)
+            if not ok.any():
+                continue
+            idx = jy[ok] * n_x + jx[ok]
+            ww = (wx * wy)[ok]
+            s += np.bincount(idx, weights=ww * v[ok], minlength=n_cells)
+            w += np.bincount(idx, weights=ww, minlength=n_cells)
+    return s.reshape(n_y, n_x), w.reshape(n_y, n_x)
+
+
+def _normalized_convolution(s, w, sigma):
+    """Gaussian-smoothed ``s / w`` (NaN where the kernel saw no weight)."""
+    from scipy.ndimage import gaussian_filter
+
+    num = gaussian_filter(s, sigma, mode="constant")
+    den = gaussian_filter(w, sigma, mode="constant")
+    out = np.full(s.shape, np.nan, dtype=np.float64)
+    ok = den > 1e-9
+    out[ok] = num[ok] / den[ok]
+    return out
+
+
+def grid_binned(
+    x_pts,
+    y_pts,
+    v_pts,
+    x_min: float,
+    y_min: float,
+    n_x: int,
+    n_y: int,
+    resolution: float,
+    reach_m: float,
+    sigma_cells: float = 1.0,
+    blanking_m: float = 0.0,
+    min_cover: float = 0.3,
+) -> np.ndarray:
+    """Grid scattered samples without IDW's point-dominated bull's-eyes.
+
+    ``sigma_cells`` is the Gaussian sigma (in cells) of the base smoothing.
+    ``reach_m`` is the largest gap between data that is bridged (gaps up to
+    ``2*reach_m`` wide are closed; the outer edge of the survey only grows by
+    ~1.5 cells). ``blanking_m`` > 0 additionally NaNs every cell farther than
+    that from a sample. Returns ``(n_y, n_x)`` float32, row 0 = ``y_min``.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    n_x = int(n_x)
+    n_y = int(n_y)
+    res = float(resolution)
+    x = np.asarray(x_pts, dtype=np.float64).ravel()
+    y = np.asarray(y_pts, dtype=np.float64).ravel()
+    v = np.asarray(v_pts, dtype=np.float64).ravel()
+    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(v)
+    if not ok.any():
+        return np.full((n_y, n_x), np.nan, dtype=np.float32)
+    x, y, v = x[ok], y[ok], v[ok]
+
+    s, w = _splat_bilinear(x, y, v, float(x_min), float(y_min), n_x, n_y, res)
+    cover = w >= float(min_cover)
+    if not cover.any():
+        return np.full((n_y, n_x), np.nan, dtype=np.float32)
+    s = np.where(cover, s, 0.0)
+    w = np.where(cover, w, 0.0)
+
+    from scipy.ndimage import gaussian_filter
+
+    sig = max(0.3, float(sigma_cells))
+    fine = _normalized_convolution(s, w, sig)
+    coverage = gaussian_filter(cover.astype(np.float64), sig, mode="constant")
+
+    reach_cells = max(1.0, float(reach_m) / res)
+    sig_wide = float(min(max(2.0 * sig, reach_cells / 2.0), 64.0))
+    wide = _normalized_convolution(s, w, sig_wide)
+
+    # Smooth hand-over from the fine field (where it has data all around) to the
+    # wide field (holes / survey edge): no visible seam between the two scales.
+    t = np.clip((coverage - 0.15) / 0.45, 0.0, 1.0)
+    t = t * t * (3.0 - 2.0 * t)
+    fine_f = np.where(np.isfinite(fine), fine, 0.0)
+    wide_f = np.where(np.isfinite(wide), wide, 0.0)
+    out = np.where(np.isfinite(fine), t * fine_f + (1.0 - t) * wide_f, wide)
+
+    # Which cells are allowed to carry a value.
+    dist = distance_transform_edt(~cover)
+    pad = int(np.ceil(reach_cells)) + 2
+    dilated = np.pad(dist <= reach_cells, pad)
+    closed = (distance_transform_edt(dilated) > reach_cells)[pad:-pad, pad:-pad]
+    allowed = closed | (dist <= 1.5)
+    if float(blanking_m) > 0.0:
+        allowed &= dist <= float(blanking_m) / res
+    out = np.where(allowed & np.isfinite(out), out, np.nan)
+    return out.astype(np.float32)
 
 
 def _estimate_idw_knn_k(
