@@ -217,6 +217,39 @@ def _indices_from_view_geom(n_full: int, view_geom):
     return idx if idx.size > 0 else None
 
 
+_GEOMETRY_ATTRS = ("easting", "northing", "altitude", "heading", "distances")
+
+
+def aligned_geometry_columns(source_channel, n_traces: int, view_geom) -> dict | None:
+    """Geometria del canale sorgente riportata alle ``n_traces`` colonne di un dato
+    salvato (stesso trim/flip del salvataggio). ``None`` se non e' ricostruibile.
+
+    Ritorna ``{attributo: array}`` per easting/northing/altitude/heading/distances;
+    le distanze ripartono da 0. E' l'unico punto che sa riallineare la geometria
+    corrente (pagina di posizionamento) a un radargramma processato.
+    """
+    cols = {a: np.asarray(getattr(source_channel, a, []), dtype=np.float64)
+            for a in _GEOMETRY_ATTRS}
+    n_full = int(cols["easting"].shape[0])
+    if n_full <= 0 or any(v.shape[0] != n_full for v in cols.values()):
+        return None
+    idx = None
+    cand = _indices_from_view_geom(n_full, view_geom) if view_geom else None
+    if cand is not None and cand.size == int(n_traces):
+        idx = cand
+    elif n_full == int(n_traces):
+        idx = np.arange(int(n_traces), dtype=np.int64)
+    if idx is None:
+        return None
+    out = {}
+    for attr, arr in cols.items():
+        sub = arr[idx]
+        if attr == "distances":
+            sub = np.abs(sub - sub[0])
+        out[attr] = sub.copy()
+    return out
+
+
 def apply_geometry_from_profile(npz_profile, source_profile) -> bool:
     """Sostituisce la geometria di un profilo caricato da .npz con quella CORRENTE
     del profilo sorgente in memoria.
@@ -235,27 +268,15 @@ def apply_geometry_from_profile(npz_profile, source_profile) -> bool:
     for ci, ch in enumerate(getattr(npz_profile, "channels", []) or []):
         src = source_profile.channel(min(ci, n_src_ch - 1))
         n_t = int(np.asarray(ch.data).shape[1])
-        cols = {}
-        for attr in ("easting", "northing", "altitude", "heading", "distances"):
-            cols[attr] = np.asarray(getattr(src, attr, []), dtype=np.float64)
-        n_full = int(cols["easting"].shape[0])
-        idx = None
-        if n_full > 0:
-            cand = _indices_from_view_geom(n_full, view_geom) if view_geom else None
-            if cand is not None and cand.size == n_t:
-                idx = cand
-            elif n_full == n_t:
-                idx = np.arange(n_t, dtype=np.int64)
-        if idx is None or any(v.shape[0] != n_full for v in cols.values()):
+        cols = aligned_geometry_columns(src, n_t, view_geom)
+        if cols is None:
+            n_full = int(np.asarray(getattr(src, "easting", [])).shape[0])
             _dbg.log("NPZ-GEOM", f"canale {ci}: tracce npz={n_t} vs sorgente={n_full}, "
                      "geometria NON riallineabile: uso quella salvata nel .npz")
             ok_all = False
             continue
         for attr, arr in cols.items():
-            sub = arr[idx]
-            if attr == "distances":
-                sub = np.abs(sub - sub[0])
-            setattr(ch, attr, sub.copy())
+            setattr(ch, attr, arr)
         _dbg.log("NPZ-GEOM", f"{os.path.basename(str(getattr(npz_profile, 'path', '?')))} ch{ci}: "
                  "geometria presa dal profilo corrente | " + _dbg.describe_track(ch.easting, ch.northing))
     return ok_all

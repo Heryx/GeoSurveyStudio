@@ -755,6 +755,17 @@ class GprOgprVolumeMixin:
                     QMessageBox.information(
                         getattr(self, "dlg", None), "Slice completate", msg
                     )
+                # Radargrammi processati sempre a portata di mano mentre si lavora con le
+                # time-slice sul canvas, anche a Profile Viewer chiuso.
+                if hasattr(self, "open_radargram_dock"):
+                    try:
+                        src_variant = str(getattr(resolved_spec, "source_variant", "") or "").strip()
+                        self.open_radargram_dock(
+                            variant=None if src_variant.lower() in ("", "raw") else src_variant,
+                            activate=False,
+                        )
+                    except Exception as exc:
+                        _dbg.log("VOLUME", f"pannello radargrammi non aperto: {exc}")
                 cb_ok = True
                 cb_payload.update(
                     {

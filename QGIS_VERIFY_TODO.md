@@ -148,3 +148,32 @@ a destra **"Radargramma + marker (profilo selezionato)"**.
    correnti).
 4. "Apri Viewer 3D" con una variante selezionata usa gli stessi dati filtrati.
 5. Salvare una nuova variante → compare subito nella tendina.
+
+---
+
+## Pannello "Radargrammi processati" nel canvas (2026-09-21, non committato)
+
+Nuovo pannello agganciabile (`gpr_radargram_dock.py` + `radargram_store.py`), indipendente
+dal Profile Viewer. Testato offscreen con un `QgsMapCanvas` vero e sul dataset SUASA;
+**non** provato nella finestra reale di QGIS. Ricaricare il plugin prima.
+
+1. Toolbar/menu GeoSurvey Studio → **Radargrammi processati**: il pannello compare in
+   basso; trascinandolo si aggancia a un lato o si stacca (finestra mobile). Da stretto
+   i controlli vanno a capo.
+2. Con il Profile Viewer **chiuso**: variante (default "Lavoro"), profilo e canale si
+   cambiano da tendine, ◀ ▶, PgSu/PgGiu (profilo) e frecce sinistra/destra (canale).
+3. **Profondità**: clic sul radargramma o campo "Profondità" → riga verde; il cursore
+   mostra profondità, tempo (ns), traccia, ampiezza, E/N. Rotella = zoom, tasto destro =
+   trascina, doppio clic = vista intera.
+4. Selezionare una time-slice nel pannello Livelli (con "Segui time-slice"): **atteso**
+   fascia verde = finestra di profondità della slice e passaggio alla variante da cui
+   è stata generata. Le slice senza `sliceset.json` accanto (gruppi vecchi) non fanno nulla.
+5. **Sulla mappa**: linea arancione = traccia del profilo/canale; punto giallo sotto il
+   cursore. Controllare che coincidano con la time-slice (stesso CRS del progetto).
+6. **Punta sulla mappa**: un clic sul canvas apre profilo/canale/traccia più vicini
+   (tolleranza ~10 px, minimo 2 m); scegliendo un altro strumento QGIS il pulsante si spegne.
+7. Chiudere il pannello con la X: linea e punto spariscono dalla mappa; riaprirlo li rimette.
+8. Generare un gruppo di time-slice ("Salva gruppo"): **atteso** il pannello si apre (senza
+   rubare il focus) sulla variante sorgente.
+9. Riga di stato: "coordinate: salvate nel .npz" se il viewer è chiuso; assente se è aperto
+   (geometria dai profili in memoria). Dopo un nuovo posizionamento premere ⟳.

@@ -27,6 +27,12 @@ except Exception:
     _HAS_PROFILE_VIEWER = False
 
 try:
+    from .gpr_radargram_dock import RadargramDock
+    _HAS_RADARGRAM_DOCK = True
+except Exception:
+    _HAS_RADARGRAM_DOCK = False
+
+try:
     from .resources import *  # noqa: F401,F403
     _HAS_QT_RESOURCES = True
 except Exception:
@@ -97,6 +103,9 @@ class GeoSurveyStudioPlugin(
 
         # GPR Profile Viewer (finestra indipendente)
         self._gpr_profile_viewer = None
+        # Pannello agganciabile con i radargrammi processati (vive nel canvas di QGIS,
+        # indipendente dal Profile Viewer)
+        self._radargram_dock = None
 
         # Mixin state initialisation – each mixin owns and resets its own attributes.
         self._init_grid_state()
@@ -171,6 +180,22 @@ class GeoSurveyStudioPlugin(
             radar_icon = self._qgis_theme_icon("mIconRasterLayer.svg", "mIconRaster.svg")
             if radar_icon is not None and not radar_icon.isNull():
                 self.gpr_viewer_action.setIcon(radar_icon)
+
+        # --- Radargrammi processati (pannello agganciabile) ---
+        if _HAS_RADARGRAM_DOCK:
+            self.radargram_dock_action = self.add_action(
+                icon_path,
+                text=self.tr(u'Radargrammi processati'),
+                callback=self.open_radargram_dock,
+                parent=self.iface.mainWindow(),
+            )
+            self.radargram_dock_action.setToolTip(
+                "Pannello agganciabile con i radargrammi processati: profilo, canale e "
+                "profondità, senza il Profile Viewer."
+            )
+            wave_icon = self._qgis_theme_icon("mActionAddRasterLayer.svg", "mIconRasterLayer.svg")
+            if wave_icon is not None and not wave_icon.isNull():
+                self.radargram_dock_action.setIcon(wave_icon)
 
         self.check_updates_action = self.add_action(
             icon_path,
@@ -352,6 +377,93 @@ class GeoSurveyStudioPlugin(
         self._gpr_profile_viewer.raise_()
         self._gpr_profile_viewer.activateWindow()
 
+    # ------------------------------------------------------------------
+    # Radargrammi processati (pannello agganciabile)
+    # ------------------------------------------------------------------
+
+    def _radargram_workspace_root(self) -> str:
+        """Cartella-progetto (o GPR_Processing) che contiene `processed/`."""
+        viewer = self._live_profile_viewer()
+        if viewer is not None:
+            try:
+                base = (viewer._gpr_processing_paths() or {}).get("base", "")
+                if base and os.path.isdir(base):
+                    return base
+            except Exception:
+                pass
+        root = ""
+        try:
+            root = (self.settings.value(self.settings_key_active_project, "", type=str) or "").strip()
+        except Exception:
+            root = ""
+        if not root:
+            try:
+                from qgis.core import QgsProject
+                qgs = str(QgsProject.instance().fileName() or "").strip()
+                root = os.path.dirname(os.path.normpath(qgs)) if qgs else ""
+            except Exception:
+                root = ""
+        return root
+
+    def _live_profile_viewer(self):
+        """Il Profile Viewer se e' aperto e ha profili in memoria, altrimenti None."""
+        viewer = self._gpr_profile_viewer
+        if viewer is None:
+            return None
+        try:
+            viewer.objectName()
+            return viewer if getattr(viewer, "_profiles", None) else None
+        except Exception:
+            return None
+
+    def _radargram_geometry_provider(self, stem: str):
+        """Profilo in memoria del viewer con quel nome: unica fonte del posizionamento."""
+        viewer = self._live_profile_viewer()
+        if viewer is None:
+            return None
+        for prof in viewer._profiles:
+            if os.path.splitext(os.path.basename(str(getattr(prof, "path", "") or "")))[0] == stem:
+                return prof
+        return None
+
+    def open_radargram_dock(self, checked=False, variant=None, profile_stem=None, activate=True):
+        """Mostra (creandolo se serve) il pannello dei radargrammi processati.
+
+        `variant` = nome o cartella della variante da aprire; `activate=False` lo mostra
+        senza portarlo in primo piano (uso automatico dopo la generazione delle time-slice).
+        """
+        if not _HAS_RADARGRAM_DOCK:
+            QMessageBox.warning(
+                self.iface.mainWindow(), "Radargrammi processati",
+                "Pannello non disponibile (componenti QGIS/matplotlib mancanti).")
+            return None
+        from qgis.PyQt.QtCore import Qt
+        dock = self._radargram_dock
+        alive = False
+        if dock is not None:
+            try:
+                dock.objectName()
+                alive = True
+            except RuntimeError:
+                alive = False
+        if not alive:
+            dock = RadargramDock(
+                self.iface,
+                workspace_provider=self._radargram_workspace_root,
+                geometry_provider=self._radargram_geometry_provider,
+                parent=self.iface.mainWindow(),
+            )
+            self.iface.addDockWidget(Qt.BottomDockWidgetArea, dock)
+            self._radargram_dock = dock
+        else:
+            dock.refresh_variants()
+        dock.show()
+        if variant:
+            dock.open_variant(variant, profile_stem=profile_stem)
+        if activate:
+            dock.raise_()
+        return dock
+
     def unload(self):
         """Unload the plugin."""
         try:
@@ -361,6 +473,14 @@ class GeoSurveyStudioPlugin(
             pass
         if self.dlg is not None:
             self._save_ui_settings()
+        if self._radargram_dock is not None:
+            try:
+                self._radargram_dock.cleanup()
+                self.iface.removeDockWidget(self._radargram_dock)
+                self._radargram_dock.deleteLater()
+            except Exception:
+                pass
+            self._radargram_dock = None
         # Chiudi viewer GPR se aperto
         if self._gpr_profile_viewer is not None:
             try:
