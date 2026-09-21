@@ -440,5 +440,77 @@ class TestComputePositions(unittest.TestCase):
         np.testing.assert_allclose(arr[:, 1], [100.0, 102.5, 101.0])
 
 
+
+# -- Test deduzione geometria da coordinate reali --
+
+class TestInferGeometryFromCoords(unittest.TestCase):
+
+    @staticmethod
+    def _items(profs):
+        return [
+            {"prof": p, "name": f"P{i}", "axis": "X", "offset": float(i),
+             "reversed": False, "length": 10.0}
+            for i, p in enumerate(profs)
+        ]
+
+    @staticmethod
+    def _infer(items):
+        from gpr_manual_positioning_dialog import GprManualPositioningDialog
+        d = GprManualPositioningDialog.__new__(GprManualPositioningDialog)
+        d._infer_geometry_from_coords(items)
+
+    def test_zigzag_detected_from_utm(self):
+        e = np.linspace(350_000.0, 350_020.0, 50)
+        profs = [
+            _make_profile(easting=e, northing=np.full(50, 4_500_000.0)),
+            _make_profile(easting=e[::-1], northing=np.full(50, 4_500_001.0)),
+            _make_profile(easting=e, northing=np.full(50, 4_500_002.0)),
+        ]
+        items = self._items(profs)
+        self._infer(items)
+        self.assertEqual([it["reversed"] for it in items], [False, True, False])
+        self.assertTrue(all(it["axis"] == "X" for it in items))
+        self.assertAlmostEqual(items[2]["offset"], 2.0, places=6)
+        self.assertAlmostEqual(items[0]["length"], 20.0, places=6)
+
+    def test_y_axis_profiles(self):
+        n = np.linspace(4_500_000.0, 4_500_030.0, 40)
+        profs = [
+            _make_profile(easting=np.full(40, 350_000.0), northing=n),
+            _make_profile(easting=np.full(40, 350_001.5), northing=n[::-1]),
+        ]
+        items = self._items(profs)
+        self._infer(items)
+        self.assertEqual([it["axis"] for it in items], ["Y", "Y"])
+        self.assertEqual([it["reversed"] for it in items], [False, True])
+        self.assertAlmostEqual(items[1]["offset"], 1.5, places=6)
+
+    def test_profiles_without_coords_keep_defaults(self):
+        items = self._items([_make_profile(), _make_profile()])
+        self._infer(items)
+        self.assertEqual([it["reversed"] for it in items], [False, False])
+        self.assertEqual([it["offset"] for it in items], [0.0, 1.0])
+
+
+class TestDebugLog(unittest.TestCase):
+
+    def test_log_buffer_and_clear(self):
+        import gpr_debug_log as dbg
+        dbg.clear()
+        dbg.log("T", "prova")
+        self.assertIn("prova", dbg.get_text())
+        dbg.log_once("k", "T", "una-volta")
+        dbg.log_once("k", "T", "una-volta")
+        self.assertEqual(dbg.get_text().count("una-volta"), 1)
+        dbg.clear()
+        self.assertEqual(dbg.get_text(), "")
+
+    def test_describe_track_handles_nan_and_empty(self):
+        import gpr_debug_log as dbg
+        self.assertEqual(dbg.describe_track([], []), "vuota")
+        txt = dbg.describe_track([1.0, np.nan, 3.0], [1.0, 2.0, 3.0])
+        self.assertIn("nonfinite=1", txt)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg version="1.1" xmlns="http://www.w3.org/2000/svg">
+  <linearGradient id="id-ES-Platinum-16" data-name="ES Platinum 16" gradientUnits="objectBoundingBox" spreadMethod="pad" x1="0%" x2="100%" y1="0%" y2="0%">
+    <!--
+      cpt-city: es/platinum/es_platinum_16 (PspGradient)
+
+      Themed collections of art gradient by Turkish graphic
+      designer ElvenSword. The original PaintShop Pro
+      gradients can be downloaded from DeviantArt.
+
+      author: ElvenSword
+      copyright: Credit requested for use, required for distribution
+      year: 2008
+      url: https://phillips.shef.ac.uk/pub/cpt-city/es/platinum
+    -->
+    <stop offset="0.0000%" stop-color="rgb(8, 16, 19)" stop-opacity="1.0000"/>
+    <stop offset="5.0049%" stop-color="rgb(24, 29, 33)" stop-opacity="1.0000"/>
+    <stop offset="75.0000%" stop-color="rgb(162, 162, 166)" stop-opacity="1.0000"/>
+    <stop offset="97.9980%" stop-color="rgb(239, 242, 241)" stop-opacity="1.0000"/>
+    <stop offset="100.0000%" stop-color="rgb(239, 242, 241)" stop-opacity="1.0000"/>
+  </linearGradient>
+  <metadata>
+    <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:xm="http://jjg.gitlab.io/2025/metadata">
+      <rdf:Description>
+        <xm:creator name="cptutils" version="1.85"/>
+        <xm:created date="2026-02-08"/>
+      </rdf:Description>
+    </rdf:RDF>
+  </metadata>
+</svg>

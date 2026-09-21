@@ -299,3 +299,27 @@ class ComputeWithSpecTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGridBg(unittest.TestCase):
+    def test_apply_grid_bg_removes_row_and_column_bands(self):
+        import numpy as np
+        from grid_filters import apply_grid_bg
+        rng = np.random.default_rng(1)
+        base = rng.normal(0, 0.1, (60, 80))
+        rows = rng.normal(0, 2.0, (60, 1))
+        cols = rng.normal(0, 2.0, (1, 80))
+        g = base + rows + cols
+        h = apply_grid_bg(g, "h")
+        self.assertLess(np.std(h.mean(axis=1)), 0.05)
+        v = apply_grid_bg(g, "v")
+        self.assertLess(np.std(v.mean(axis=0)), 0.05)
+        hv = apply_grid_bg(g, "hv@95")
+        self.assertLess(float(np.std(hv)), float(np.std(g)) * 0.2)
+        self.assertTrue(np.array_equal(apply_grid_bg(g, ""), g))
+
+    def test_spec_exposes_grid_bg_kwarg(self):
+        from slice_spec import SliceSpec
+        sp = SliceSpec(z_max_m=1.0, search_radius_m=0.5, bg_horizontal=True, bg_vertical=True)
+        self.assertEqual(sp.to_compute_kwargs()["grid_bg"], "hv@95")
+        self.assertEqual(SliceSpec(z_max_m=1.0, search_radius_m=0.5).to_compute_kwargs()["grid_bg"], "")

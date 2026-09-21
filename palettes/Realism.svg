@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg version="1.1" xmlns="http://www.w3.org/2000/svg">
+  <linearGradient id="id-Atmospheric-Realism" data-name="Atmospheric_Realism" gradientUnits="objectBoundingBox" spreadMethod="pad" x1="0%" x2="100%" y1="0%" y2="0%">
+    <!--
+      cpt-city: nd/atmospheric/Realism (ggr)
+
+      Extra gradients for the GIMP by Nevit Dilmen
+
+      author: Nevit Dilmen
+      copyright: GPL
+      year: 2007
+      url: https://phillips.shef.ac.uk/pub/cpt-city/nd/atmospheric
+    -->
+    <stop offset="0.0000%" stop-color="rgb(91, 109, 157)" stop-opacity="1.0000"/>
+    <stop offset="11.3523%" stop-color="rgb(120, 147, 186)" stop-opacity="1.0000"/>
+    <stop offset="22.3706%" stop-color="rgb(150, 185, 215)" stop-opacity="1.0000"/>
+    <stop offset="37.5626%" stop-color="rgb(194, 212, 227)" stop-opacity="1.0000"/>
+    <stop offset="40.0000%" stop-color="rgb(239, 240, 240)" stop-opacity="1.0000"/>
+    <stop offset="42.7379%" stop-color="rgb(235, 216, 206)" stop-opacity="1.0000"/>
+    <stop offset="49.0818%" stop-color="rgb(231, 192, 173)" stop-opacity="1.0000"/>
+    <stop offset="61.9366%" stop-color="rgb(170, 161, 177)" stop-opacity="1.0000"/>
+    <stop offset="80.0000%" stop-color="rgb(109, 130, 181)" stop-opacity="1.0000"/>
+    <stop offset="90.0000%" stop-color="rgb(111, 132, 184)" stop-opacity="1.0000"/>
+    <stop offset="100.0000%" stop-color="rgb(113, 135, 187)" stop-opacity="1.0000"/>
+  </linearGradient>
+  <metadata>
+    <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:xm="http://jjg.gitlab.io/2025/metadata">
+      <rdf:Description>
+        <xm:creator name="cptutils" version="1.85"/>
+        <xm:created date="2026-02-08"/>
+      </rdf:Description>
+    </rdf:RDF>
+  </metadata>
+</svg>

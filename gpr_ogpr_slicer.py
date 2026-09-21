@@ -24,6 +24,11 @@ from typing import Callable
 
 import numpy as np
 
+try:
+    from . import gpr_debug_log as _dbg
+except ImportError:
+    import gpr_debug_log as _dbg
+
 # Shared numeric core and raster I/O (Fase A extraction). These names keep
 # their historical spelling so the rest of this module is unchanged.
 from .raster_io import (  # noqa: F401
@@ -191,7 +196,9 @@ def _has_plausible_geo_xy(x: np.ndarray, y: np.ndarray) -> bool:
     if x.size == 0 or y.size == 0:
         return False
     finite = np.isfinite(x) & np.isfinite(y)
-    if float(finite.mean()) < 0.95:
+    # Tracce senza fix (NaN) vengono interpolate piu' avanti: basta che ce ne
+    # sia una parte utile, altrimenti tutto il rilievo finirebbe in coordinate locali.
+    if float(finite.mean()) < 0.3:
         return False
     xf = x[finite].astype(np.float64, copy=False)
     yf = y[finite].astype(np.float64, copy=False)
@@ -533,6 +540,8 @@ def _process_profiles(
                 continue
         valid_geo_flags.append(ok_geo)
     use_synthetic_coords = not any(valid_geo_flags)
+    _dbg.log("SLICER", f"profili={len(profiles)} con geo plausibile={sum(1 for v in valid_geo_flags if v)} "
+             f"-> {'COORDINATE SINTETICHE locali' if use_synthetic_coords else 'coordinate reali dei profili'}")
     proc_diag = {
         "profiles_total": int(len(profiles)),
         "profiles_geo_valid": int(sum(1 for v in valid_geo_flags if bool(v))),
@@ -542,9 +551,23 @@ def _process_profiles(
         "profile_workers_used": 1,
     }
     if use_synthetic_coords:
+        _diag = []
+        for _prof in profiles[:5]:
+            try:
+                _c = _prof.channel(0)
+                _e = np.asarray(_c.easting, dtype=np.float64)
+                _n = np.asarray(_c.northing, dtype=np.float64)
+                _f = np.isfinite(_e) & np.isfinite(_n)
+                _diag.append(
+                    f"{os.path.basename(str(getattr(_prof, 'path', '')))}: n={_e.size} "
+                    f"finite={float(_f.mean()) if _e.size else 0.0:.2f} "
+                    f"span={float(np.ptp(_e[_f]) + np.ptp(_n[_f])) if _f.any() else 0.0:.3g}"
+                )
+            except Exception as _exc:
+                _diag.append(f"errore: {_exc}")
         print(
             "[OGPR slicer][WARN] nessun profilo con geolocalizzazione plausibile; "
-            "uso coordinate sintetiche locali."
+            "uso coordinate sintetiche locali. " + " | ".join(_diag)
         )
 
     bg_reference = None
@@ -997,6 +1020,7 @@ def _interpolate_z_level(
     topographic_correction: bool = False,
     topo_reference_elevation: float | None = None,
     tree=None,
+    grid_bg: str = "",
 ) -> tuple[np.ndarray | None, int, dict]:
     profile_rows = []
     topo_on = bool(topographic_correction) and topo_reference_elevation is not None and np.isfinite(float(topo_reference_elevation))
@@ -1188,6 +1212,9 @@ def _interpolate_z_level(
         if np.isfinite(fill_m) and fill_m > 0.0 and resolution > 0.0:
             fill_px = max(1, int(round(fill_m / float(resolution))))
             grid = _fill_nodata_grid(grid, max_distance=fill_px)
+    if grid_bg:
+        from .grid_filters import apply_grid_bg
+        grid = apply_grid_bg(grid, grid_bg).astype(np.float32, copy=False)
     if smooth_sigma > 0:
         grid = _smooth_grid_gaussian(grid, sigma=smooth_sigma)
     # Enforce blanking at the end so fill/smooth never reintroduce ghost values.
@@ -1228,6 +1255,7 @@ def compute_preview_slice(
     fill_nodata_max_distance: float = 0.0,
     blanking_distance: float = 0.0,
     smooth_sigma: float = 0.8,
+    grid_bg: str = "",
     depth_radius_factor: float = 0.6,
     balance_profiles: bool = True,
     per_slice_balance: bool = False,
@@ -1281,6 +1309,7 @@ def compute_preview_slice(
         float(fill_nodata_max_distance or 0.0),
         float(blanking_distance or 0.0),
         float(smooth_sigma or 0.0),
+        str(grid_bg or ""),
         float(depth_radius_factor or 0.0),
         bool(auto_radius),
         (None if anisotropy_ratio is None else float(anisotropy_ratio)),
@@ -1402,6 +1431,7 @@ def compute_preview_slice(
         fill_nodata, fill_nodata_max_distance,
         blanking_distance=blanking_distance,
         smooth_sigma=smooth_sigma,
+        grid_bg=str(grid_bg or ""),
         balance_profiles=balance_profiles,
         per_slice_balance=per_slice_balance_eff,
         amplitude_hist_bins=amplitude_hist_bins,
@@ -1665,6 +1695,7 @@ def compute_ogpr_slice_grids(
     overlap_fraction: float = 0.5,
     blanking_distance: float = 0.0,
     smooth_sigma: float = 0.8,
+    grid_bg: str = "",
     emit_diagnostics: bool = True,
     depth_radius_factor: float = 0.6,
     balance_profiles: bool = True,
@@ -1716,6 +1747,7 @@ def compute_ogpr_slice_grids(
         use_hilbert = _sk.get("use_hilbert", use_hilbert)
         blanking_distance = _sk.get("blanking_distance", blanking_distance)
         smooth_sigma = _sk.get("smooth_sigma", smooth_sigma)
+        grid_bg = _sk.get("grid_bg", grid_bg)
         auto_radius = _sk.get("auto_radius", auto_radius)
         if "radius" in _sk:
             radius = _sk["radius"]
@@ -1993,6 +2025,7 @@ def compute_ogpr_slice_grids(
             fill_nodata_max_distance=fill_nodata_max_distance,
             blanking_distance=blanking_distance,
             smooth_sigma=smooth_sigma,
+            grid_bg=str(grid_bg or ""),
             balance_profiles=balance_profiles,
             per_slice_balance=per_slice_balance_eff,
             amplitude_hist_bins=amplitude_hist_bins,

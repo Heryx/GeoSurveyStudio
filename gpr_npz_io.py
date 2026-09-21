@@ -37,6 +37,11 @@ from datetime import datetime, timezone
 
 import numpy as np
 
+try:
+    from . import gpr_debug_log as _dbg
+except ImportError:
+    import gpr_debug_log as _dbg
+
 PROCESSED_FORMAT = "rasterlinker_gpr_processed_v1"
 VARIANT_FORMAT = "rasterlinker_gpr_variant_v1"
 VARIANT_MANIFEST = "variant.json"
@@ -52,6 +57,8 @@ def save_processed_profile_npz(
     processed_by_channel: list,
     pipeline_params: dict | None = None,
     chain_order: list | None = None,
+    trace_indices_by_channel: list | None = None,
+    view_geom: list | None = None,
 ) -> str:
     """Scrive un profilo processato in <variant_dir>/<basename>.npz.
 
@@ -82,8 +89,17 @@ def save_processed_profile_npz(
         ch = profile.channel(ci)
         n_traces = int(data.shape[1])
 
+        tidx = None
+        if trace_indices_by_channel is not None and ci < len(trace_indices_by_channel):
+            tidx = trace_indices_by_channel[ci]
+
         def _geo(attr):
             arr = np.asarray(getattr(ch, attr), dtype=np.float64)
+            if tidx is not None and len(tidx) == n_traces and len(tidx) > 0 and int(np.max(tidx)) < arr.shape[0]:
+                arr = arr[np.asarray(tidx, dtype=np.int64)]
+                if attr == "distances":
+                    arr = np.abs(arr - arr[0])
+                return arr
             # Allinea la geometria al numero di tracce del dato processato.
             if arr.shape[0] != n_traces:
                 out = np.zeros(n_traces, dtype=np.float64)
@@ -95,6 +111,7 @@ def save_processed_profile_npz(
         arrays[f"data_{ci}"] = data
         arrays[f"east_{ci}"] = _geo("easting")
         arrays[f"north_{ci}"] = _geo("northing")
+        _dbg.log("NPZ-SAVE", f"{os.path.basename(str(getattr(profile, 'path', '?')))} ch{ci}: scrivo coordinate nel .npz | " + _dbg.describe_track(arrays[f"east_{ci}"], arrays[f"north_{ci}"]))
         arrays[f"alt_{ci}"] = _geo("altitude")
         arrays[f"head_{ci}"] = _geo("heading")
         arrays[f"dist_{ci}"] = _geo("distances")
@@ -117,6 +134,8 @@ def save_processed_profile_npz(
         "swath_id": str(getattr(profile, "swath_id", "") or ""),
         "pipeline_params": dict(pipeline_params or {}),
         "chain_order": list(chain_order or []),
+        # trim/flip attivi al salvataggio: serve a riusare il dato da cache
+        "view_geom": view_geom,
     }
     arrays["meta"] = np.array(json.dumps(meta, ensure_ascii=False))
 
@@ -144,6 +163,7 @@ def load_processed_profile_npz(path: str):
         n_ch = int(meta.get("n_channels", 0) or 0)
         channels = []
         for ci in range(n_ch):
+            _dbg.log("NPZ-LOAD", f"{os.path.basename(str(path))} ch{ci}: coordinate lette dal .npz | " + _dbg.describe_track(npz[f"east_{ci}"], npz[f"north_{ci}"]))
             channels.append(OgprChannel(
                 channel_idx=ci,
                 data=np.asarray(npz[f"data_{ci}"], dtype=np.float32),
@@ -157,7 +177,7 @@ def load_processed_profile_npz(path: str):
     n_samples = int(channels[0].data.shape[0]) if channels else 0
     n_slices = int(channels[0].data.shape[1]) if channels else 0
 
-    return OgprProfile(
+    prof = OgprProfile(
         path=str(meta.get("source_path", path) or path),
         version_major=0,
         version_minor=0,
@@ -177,6 +197,68 @@ def load_processed_profile_npz(path: str):
         channels=channels,
         header_raw={},
     )
+    # trim/flip attivi al salvataggio: serve a riallineare la geometria corrente
+    prof.view_geom = meta.get("view_geom")
+    return prof
+
+
+def _indices_from_view_geom(n_full: int, view_geom):
+    """Ricostruisce gli indici di traccia (trim + flip) usati al salvataggio."""
+    try:
+        start_t, end_t, flip = int(view_geom[0]), int(view_geom[1]), bool(view_geom[2])
+    except Exception:
+        return None
+    start = int(np.clip(start_t, 0, max(0, n_full - 1)))
+    end_trim = int(np.clip(end_t, 0, max(0, n_full - 1)))
+    end = min(max(start + 1, n_full - end_trim), n_full)
+    idx = np.arange(start, end, dtype=np.int64)
+    if flip:
+        idx = idx[::-1]
+    return idx if idx.size > 0 else None
+
+
+def apply_geometry_from_profile(npz_profile, source_profile) -> bool:
+    """Sostituisce la geometria di un profilo caricato da .npz con quella CORRENTE
+    del profilo sorgente in memoria.
+
+    Le coordinate scritte nel .npz sono una fotografia del momento del
+    salvataggio: se nel frattempo il posizionamento e' cambiato non valgono piu'.
+    La fonte di verita' e' il profilo in memoria (gestito dalla pagina di
+    posizionamento). Ritorna True se ogni canale e' stato riallineato; se il
+    numero di tracce non e' ricostruibile lascia il canale com'e'.
+    """
+    ok_all = True
+    n_src_ch = int(getattr(source_profile, "n_channels", 0) or 0)
+    if n_src_ch <= 0:
+        return False
+    view_geom = getattr(npz_profile, "view_geom", None)
+    for ci, ch in enumerate(getattr(npz_profile, "channels", []) or []):
+        src = source_profile.channel(min(ci, n_src_ch - 1))
+        n_t = int(np.asarray(ch.data).shape[1])
+        cols = {}
+        for attr in ("easting", "northing", "altitude", "heading", "distances"):
+            cols[attr] = np.asarray(getattr(src, attr, []), dtype=np.float64)
+        n_full = int(cols["easting"].shape[0])
+        idx = None
+        if n_full > 0:
+            cand = _indices_from_view_geom(n_full, view_geom) if view_geom else None
+            if cand is not None and cand.size == n_t:
+                idx = cand
+            elif n_full == n_t:
+                idx = np.arange(n_t, dtype=np.int64)
+        if idx is None or any(v.shape[0] != n_full for v in cols.values()):
+            _dbg.log("NPZ-GEOM", f"canale {ci}: tracce npz={n_t} vs sorgente={n_full}, "
+                     "geometria NON riallineabile: uso quella salvata nel .npz")
+            ok_all = False
+            continue
+        for attr, arr in cols.items():
+            sub = arr[idx]
+            if attr == "distances":
+                sub = np.abs(sub - sub[0])
+            setattr(ch, attr, sub.copy())
+        _dbg.log("NPZ-GEOM", f"{os.path.basename(str(getattr(npz_profile, 'path', '?')))} ch{ci}: "
+                 "geometria presa dal profilo corrente | " + _dbg.describe_track(ch.easting, ch.northing))
+    return ok_all
 
 
 # ---------------------------------------------------------------------------

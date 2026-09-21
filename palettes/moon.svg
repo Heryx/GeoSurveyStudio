@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg version="1.1" xmlns="http://www.w3.org/2000/svg">
+  <linearGradient id="id-moon" data-name="moon" gradientUnits="objectBoundingBox" spreadMethod="pad" x1="0%" x2="100%" y1="0%" y2="0%">
+    <!--
+      cpt-city: pn/moon (cpt)
+
+      A colour-ramp for the 1:1,470,000 map depicting the landing site
+      of Apollo 11 on the Moon, by Paul Naylor for the Ordnance Survey,
+      Great Britain's national mapping agency.
+
+      author: Paul Naylor
+      copyright: Open Government Licence v3.0
+      year: 2019
+      url: https://phillips.shef.ac.uk/pub/cpt-city/pn
+    -->
+    <stop offset="0.0000%" stop-color="rgb(140, 166, 204)" stop-opacity="1.0000"/>
+    <stop offset="1.4657%" stop-color="rgb(141, 167, 205)" stop-opacity="1.0000"/>
+    <stop offset="3.6698%" stop-color="rgb(144, 169, 206)" stop-opacity="1.0000"/>
+    <stop offset="5.8739%" stop-color="rgb(146, 171, 207)" stop-opacity="1.0000"/>
+    <stop offset="8.0780%" stop-color="rgb(150, 173, 207)" stop-opacity="1.0000"/>
+    <stop offset="10.2821%" stop-color="rgb(152, 175, 208)" stop-opacity="1.0000"/>
+    <stop offset="12.4862%" stop-color="rgb(154, 177, 209)" stop-opacity="1.0000"/>
+    <stop offset="14.6903%" stop-color="rgb(157, 178, 210)" stop-opacity="1.0000"/>
+    <stop offset="16.8944%" stop-color="rgb(159, 180, 210)" stop-opacity="1.0000"/>
+    <stop offset="19.0985%" stop-color="rgb(162, 182, 211)" stop-opacity="1.0000"/>
+    <stop offset="21.3026%" stop-color="rgb(165, 184, 211)" stop-opacity="1.0000"/>
+    <stop offset="23.5067%" stop-color="rgb(167, 186, 212)" stop-opacity="1.0000"/>
+    <stop offset="25.7108%" stop-color="rgb(170, 188, 212)" stop-opacity="1.0000"/>
+    <stop offset="27.9149%" stop-color="rgb(172, 190, 213)" stop-opacity="1.0000"/>
+    <stop offset="30.1190%" stop-color="rgb(174, 192, 213)" stop-opacity="1.0000"/>
+    <stop offset="32.3231%" stop-color="rgb(176, 193, 214)" stop-opacity="1.0000"/>
+    <stop offset="34.5272%" stop-color="rgb(178, 195, 214)" stop-opacity="1.0000"/>
+    <stop offset="36.7313%" stop-color="rgb(181, 197, 215)" stop-opacity="1.0000"/>
+    <stop offset="38.9354%" stop-color="rgb(183, 199, 215)" stop-opacity="1.0000"/>
+    <stop offset="41.1395%" stop-color="rgb(186, 200, 216)" stop-opacity="1.0000"/>
+    <stop offset="43.3436%" stop-color="rgb(188, 202, 216)" stop-opacity="1.0000"/>
+    <stop offset="45.5477%" stop-color="rgb(191, 204, 217)" stop-opacity="1.0000"/>
+    <stop offset="47.7518%" stop-color="rgb(193, 206, 218)" stop-opacity="1.0000"/>
+    <stop offset="49.9559%" stop-color="rgb(196, 208, 219)" stop-opacity="1.0000"/>
+    <stop offset="52.1600%" stop-color="rgb(199, 211, 219)" stop-opacity="1.0000"/>
+    <stop offset="54.3641%" stop-color="rgb(202, 213, 220)" stop-opacity="1.0000"/>
+    <stop offset="56.5682%" stop-color="rgb(204, 215, 221)" stop-opacity="1.0000"/>
+    <stop offset="58.7723%" stop-color="rgb(206, 217, 222)" stop-opacity="1.0000"/>
+    <stop offset="60.9764%" stop-color="rgb(208, 219, 223)" stop-opacity="1.0000"/>
+    <stop offset="63.1805%" stop-color="rgb(210, 221, 224)" stop-opacity="1.0000"/>
+    <stop offset="65.3846%" stop-color="rgb(213, 222, 224)" stop-opacity="1.0000"/>
+    <stop offset="67.5887%" stop-color="rgb(215, 225, 225)" stop-opacity="1.0000"/>
+    <stop offset="69.7928%" stop-color="rgb(218, 226, 225)" stop-opacity="1.0000"/>
+    <stop offset="71.9969%" stop-color="rgb(220, 228, 226)" stop-opacity="1.0000"/>
+    <stop offset="74.2010%" stop-color="rgb(223, 230, 226)" stop-opacity="1.0000"/>
+    <stop offset="76.4051%" stop-color="rgb(226, 232, 227)" stop-opacity="1.0000"/>
+    <stop offset="78.6092%" stop-color="rgb(228, 234, 227)" stop-opacity="1.0000"/>
+    <stop offset="80.8133%" stop-color="rgb(231, 237, 228)" stop-opacity="1.0000"/>
+    <stop offset="83.0174%" stop-color="rgb(234, 239, 228)" stop-opacity="1.0000"/>
+    <stop offset="85.2215%" stop-color="rgb(237, 241, 229)" stop-opacity="1.0000"/>
+    <stop offset="87.4256%" stop-color="rgb(239, 243, 230)" stop-opacity="1.0000"/>
+    <stop offset="89.6297%" stop-color="rgb(242, 245, 230)" stop-opacity="1.0000"/>
+    <stop offset="91.8338%" stop-color="rgb(244, 247, 231)" stop-opacity="1.0000"/>
+    <stop offset="94.0379%" stop-color="rgb(246, 248, 232)" stop-opacity="1.0000"/>
+    <stop offset="96.2420%" stop-color="rgb(248, 249, 233)" stop-opacity="1.0000"/>
+    <stop offset="98.4461%" stop-color="rgb(250, 251, 234)" stop-opacity="1.0000"/>
+    <stop offset="100.0000%" stop-color="rgb(251, 252, 234)" stop-opacity="1.0000"/>
+  </linearGradient>
+  <metadata>
+    <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:xm="http://jjg.gitlab.io/2025/metadata">
+      <rdf:Description>
+        <xm:creator name="cptutils" version="1.85"/>
+        <xm:created date="2026-02-08"/>
+      </rdf:Description>
+    </rdf:RDF>
+  </metadata>
+</svg>

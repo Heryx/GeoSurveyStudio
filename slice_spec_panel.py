@@ -19,6 +19,7 @@ from qgis.PyQt.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QWidget,
 )
@@ -116,6 +117,19 @@ class SliceSpecPanel(QWidget):
         self.sp_blanking.setToolTip("0 = nessun blanking; celle oltre questa distanza dai dati -> NoData")
         form.addRow("Raggio blanking:", self.sp_blanking)
 
+        self.chk_bg_h = QCheckBox("orizzontale")
+        self.chk_bg_h.setToolTip("Toglie le bande orizzontali (sottrae la media di ogni riga della slice)")
+        self.chk_bg_v = QCheckBox("verticale")
+        self.chk_bg_v.setToolTip("Toglie le bande verticali (sottrae la media di ogni colonna della slice)")
+        self.sp_bg_clip = self._dspin(95.0, 50.0, 100.0, 1.0, " %")
+        self.sp_bg_clip.setToolTip("Percentile: i valori piu' alti di ogni linea non entrano nel background (protegge i target forti)")
+        _bgw = QWidget()
+        _bgl = QHBoxLayout(_bgw)
+        _bgl.setContentsMargins(0, 0, 0, 0)
+        for _w in (self.chk_bg_h, self.chk_bg_v, QLabel("clip"), self.sp_bg_clip):
+            _bgl.addWidget(_w)
+        form.addRow("Background slice:", _bgw)
+
         self.cb_smooth = QComboBox()
         for v in SMOOTH_LOWPASS_VALUES:
             self.cb_smooth.addItem("nessuno" if v == 0 else f"{v}×{v}", v)
@@ -158,11 +172,11 @@ class SliceSpecPanel(QWidget):
     def _wire_signals(self):
         for sp in (self.sp_z_min, self.sp_z_max, self.sp_thickness, self.sp_overlap,
                    self.sp_velocity, self.sp_resolution, self.sp_search_radius,
-                   self.sp_blanking):
+                   self.sp_blanking, self.sp_bg_clip):
             sp.valueChanged.connect(self._on_changed)
         for cb in (self.cb_amplitude, self.cb_interp, self.cb_smooth):
             cb.currentIndexChanged.connect(self._on_changed)
-        for chk in (self.chk_z_max_auto, self.chk_radius_auto):
+        for chk in (self.chk_z_max_auto, self.chk_radius_auto, self.chk_bg_h, self.chk_bg_v):
             chk.toggled.connect(self._on_changed)
         self.cb_source_variant.currentTextChanged.connect(self._on_changed)
         self.le_crs_epsg.textChanged.connect(self._on_changed)
@@ -225,6 +239,9 @@ class SliceSpecPanel(QWidget):
                              else float(self.sp_search_radius.value())),
             blanking_radius_m=float(self.sp_blanking.value()),
             smooth_lowpass=int(self.cb_smooth.currentData() or 0),
+            bg_horizontal=self.chk_bg_h.isChecked(),
+            bg_vertical=self.chk_bg_v.isChecked(),
+            bg_clip_pct=float(self.sp_bg_clip.value()),
             crs_epsg=crs_epsg,
         )
         spec.validate()
@@ -252,6 +269,9 @@ class SliceSpecPanel(QWidget):
                 self.sp_search_radius.setValue(float(spec.search_radius_m))
             self.sp_blanking.setValue(float(spec.blanking_radius_m))
             self._set_combo(self.cb_smooth, int(spec.smooth_lowpass))
+            self.chk_bg_h.setChecked(bool(spec.bg_horizontal))
+            self.chk_bg_v.setChecked(bool(spec.bg_vertical))
+            self.sp_bg_clip.setValue(float(spec.bg_clip_pct))
             self.le_crs_epsg.setText("" if spec.crs_epsg is None else str(int(spec.crs_epsg)))
             self._sync_enabled()
         finally:

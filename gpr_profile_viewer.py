@@ -7,534 +7,90 @@ QMainWindow con radargram matplotlib integrato.
 
 from __future__ import annotations
 
-import json
-import os
-import glob
-import re
-import shutil
-from datetime import datetime
-from typing import Optional
-
-import numpy as np
-
-from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal, QSettings, QThread, QObject, QSize
-from qgis.PyQt.QtGui import QColor
-from qgis.PyQt.QtWidgets import (
-    QDialog, QMainWindow, QVBoxLayout, QHBoxLayout, QToolBar,
-    QAction, QLabel, QComboBox,
-    QCheckBox, QDoubleSpinBox, QSpinBox,
-    QSlider,
-    QSplitter,
-    QToolButton,
-    QTabWidget,
-    QWidget,
-    QInputDialog,
-    QFileDialog, QMessageBox, QSizePolicy,
-    QGroupBox, QFormLayout, QPushButton, QDialogButtonBox, QScrollArea, QDockWidget, QLineEdit,
-    QProgressBar, QListWidget, QListWidgetItem,
-    QTreeWidget, QTreeWidgetItem, QMenu,
-)
-from qgis.core import (
-    Qgis,
-    QgsCoordinateReferenceSystem,
-    QgsCoordinateTransform,
-    QgsMessageLog,
-    QgsPointXY,
-    QgsProject,
-    QgsWkbTypes,
-    QgsRasterLayer,
-)
-from qgis.gui import QgsRubberBand
-
-try:
-    from qgis.PyQt import sip  # type: ignore
-except Exception:
-    try:
-        import sip  # type: ignore
-    except Exception:
-        sip = None  # type: ignore
-
-try:
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
-    from matplotlib.figure import Figure
-    HAS_MPL = True
-except ImportError:
-    HAS_MPL = False
-
-from .gpr_ogpr_reader import read_ogpr_cached, OgprProfile, OgprChannel
-from .gpr_raw_format_registry import detect_and_read, sidecar_paths, import_dialog_filter
-from .gpr_manual_positioning_dialog import GprManualPositioningDialog, check_profiles_have_gps
-from .gpr_processing import (
-    apply_pipeline,
-    DEFAULT_PIPELINE,
+from .gpr_viewer_common import (
     DEFAULT_CHAIN_ORDER,
+    DEFAULT_CMAP,
     FILTER_REGISTRY,
-    normalize_display,
-    _normalize_display_vmax,
-    manual_gain,
-    auto_tune_params,
-    multifreq_blend,
-    log_exception,
+    Figure,
+    FigureCanvasQTAgg,
+    FilterBlockWidget,
+    FilterChainWidget,
+    GprManualPositioningDialog,
+    HAS_MPL,
     LOG_FILE_PATH,
+    OgprProfile,
+    Optional,
+    QAction,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDockWidget,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSettings,
+    QSize,
+    QSizePolicy,
+    QSlider,
+    QSpinBox,
+    QSplitter,
+    QTabWidget,
+    QThread,
+    QTimer,
+    QToolBar,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+    Qgis,
+    QgsMessageLog,
+    QgsRubberBand,
+    Qt,
+    _BlitManager,
+    _PipelineWorker,
+    _PreviewSliceWorker,
+    _RangeGainCurveDialog,
+    _dbg,
+    _gpr_palettes,
+    _log_gpr,
+    _populate_cmap_combo,
+    _run_pipeline_job,
+    auto_tune_params,
+    check_profiles_have_gps,
+    clear_ogpr_cache,
+    detect_and_read,
+    import_dialog_filter,
+    json,
+    log_exception,
+    np,
+    os,
+    pyqtSignal,
+    refresh_gpr_cmaps,
+    sip,
 )
-from .gpr_npz_io import (
-    save_processed_profile_npz,
-    load_processed_profile_npz,
-    write_variant_manifest,
-    read_variant_manifest,
-    list_variants,
-)
-
-try:
-    from .filter_chain_widget import FilterChainWidget, FilterBlockWidget
-except Exception:
-    FilterChainWidget = None
-    FilterBlockWidget = None
-
-try:
-    from . import gpr_palettes as _gpr_palettes
-except Exception:  # pragma: no cover
-    _gpr_palettes = None
+from .gpr_viewer_radargram import RadargramViewMixin
+from .gpr_viewer_timeslice import TimesliceViewMixin
+from .gpr_viewer_variants import VariantsMixin
+from .gpr_viewer_project import ProjectPersistenceMixin
 
 
-GPR_BUILTIN_CMAPS = [
-    "RdBu_r",
-    "seismic",
-    "gray",
-    "bwr",
-    "Greys_r",
-    "viridis",
-    "plasma",
-    "magma",
-    "cividis",
-    "turbo",
-    "Spectral_r",
-]
-DEFAULT_CMAP = "RdBu_r"
-
-# Lista completa (native + palette esterne registrate in matplotlib).
-GPR_CMAPS = list(GPR_BUILTIN_CMAPS)
-
-
-def refresh_gpr_cmaps():
-    """Ri-scansiona le palette esterne e aggiorna GPR_CMAPS. Idempotente."""
-    global GPR_CMAPS
-    extra = []
-    if _gpr_palettes is not None:
-        try:
-            extra = _gpr_palettes.register_all()
-        except Exception:
-            extra = []
-    GPR_CMAPS = GPR_BUILTIN_CMAPS + [c for c in extra if c not in GPR_BUILTIN_CMAPS]
-    return GPR_CMAPS
-
-
-def _populate_cmap_combo(cb, *, current=None):
-    """Riempie una QComboBox con i nomi colormap + icona anteprima, preservando
-    la selezione corrente quando possibile."""
-    if cb is None:
-        return
-    keep = current if current is not None else cb.currentText()
-    try:
-        cb.blockSignals(True)
-        cb.clear()
-        for name in GPR_CMAPS:
-            icon = None
-            if _gpr_palettes is not None:
-                try:
-                    icon = _gpr_palettes.make_cmap_icon(name, 64, 14)
-                except Exception:
-                    icon = None
-            if icon is not None:
-                cb.addItem(icon, name)
-            else:
-                cb.addItem(name)
-        if keep and keep in GPR_CMAPS:
-            cb.setCurrentText(keep)
-        elif DEFAULT_CMAP in GPR_CMAPS:
-            cb.setCurrentText(DEFAULT_CMAP)
-    finally:
-        cb.blockSignals(False)
-
-
-refresh_gpr_cmaps()
-
-
-class _RangeGainCurveDialog(QDialog):
-    """Interactive breakpoint editor for range gain curve."""
-
-    def __init__(self, points, max_points=16, gain_max=100.0, on_curve_changed=None, parent=None):
-        super().__init__(parent, Qt.Window)
-        self.setWindowTitle("Range Gain Curve")
-        self.resize(620, 420)
-        self._max_points = int(max(2, min(32, max_points)))
-        self._on_curve_changed = on_curve_changed
-        self._gain_max = float(np.clip(float(gain_max), 1.0, 100.0))
-        self._drag_idx = None
-        self._selected_idx = None
-        self._did_drag = False
-        self._points = self._sanitize(points)
-
-        root = QVBoxLayout(self)
-
-        if HAS_MPL:
-            self._fig = Figure(figsize=(6.2, 3.2), tight_layout=True)
-            self._ax = self._fig.add_subplot(111)
-            self._canvas = FigureCanvasQTAgg(self._fig)
-            root.addWidget(self._canvas, 1)
-            self._canvas.mpl_connect("button_press_event", self._on_press)
-            self._canvas.mpl_connect("button_release_event", self._on_release)
-            self._canvas.mpl_connect("motion_notify_event", self._on_move)
-        else:
-            self._fig = None
-            self._ax = None
-            self._canvas = None
-            lbl = QLabel("matplotlib non disponibile.")
-            lbl.setAlignment(Qt.AlignCenter)
-            root.addWidget(lbl, 1)
-
-        help_lbl = QLabel(
-            "X=Gain, Y=Depth (0 in alto) | Left click: seleziona/drag | "
-            "Double-click: aggiungi | Right-click: elimina punto interno"
-        )
-        help_lbl.setWordWrap(True)
-        root.addWidget(help_lbl)
-
-        gain_row = QHBoxLayout()
-        gain_row.addWidget(QLabel("Gain max:"))
-        self._spin_gain_max = QDoubleSpinBox()
-        self._spin_gain_max.setRange(1.0, 100.0)
-        self._spin_gain_max.setSingleStep(1.0)
-        self._spin_gain_max.setDecimals(1)
-        self._spin_gain_max.setValue(self._gain_max)
-        self._spin_gain_max.valueChanged.connect(self._on_gain_max_changed)
-        gain_row.addWidget(self._spin_gain_max)
-        gain_row.addStretch(1)
-        root.addLayout(gain_row)
-
-        step_row = QHBoxLayout()
-        step_row.addWidget(QLabel("Step:"))
-        self._spin_step = QDoubleSpinBox()
-        self._spin_step.setRange(0.01, 1.0)
-        self._spin_step.setSingleStep(0.01)
-        self._spin_step.setValue(0.05)
-        self._spin_step.setDecimals(2)
-        step_row.addWidget(self._spin_step)
-        self._btn_step_up = QPushButton("▲ Gain +")
-        self._btn_step_down = QPushButton("▼ Gain -")
-        self._btn_step_up.clicked.connect(lambda: self._move_selected(+float(self._spin_step.value())))
-        self._btn_step_down.clicked.connect(lambda: self._move_selected(-float(self._spin_step.value())))
-        step_row.addWidget(self._btn_step_up)
-        step_row.addWidget(self._btn_step_down)
-        step_row.addStretch(1)
-        root.addLayout(step_row)
-
-        btns_row = QHBoxLayout()
-        self._btn_reset = QPushButton("Reset")
-        self._btn_reset.clicked.connect(self._on_reset)
-        btns_row.addWidget(self._btn_reset)
-        btns_row.addStretch(1)
-        root.addLayout(btns_row)
-
-        dbb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        dbb.accepted.connect(self.accept)
-        dbb.rejected.connect(self.reject)
-        root.addWidget(dbb)
-
-        self._redraw()
-
-    def _sanitize(self, points):
-        arr = np.asarray(points if points is not None else [], dtype=np.float64).reshape(-1, 2)
-        clean = []
-        for x, y in arr:
-            if np.isfinite(x) and np.isfinite(y):
-                clean.append(
-                    (
-                        float(np.clip(x, 0.0, 1.0)),
-                        float(np.clip(y, 0.0, self._gain_max)),
-                    )
-                )
-        if not clean:
-            clean = [(0.0, 1.0), (1.0, 6.0)]
-        clean.sort(key=lambda p: p[0])
-        # Force endpoints and uniqueness.
-        x0, y0 = clean[0]
-        x1, y1 = clean[-1]
-        pts = [(0.0, float(y0))]
-        for x, y in clean[1:-1]:
-            if x <= 0.0 or x >= 1.0:
-                continue
-            if abs(x - pts[-1][0]) < 1e-6:
-                continue
-            pts.append((x, y))
-        if abs(1.0 - pts[-1][0]) < 1e-6:
-            pts[-1] = (1.0, float(y1))
-        else:
-            pts.append((1.0, float(y1)))
-        if len(pts) > self._max_points:
-            inner = pts[1:-1]
-            take = max(0, self._max_points - 2)
-            if len(inner) > take:
-                idx = np.linspace(0, len(inner) - 1, take, dtype=np.int64)
-                inner = [inner[i] for i in idx]
-            pts = [pts[0]] + inner + [pts[-1]]
-        return np.asarray(pts, dtype=np.float64)
-
-    def points(self):
-        return self._points.astype(np.float64, copy=True)
-
-    def gain_max(self) -> float:
-        return float(self._gain_max)
-
-    def _emit_changed(self):
-        if callable(self._on_curve_changed):
-            try:
-                self._on_curve_changed(self.points(), float(self._gain_max))
-            except Exception:
-                pass
-
-    def _redraw(self):
-        if not HAS_MPL or self._ax is None or self._canvas is None:
-            return
-        self._ax.clear()
-        p = self._points
-        # X=gain, Y=depth fraction (0 top, 1 bottom).
-        self._ax.plot(p[:, 1], p[:, 0], color="#2d6ba3", lw=1.4)
-        self._ax.scatter(p[:, 1], p[:, 0], s=40, color="#c0392b", zorder=3)
-        self._ax.set_xlim(0.0, float(self._gain_max))
-        self._ax.set_ylim(1.0, 0.0)
-        self._ax.grid(True, ls=":", lw=0.5, alpha=0.7)
-        self._ax.set_xlabel("Gain")
-        self._ax.set_ylabel("Depth fraction")
-        self._ax.set_title(f"Breakpoints: {len(p)}/{self._max_points}")
-        if self._selected_idx is not None:
-            try:
-                i = int(self._selected_idx)
-                if 0 <= i < len(p):
-                    sel = p[i]
-                    self._ax.scatter(
-                        [float(sel[1])],
-                        [float(sel[0])],
-                        s=80,
-                        color="#ffd000",
-                        edgecolor="#1f1f1f",
-                        linewidths=1.0,
-                        zorder=5,
-                    )
-            except Exception:
-                pass
-        self._canvas.draw_idle()
-
-    def _nearest_idx(self, x, y):
-        p = self._points
-        if p.shape[0] <= 0:
-            return None, 1e9
-        # x=gain, y=depth fraction
-        x_span = max(1e-6, float(np.nanmax(p[:, 1]) - np.nanmin(p[:, 1])))
-        dx = (p[:, 1] - float(x)) / x_span
-        dy = (p[:, 0] - float(y))
-        d = np.sqrt(dx * dx + dy * dy)
-        idx = int(np.argmin(d))
-        return idx, float(d[idx])
-
-    def _on_press(self, event):
-        if event is None or event.inaxes != self._ax or event.xdata is None or event.ydata is None:
-            return
-        gain = float(np.clip(event.xdata, 0.0, self._gain_max))
-        depth = float(np.clip(event.ydata, 0.0, 1.0))
-        idx, dist = self._nearest_idx(gain, depth)
-
-        # Right click: remove internal point.
-        if int(getattr(event, "button", 0) or 0) == 3:
-            if idx is not None and dist < 0.05 and idx not in (0, len(self._points) - 1):
-                self._points = np.delete(self._points, idx, axis=0)
-                self._points = self._sanitize(self._points)
-                self._selected_idx = None
-                self._emit_changed()
-                self._redraw()
-            return
-
-        # Double left click: add point.
-        if bool(getattr(event, "dblclick", False)) and int(getattr(event, "button", 0) or 0) == 1:
-            if len(self._points) < self._max_points and (idx is None or dist >= 0.02):
-                self._points = np.vstack([self._points, np.asarray([[depth, gain]], dtype=np.float64)])
-                self._points = self._sanitize(self._points)
-                idx_new, _ = self._nearest_idx(gain, depth)
-                self._selected_idx = idx_new
-                self._emit_changed()
-                self._redraw()
-            return
-
-        # Single left click: select nearest point and enable drag.
-        if int(getattr(event, "button", 0) or 0) == 1 and idx is not None and dist < 0.08:
-            self._selected_idx = int(idx)
-            self._drag_idx = int(idx)
-            self._did_drag = False
-            self._redraw()
-
-    def _on_move(self, event):
-        if self._drag_idx is None:
-            return
-        if event is None or event.inaxes != self._ax or event.xdata is None or event.ydata is None:
-            return
-        i = int(self._drag_idx)
-        gain = float(np.clip(event.xdata, 0.0, self._gain_max))
-        depth = float(np.clip(event.ydata, 0.0, 1.0))
-        p = self._points.copy()
-        if i == 0:
-            depth = 0.0
-        elif i == (len(p) - 1):
-            depth = 1.0
-        else:
-            lo = float(p[i - 1, 0] + 1e-4)
-            hi = float(p[i + 1, 0] - 1e-4)
-            if hi <= lo:
-                depth = float(p[i, 0])
-            else:
-                depth = float(np.clip(depth, lo, hi))
-        p[i, 0] = depth
-        p[i, 1] = gain
-        self._points = self._sanitize(p)
-        self._did_drag = True
-        self._emit_changed()
-        self._redraw()
-
-    def _on_release(self, _event):
-        self._did_drag = False
-        self._drag_idx = None
-
-    def _move_selected(self, delta: float):
-        if self._selected_idx is None:
-            return
-        i = int(self._selected_idx)
-        p = self._points.copy()
-        if i < 0 or i >= len(p):
-            return
-        p[i, 1] = float(np.clip(p[i, 1] + float(delta), 0.0, self._gain_max))
-        self._points = self._sanitize(p)
-        self._emit_changed()
-        self._redraw()
-
-    def _on_gain_max_changed(self, value: float):
-        self._gain_max = float(np.clip(float(value), 1.0, 100.0))
-        self._points = self._sanitize(self._points)
-        self._emit_changed()
-        self._redraw()
-
-    def _on_reset(self):
-        self._points = np.asarray([(0.0, 1.0), (1.0, 6.0)], dtype=np.float64)
-        self._selected_idx = None
-        self._drag_idx = None
-        self._emit_changed()
-        self._redraw()
-
-
-class _BlitManager:
-    """Ridisegna solo gli artisti "animati" (cursore, A-scan) senza rifare l'immagine.
-
-    Il ricampionamento del radargramma costa ~100+ ms: farlo a ogni movimento
-    del mouse rende il cursore a scatti.  Dopo ogni draw completo salviamo lo
-    sfondo; il movimento del mouse ripristina lo sfondo e ridisegna solo gli
-    artisti registrati (matplotlib: "blitting").
-    """
-
-    def __init__(self, canvas):
-        self.canvas = canvas
-        self._bg = None
-        self._artists: list = []
-        self._cid = canvas.mpl_connect("draw_event", self._on_draw)
-        # Dopo un resize lo sfondo salvato ha la dimensione sbagliata.
-        canvas.mpl_connect("resize_event", lambda _e: self.invalidate())
-
-    def set_artists(self, artists) -> None:
-        self._artists = []
-        for art in artists:
-            if art is None:
-                continue
-            art.set_animated(True)
-            self._artists.append(art)
-
-    def _draw_animated(self) -> None:
-        fig = self.canvas.figure
-        for art in self._artists:
-            ax = getattr(art, "axes", None)
-            if ax is not None and not ax.get_visible():
-                continue
-            fig.draw_artist(art)
-
-    def _on_draw(self, event) -> None:
-        if event is not None and getattr(event, "canvas", self.canvas) is not self.canvas:
-            return
-        self._bg = self.canvas.copy_from_bbox(self.canvas.figure.bbox)
-        self._draw_animated()
-
-    def update(self) -> None:
-        """Aggiorna gli artisti animati; ripiega su un draw completo se serve."""
-        if self._bg is None:
-            self.canvas.draw_idle()
-            return
-        self.canvas.restore_region(self._bg)
-        self._draw_animated()
-        self.canvas.blit(self.canvas.figure.bbox)
-
-    def invalidate(self) -> None:
-        """Lo sfondo non e' piu' valido (resize, nuovo draw in arrivo)."""
-        self._bg = None
-
-
-class _PreviewSliceWorker(QObject):
-    """Esegue compute_timeslice_preview() su un thread separato dalla GUI.
-
-    Evita il blocco del thread principale (che produce il cursore "in
-    caricamento" permanente di Windows/Qt) durante il preview live delle
-    timeslice.
-    """
-
-    finished = pyqtSignal(int, object, object, str)  # request_id, grid, extent, error
-
-    def __init__(self, request_id: int, profiles, z_from, z_to, resolution, chain_order, kwargs,
-                 spec=None):
-        super().__init__()
-        self._request_id = int(request_id)
-        self._profiles = profiles
-        self._z_from = z_from
-        self._z_to = z_to
-        self._resolution = resolution
-        self._chain_order = chain_order
-        self._kwargs = kwargs
-        self._spec = spec
-
-    def run(self):
-        try:
-            if self._spec is not None:
-                # Fase D: spec-native preview (single window), same code path
-                # as the final generation but with cheap knobs: fast kNN IDW,
-                # no NoData fill, no diagnostics. The final "Salva gruppo" run
-                # still uses the quality settings from the spec.
-                from .gpr_ogpr_slicer import compute_slice_preview
-                grid, extent = compute_slice_preview(
-                    self._profiles, self._spec, self._z_from, self._z_to,
-                    resolution=self._resolution,
-                    idw_mode="fast",
-                    fill_nodata=False,
-                    emit_diagnostics=False,
-                )
-            else:
-                from .gpr_ogpr_slicer import compute_timeslice_preview
-                grid, extent = compute_timeslice_preview(
-                    profiles=self._profiles,
-                    z_from=self._z_from,
-                    z_to=self._z_to,
-                    resolution=self._resolution,
-                    chain_order=self._chain_order,
-                    **self._kwargs,
-                )
-            self.finished.emit(self._request_id, grid, extent, "")
-        except Exception as exc:
-            self.finished.emit(self._request_id, None, None, str(exc))
-
-
-class GprProfileViewer(QMainWindow):
+class GprProfileViewer(
+    RadargramViewMixin,
+    TimesliceViewMixin,
+    VariantsMixin,
+    ProjectPersistenceMixin,
+    QMainWindow,
+):
     cursor_moved = pyqtSignal(float, float, float)  # easting, northing, depth
 
     def __init__(self, iface, plugin=None, parent=None):
@@ -582,7 +138,18 @@ class GprProfileViewer(QMainWindow):
         self._wiggle_fil_line = None
         self._blit: Optional[_BlitManager] = None
         self._im_key: Optional[tuple] = None
+        self._lod = None                 # _ImageLod: ritaglio/decimazione per profili lunghi
+        self._lod_cid = None
+        self._lod_resize_cid = None
+        self._lod_busy = False
+        self._im_full_extent: Optional[tuple] = None
         self._display_base_cache: Optional[tuple] = None
+        self._proc_thread: Optional[QThread] = None
+        self._proc_worker: Optional[_PipelineWorker] = None
+        self._proc_job: Optional[dict] = None
+        self._proc_job_seq: int = 0
+        self._proc_rerun: bool = False
+        self._proc_busy: bool = False
         self._fig_slice = None
         self._ax_slice = None
         self._canvas_slice = None
@@ -615,6 +182,10 @@ class GprProfileViewer(QMainWindow):
         self._ax_main_bounds_default = None
         self._ax_wiggle_bounds_default = None
         self._last_pipeline_params: dict = {}
+        # True se _proc_data contiene GIA' il range-gain (pre_agc_gain nella pipeline).
+        # Descrive il dato, non i widget: con il fallback su dato grezzo i parametri
+        # dicono 'applicato' ma il dato no.
+        self._proc_pre_agc: bool = False
         self._filter_chain_widget = None
         self._filter_chain_blocks: dict[str, object] = {}
         self._phase1_controls: dict[str, dict] = {}
@@ -700,36 +271,29 @@ class GprProfileViewer(QMainWindow):
         except Exception:
             pass
 
-    def _refresh_blit_artists(self) -> None:
-        """Registra gli artisti che cambiano a ogni movimento del cursore."""
-        blit = getattr(self, "_blit", None)
-        if blit is None:
-            return
-        arts = [self._vline, self._hline]
-        if self._wiggle_fil_line is not None and getattr(self, "_ax_wiggle", None) is not None:
-            arts += [
-                self._wiggle_raw_line,
-                self._wiggle_fil_line,
-                self._wiggle_depth_line,
-                self._ax_wiggle.title,
-            ]
-        blit.set_artists(arts)
+    def _note_swallowed(self, where: str, exc: BaseException) -> None:
+        """Registra un errore che il codice sceglie di non propagare.
 
-    def _blit_update(self) -> None:
-        """Aggiorna cursore e A-scan senza ridisegnare il radargramma."""
-        canvas = getattr(self, "_canvas_mpl", None)
-        if not self._is_qt_alive(canvas):
+        Una sola volta per causa (dove + tipo + messaggio): sui percorsi caldi,
+        come il movimento del mouse, un errore ripetuto non deve inondare il log.
+        """
+        seen = self.__dict__.setdefault("_swallowed_seen", set())
+        key = (where, type(exc).__name__, str(exc)[:200])
+        if key in seen:
             return
-        blit = getattr(self, "_blit", None)
+        seen.add(key)
         try:
-            if blit is None:
-                canvas.draw_idle()
-            else:
-                blit.update()
+            import traceback
+            _log_gpr(
+                f"[GPR] Errore ignorato in {where}: {type(exc).__name__}: {exc}\n"
+                f"{traceback.format_exc(limit=6)}",
+                level=Qgis.Warning,
+            )
         except Exception:
-            self._safe_draw_idle(canvas)
+            pass
 
     def _reset_session_state(self):
+        self._active_variant_dir = ""
         try:
             self._canvas_timer.stop()
         except Exception:
@@ -744,6 +308,7 @@ class GprProfileViewer(QMainWindow):
         self._ch_idx = 0
         self._raw_data = None
         self._proc_data = None
+        self._proc_pre_agc = False
         self._disp_data = None
         self._cursor_x = None
         self._cursor_z = None
@@ -762,7 +327,11 @@ class GprProfileViewer(QMainWindow):
         self._hline = None
         self._im = None
         self._im_key = None
+        self._lod = None
+        self._im_full_extent = None
         self._display_base_cache = None
+        self._proc_job_seq += 1
+        self._proc_rerun = False
         self._refresh_blit_artists()
         self._slice_pan_anchor = None
 
@@ -1051,6 +620,22 @@ class GprProfileViewer(QMainWindow):
         act_manual_pos.triggered.connect(self._open_manual_positioning_dialog)
         tb.addAction(act_manual_pos)
 
+        act_coord_log = QAction("📋 Log coordinate", self)
+        act_coord_log.setToolTip(
+            "Mostra il log di debug di lettura/applicazione coordinate,\n"
+            "con pulsanti per pulire il log e la cache dei profili."
+        )
+        act_coord_log.triggered.connect(self._show_coord_log_dialog)
+        tb.addAction(act_coord_log)
+
+        act_clear_cache = QAction("🧹 Pulisci cache", self)
+        act_clear_cache.setToolTip(
+            "Svuota la cache di lettura dei file .ogpr (i prossimi caricamenti\n"
+            "rileggono i file da disco, con le coordinate originali)."
+        )
+        act_clear_cache.triggered.connect(self._clear_profile_cache)
+        tb.addAction(act_clear_cache)
+
         root.addWidget(tb)
 
         center = QHBoxLayout()
@@ -1181,13 +766,40 @@ class GprProfileViewer(QMainWindow):
         self._build_menu()
         root.addLayout(center)
 
+        # Barra non modale "ripristinato l'ultimo stato" (con annulla).
+        self._restore_bar = QWidget()
+        rb_lay = QHBoxLayout(self._restore_bar)
+        rb_lay.setContentsMargins(6, 3, 6, 3)
+        self._lbl_restore_bar = QLabel("")
+        self._btn_restore_undo = QPushButton("Annulla ripristino")
+        self._btn_restore_undo.clicked.connect(self._undo_restore)
+        self._btn_restore_close = QToolButton()
+        self._btn_restore_close.setText("×")
+        self._btn_restore_close.clicked.connect(self._restore_bar.hide)
+        rb_lay.addWidget(self._lbl_restore_bar, 1)
+        rb_lay.addWidget(self._btn_restore_undo)
+        rb_lay.addWidget(self._btn_restore_close)
+        self._restore_bar.setStyleSheet(
+            "QWidget { background: #fff4c2; color: #333; }")
+        self._restore_bar.hide()
+        self._pre_restore_state = None
+        root.addWidget(self._restore_bar)
+
+        status_row = QHBoxLayout()
         self._lbl_status = QLabel("Importa un file .ogpr per iniziare.")
         # Il testo cambia a ogni movimento del mouse: senza questo la larghezza
         # minima segue il testo, la finestra si allarga/restringe e il canvas
         # viene ridimensionato (= ridisegnato per intero) a ogni movimento.
         self._lbl_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._lbl_status.setMinimumWidth(0)
-        root.addWidget(self._lbl_status)
+        self._lbl_recipe_state = QLabel("")
+        self._lbl_recipe_state.setToolTip(
+            "Processo: salvato = scritto automaticamente in project.json e "
+            "ripristinato alla riapertura. Le varianti (radargrammi filtrati "
+            "su disco) si salvano solo su richiesta esplicita.")
+        status_row.addWidget(self._lbl_status, 1)
+        status_row.addWidget(self._lbl_recipe_state)
+        root.addLayout(status_row)
 
     def _dock_settings(self):
         st = getattr(self.plugin, "settings", None)
@@ -1317,40 +929,6 @@ class GprProfileViewer(QMainWindow):
         self._timeslice_dock.show()
         self._timeslice_dock.raise_()
 
-    def _open_project_manager(self):
-        if self.plugin is not None and hasattr(self.plugin, "open_project_manager"):
-            try:
-                self.plugin.open_project_manager()
-                return
-            except Exception:
-                pass
-        QMessageBox.information(
-            self,
-            "Project Manager",
-            "Project Manager non disponibile in questo contesto.",
-        )
-
-    def _save_project_file(self):
-        try:
-            ok = bool(QgsProject.instance().write())
-        except Exception:
-            ok = False
-        meta_ok = False
-        try:
-            meta_ok = bool(self._save_gpr_processing_project_meta())
-        except Exception:
-            meta_ok = False
-        if ok and meta_ok:
-            self._safe_set_text(self._lbl_status, "Progetto QGIS + stato GPR salvati.")
-        elif ok and (not meta_ok):
-            self._safe_set_text(self._lbl_status, "Progetto QGIS salvato, stato GPR non salvato.")
-        else:
-            QMessageBox.warning(
-                self,
-                "Salva progetto",
-                "Impossibile salvare il progetto QGIS corrente.",
-            )
-
     def _toggle_wiggle_panel(self, checked: bool):
         try:
             self._chk_show_wiggle.setChecked(bool(checked))
@@ -1464,7 +1042,7 @@ class GprProfileViewer(QMainWindow):
         m_proc = mb.addMenu("Processing")
         act_apply = QAction("Applica pipeline", self)
         act_apply.setShortcut("F5")
-        act_apply.triggered.connect(self._apply_processing)
+        act_apply.triggered.connect(self._apply_processing_async)
         m_proc.addAction(act_apply)
 
         act_gain = QAction("Aggiorna gain", self)
@@ -1476,6 +1054,14 @@ class GprProfileViewer(QMainWindow):
         act_save_variant = QAction("Salva variante processata (.npz)...", self)
         act_save_variant.triggered.connect(self._save_processed_variant)
         m_proc.addAction(act_save_variant)
+
+        act_save_working = QAction("Aggiorna variante di lavoro (sovrascrive 'Lavoro')", self)
+        act_save_working.setToolTip(
+            "Scrive i radargrammi filtrati nell'unica variante di lavoro, sempre\n"
+            "con lo stesso nome. Viene aggiornata in automatico alla chiusura."
+        )
+        act_save_working.triggered.connect(lambda *_: self._save_working_variant())
+        m_proc.addAction(act_save_working)
 
         act_slice_variant = QAction("Time-slice da variante processata...", self)
         act_slice_variant.triggered.connect(self._build_slices_from_variant)
@@ -1527,29 +1113,6 @@ class GprProfileViewer(QMainWindow):
         act_load_preset.triggered.connect(self._load_gain_hyper_preset)
         m_proc.addAction(act_load_preset)
 
-    def _apply_wiggle_visibility_layout(self):
-        if not HAS_MPL or not hasattr(self, "_ax") or not hasattr(self, "_ax_wiggle"):
-            return
-        if self._ax is None or self._ax_wiggle is None:
-            return
-        if self._ax_main_bounds_default is None or self._ax_wiggle_bounds_default is None:
-            try:
-                self._ax_main_bounds_default = list(self._ax.get_position().bounds)
-                self._ax_wiggle_bounds_default = list(self._ax_wiggle.get_position().bounds)
-            except Exception:
-                return
-
-        main = list(self._ax_main_bounds_default)
-        wig = list(self._ax_wiggle_bounds_default)
-        if bool(getattr(self, "_show_wiggle", True)):
-            self._ax_wiggle.set_visible(True)
-            self._ax.set_position(main)
-            self._ax_wiggle.set_position(wig)
-        else:
-            self._ax_wiggle.set_visible(False)
-            right = float(wig[0] + wig[2])
-            self._ax.set_position([float(main[0]), float(main[1]), right - float(main[0]), float(main[3])])
-
     def _on_toggle_wiggle(self, checked: bool):
         self._show_wiggle = bool(checked)
         self._apply_wiggle_visibility_layout()
@@ -1585,6 +1148,130 @@ class GprProfileViewer(QMainWindow):
     #   int   -> (min, max, default)
     #   float -> (min, max, default, decimali, step)
     #   choice-> (lista_opzioni, default)
+    _MAIN_FILTER_IDS = (
+        "dewow", "timezero", "bg_removal", "bandpass", "migration", "pre_agc_gain", "agc",
+    )
+
+    def _connect_param_widgets(self):
+        """Ogni parametro dei filtri ricalcola il radargramma (con debounce), come
+        gia' facevano solo passa-banda e AGC max/da-campione."""
+        self._param_timer = QTimer(self)
+        self._param_timer.setSingleShot(True)
+        self._param_timer.setInterval(300)
+
+        def _fire():
+            if self._raw_data is not None and not self._syncing_filter_chain:
+                self._apply_processing_async()
+
+        self._param_timer.timeout.connect(_fire)
+        kick = lambda *_a: self._param_timer.start()
+        spins = ["_spin_dewow", "_spin_tz_threshold", "_spin_tz_backup", "_spin_bg_window",
+                 "_spin_bg_sample_start", "_spin_bg_sample_end", "_spin_agc", "_spin_agc_lateral",
+                 "_spin_mig_vel", "_spin_mig_dx", "_spin_gain_surface", "_spin_gain_deep"]
+        combos = ["_cb_tz_method", "_cb_tz_mode", "_cb_bg_method", "_cb_bg_mode"]
+        for name in spins:
+            w = getattr(self, name, None)
+            if w is not None:
+                try:
+                    w.valueChanged.connect(kick)
+                except Exception:
+                    pass
+        for name in combos:
+            w = getattr(self, name, None)
+            if w is not None:
+                try:
+                    w.currentIndexChanged.connect(kick)
+                except Exception:
+                    pass
+        w = getattr(self, "_chk_bg_auto", None)
+        if w is not None:
+            w.toggled.connect(kick)
+        for store in (getattr(self, "_phase1_controls", {}) or {}).values():
+            for w in (store or {}).values():
+                try:
+                    if isinstance(w, QComboBox):
+                        w.currentIndexChanged.connect(kick)
+                    elif isinstance(w, QCheckBox):
+                        w.toggled.connect(kick)
+                    elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                        w.valueChanged.connect(kick)
+                except Exception:
+                    pass
+
+    def _reveal_enabled_hidden_blocks(self):
+        blocks = getattr(self, "_filter_chain_blocks", None) or {}
+        chain = getattr(self, "_filter_chain_widget", None)
+        if not blocks or not self._is_qt_alive(chain):
+            return
+        try:
+            enabled = chain.get_enabled_map()
+        except Exception:
+            return
+        for sid, blk in blocks.items():
+            if enabled.get(sid) and not blk.isVisibleTo(chain):
+                blk.setVisible(True)
+
+    def _build_add_filter_menu(self):
+        btn = QToolButton()
+        btn.setText("+ Aggiungi filtro")
+        btn.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(btn)
+        blocks = getattr(self, "_filter_chain_blocks", None) or {}
+        chain = self._filter_chain_widget
+
+        def _toggle(sid, act):
+            blk = blocks.get(sid)
+            if blk is None:
+                return
+            if act.isChecked():
+                blk.setVisible(True)
+            elif blk.is_enabled():
+                act.setChecked(True)
+                QMessageBox.information(self, "Filtro", "Disattiva prima il filtro per toglierlo dalla catena.")
+            else:
+                blk.setVisible(False)
+
+        for sid in DEFAULT_CHAIN_ORDER:
+            if sid in self._MAIN_FILTER_IDS or sid not in blocks:
+                continue
+            act = menu.addAction(str(FILTER_REGISTRY.get(sid, {}).get("label", sid)))
+            act.setCheckable(True)
+            act.triggered.connect(lambda _c=False, s=sid, a=act: _toggle(s, a))
+        btn.setMenu(menu)
+        self._btn_add_filter = btn
+        return btn
+
+    def _open_diagnosis_dialog(self):
+        from .gpr_diagnosis_dialog import DiagnosisDialog
+        if self._raw_data is None:
+            QMessageBox.information(self, "Diagnosi", "Nessun profilo caricato.")
+            return
+        dock = getattr(self, "_diagnosis_dock", None)
+        if dock is not None and self._is_qt_alive(dock):
+            dock.show()
+            dock.raise_()
+            try:
+                dock.widget().run_diagnosis()
+                dock.widget().refresh_log()
+            except Exception:
+                pass
+            return
+        # Dock a sinistra della finestra del profilo (non sul canvas di QGIS).
+        host = self
+        panel = DiagnosisDialog(self)
+        dock = QDockWidget("GPR Diagnosi / Log / AI", host)
+        dock.setObjectName("RasterLinkerGprDiagnosisDock")
+        dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea
+                             | Qt.TopDockWidgetArea | Qt.BottomDockWidgetArea)
+        dock.setWidget(panel)
+        dock.setAttribute(Qt.WA_DeleteOnClose, True)
+        host.addDockWidget(Qt.LeftDockWidgetArea, dock)
+        dock.destroyed.connect(lambda *_: setattr(self, "_diagnosis_dock", None))
+        self._diagnosis_dock = dock
+        self.destroyed.connect(dock.close)
+        dock.show()
+        dock.raise_()
+
     _PHASE1_STEP_IDS = (
         "dcshift", "boxcar", "notch", "whiten", "amp_eq", "rad_threshold", "power_gain",
         "eigen_filter", "median2d", "fk_dip", "kirchhoff", "inst_attr",
@@ -1660,7 +1347,7 @@ class GprProfileViewer(QMainWindow):
             except Exception:
                 enabled = {}
         if bool(enabled.get(str(step_id), False)) and self._raw_data is not None:
-            self._apply_processing()
+            self._apply_processing_async()
             self._request_preview_update(immediate=False)
 
     def _build_phase1_step_controls(self, step_id: str):
@@ -1783,7 +1470,8 @@ class GprProfileViewer(QMainWindow):
 
         if sid == "agc":
             fl.addRow("Finestra:", self._spin_agc)
-            fl.addRow("Max Gain (0=auto):", self._spin_agc_max_gain)
+            fl.addRow("Max Gain (0=nessun limite):", self._spin_agc_max_gain)
+            fl.addRow("Tracce laterali (0=singola):", self._spin_agc_lateral)
             agc_s0_row = QHBoxLayout()
             agc_s0_row.addWidget(self._spin_agc_sample_start)
             agc_s0_row.addWidget(self._btn_pick_agc_s0)
@@ -1852,6 +1540,9 @@ class GprProfileViewer(QMainWindow):
             chain.chain_changed.connect(self._on_filter_chain_widget_changed)
             self._filter_chain_widget = chain
             self._filter_chain_blocks = blocks
+            for _sid, _blk in blocks.items():
+                if _sid not in self._MAIN_FILTER_IDS:
+                    _blk.setVisible(False)
             return chain
         except Exception:
             self._filter_chain_widget = None
@@ -1869,6 +1560,7 @@ class GprProfileViewer(QMainWindow):
             "bandpass": bool(getattr(self, "_chk_bp", None) and self._chk_bp.isChecked()),
             "envelope": bool(getattr(self, "_chk_envelope", None) and self._chk_envelope.isChecked()),
             "manual_gain": bool(getattr(self, "_chk_manual_gain", None) and self._chk_manual_gain.isChecked()),
+            "migration": bool(getattr(self, "_chk_mig", None) and self._chk_mig.isChecked()),
         }
 
     def _current_chain_order(self) -> list[str]:
@@ -1922,6 +1614,9 @@ class GprProfileViewer(QMainWindow):
             if self._is_qt_alive(getattr(self, "_chk_envelope", None)):
                 self._chk_envelope.setChecked(bool(enabled.get("envelope", self._chk_envelope.isChecked())))
 
+            if self._is_qt_alive(getattr(self, "_chk_mig", None)):
+                self._chk_mig.setChecked(bool(enabled.get("migration", self._chk_mig.isChecked())))
+
             pre_agc_enabled = bool(enabled.get("pre_agc_gain", False))
             if self._is_qt_alive(getattr(self, "_chk_range_gain", None)):
                 self._chk_range_gain.setChecked(pre_agc_enabled)
@@ -1931,7 +1626,7 @@ class GprProfileViewer(QMainWindow):
             self._syncing_filter_chain = False
 
         if self._raw_data is not None:
-            self._apply_processing()
+            self._apply_processing_async()
             self._request_preview_update(immediate=False)
 
     def _on_filter_chain_source_toggled(self, _value=None):
@@ -1949,6 +1644,13 @@ class GprProfileViewer(QMainWindow):
         )
         self._btn_auto_tune.clicked.connect(self._on_auto_tune)
         fl.addRow(self._btn_auto_tune)
+        self._btn_diagnosis = QPushButton("Diagnosi automatica / Log / AI...")
+        self._btn_diagnosis.setToolTip(
+            "Analizza il radargramma, propone sequenza e parametri dei filtri,\n"
+            "mostra il log e permette di chiedere un parere a un assistente AI."
+        )
+        self._btn_diagnosis.clicked.connect(self._open_diagnosis_dialog)
+        fl.addRow(self._btn_diagnosis)
 
         # Dewow
         self._chk_dewow  = QCheckBox(); self._chk_dewow.setChecked(False)
@@ -1962,7 +1664,7 @@ class GprProfileViewer(QMainWindow):
             "NON usa shift circolare: il radargram viene fisicamente troncato."
         )
         self._cb_tz_method = QComboBox()
-        self._cb_tz_method.addItems(["peak", "threshold", "zero_crossing"])
+        self._cb_tz_method.addItems(["peak", "threshold", "zero_crossing", "dominant", "surface", "coppens"])
         self._cb_tz_method.setCurrentText("peak")
         self._cb_tz_method.setEnabled(False)
         self._cb_tz_mode = QComboBox()
@@ -2069,7 +1771,7 @@ class GprProfileViewer(QMainWindow):
         self._chk_bg.toggled.connect(_toggle_bg)
         self._chk_bg_auto.toggled.connect(_toggle_bg_auto)
         self._cb_bg_method.currentIndexChanged.connect(
-            lambda _i: self._apply_processing() if self._chk_bg.isChecked() and self._raw_data is not None else None
+            lambda _i: self._apply_processing_async() if self._chk_bg.isChecked() and self._raw_data is not None else None
         )
 
         # ------------------------------------------------------------------
@@ -2115,7 +1817,7 @@ class GprProfileViewer(QMainWindow):
             finally:
                 self._spin_mig_rdp.blockSignals(False)
             if self._chk_mig.isChecked() and self._raw_data is not None:
-                self._apply_processing()
+                self._apply_processing_async()
 
         def _on_mig_rdp_changed(val: float):
             v = 299792458.0 / np.sqrt(max(float(val), 1.0))
@@ -2125,7 +1827,7 @@ class GprProfileViewer(QMainWindow):
             finally:
                 self._spin_mig_vel.blockSignals(False)
             if self._chk_mig.isChecked() and self._raw_data is not None:
-                self._apply_processing()
+                self._apply_processing_async()
 
         def _sync_mig_vel():
             try:
@@ -2140,12 +1842,12 @@ class GprProfileViewer(QMainWindow):
             self._spin_mig_dx.setEnabled(mig_checked)
             self._btn_sync_mig_vel.setEnabled(mig_checked)
             if self._raw_data is not None:
-                self._apply_processing()
+                self._apply_processing_async()
 
         self._spin_mig_vel.valueChanged.connect(_on_mig_vel_changed)
         self._spin_mig_rdp.valueChanged.connect(_on_mig_rdp_changed)
         self._spin_mig_dx.valueChanged.connect(
-            lambda _v: self._apply_processing() if self._chk_mig.isChecked() and self._raw_data is not None else None
+            lambda _v: self._apply_processing_async() if self._chk_mig.isChecked() and self._raw_data is not None else None
         )
         self._btn_sync_mig_vel.clicked.connect(_sync_mig_vel)
         self._chk_mig.toggled.connect(_toggle_mig)
@@ -2164,14 +1866,23 @@ class GprProfileViewer(QMainWindow):
             "Limite massimo fattore di guadagno (0 = illimitato/automatico).\n"
             "Previene l'amplificazione eccessiva del rumore di fondo nelle zone profonde."
         )
+        self._spin_agc_lateral = QSpinBox()
+        self._spin_agc_lateral.setRange(0, 999)
+        self._spin_agc_lateral.setValue(0)
+        self._spin_agc_lateral.setEnabled(False)
+        self._spin_agc_lateral.setToolTip(
+            "0 = guadagno calcolato su ogni singola traccia (appiattisce le anomalie).\n"
+            "N = energia mediata su N tracce vicine: il guadagno compensa il decadimento in\n"
+            "profondita' ma conserva le differenze di ampiezza tra tracce (consigliato 15-31)."
+        )
         self._spin_agc_sample_start = QSpinBox()
         self._spin_agc_sample_start.setRange(0, 9999)
         self._spin_agc_sample_start.setValue(0)
         self._spin_agc_sample_start.setEnabled(False)
         self._spin_agc_sample_start.setToolTip(
             "Primo campione su cui applicare l'AGC (0 = dall'inizio).\n"
-            "I campioni precedenti vengono copiati invariati (gain=1).\n"
-            "Utile per escludere il burst superficiale (coupling antenna)."
+            "I campioni precedenti (burst) non entrano nel calcolo del guadagno e vengono\n"
+            "riportati alla scala AGC con un fattore unico."
         )
         # Stato pick-mode: nome del target attivo (es. 'agc_sample_start') o None
         self._pick_mode_target: str | None = None
@@ -2192,6 +1903,7 @@ class GprProfileViewer(QMainWindow):
         def _toggle_agc(agc_checked):
             self._spin_agc.setEnabled(agc_checked)
             self._spin_agc_max_gain.setEnabled(agc_checked)
+            self._spin_agc_lateral.setEnabled(agc_checked)
             self._spin_agc_sample_start.setEnabled(agc_checked)
             if self._is_qt_alive(self._btn_pick_agc_s0):
                 self._btn_pick_agc_s0.setEnabled(agc_checked)
@@ -2200,10 +1912,10 @@ class GprProfileViewer(QMainWindow):
 
         self._chk_agc.toggled.connect(_toggle_agc)
         self._spin_agc_max_gain.valueChanged.connect(
-            lambda _v: self._apply_processing() if self._chk_agc.isChecked() and self._raw_data is not None else None
+            lambda _v: self._apply_processing_async() if self._chk_agc.isChecked() and self._raw_data is not None else None
         )
         self._spin_agc_sample_start.valueChanged.connect(
-            lambda _v: self._apply_processing() if self._chk_agc.isChecked() and self._raw_data is not None else None
+            lambda _v: self._apply_processing_async() if self._chk_agc.isChecked() and self._raw_data is not None else None
         )
 
         # Bandpass
@@ -2313,7 +2025,7 @@ class GprProfileViewer(QMainWindow):
         self._chk_flip_profile.setToolTip(
             "Inverti orizzontalmente il radargramma corrente (direzione tracce)."
         )
-        self._chk_flip_profile.toggled.connect(lambda _v: self._reload_data())
+        self._chk_flip_profile.toggled.connect(lambda _v: self._reload_data(deferred=True))
 
         self._spin_trim_start = QSpinBox()
         self._spin_trim_start.setRange(0, 0)
@@ -2453,9 +2165,10 @@ class GprProfileViewer(QMainWindow):
             self._bp_canvas = None
 
         self._filter_chain_widget = self._build_filter_chain_controls()
+        self._connect_param_widgets()
 
         btn_apply = QPushButton("Applica")
-        btn_apply.clicked.connect(self._apply_processing)
+        btn_apply.clicked.connect(self._apply_processing_async)
         btn_gain = QPushButton("Aggiorna gain")
         btn_gain.setToolTip("Applica solo Gain display senza rieseguire i filtri.")
         btn_gain.clicked.connect(self._apply_gain_only)
@@ -2469,6 +2182,7 @@ class GprProfileViewer(QMainWindow):
 
         if self._is_qt_alive(self._filter_chain_widget):
             fl.addRow("Pipeline chain:", self._filter_chain_widget)
+            fl.addRow("", self._build_add_filter_menu())
 
         fl.addRow("Trim start traces:",  self._spin_trim_start)
         fl.addRow("Trim end traces:",    self._spin_trim_end)
@@ -3225,7 +2939,7 @@ class GprProfileViewer(QMainWindow):
     def _on_bp_controls_changed(self, _checked: bool):
         self._refresh_bp_histogram()
         if self._raw_data is not None:
-            self._apply_processing()
+            self._apply_processing_async()
 
     def _on_bp_spin_changed(self, _value: float):
         lo = float(self._spin_bp_lo.value())
@@ -3248,7 +2962,7 @@ class GprProfileViewer(QMainWindow):
                     self._spin_bp_hi.blockSignals(False)
         self._refresh_bp_histogram()
         if self._raw_data is not None and bool(self._chk_bp.isChecked()):
-            self._apply_processing()
+            self._apply_processing_async()
 
     def _on_bp_hist_click(self, event):
         if event is None or event.xdata is None:
@@ -3286,84 +3000,26 @@ class GprProfileViewer(QMainWindow):
 
         self._refresh_bp_histogram()
         if self._raw_data is not None:
-            self._apply_processing()
-
-    # ------------------------------------------------------------------
-    # Import
-    # ------------------------------------------------------------------
-
-    def _prompt_workspace_dir(self) -> None:
-        """Chiede all'utente dove salvare il workspace GPR (raw/processed/timeslices).
-
-        Imposta self._gpr_workspace_override sulla cartella scelta. Se l'utente
-        annulla, mantiene l'eventuale workspace precedente (o il default
-        automatico sotto il progetto attivo).
-        """
-        start = str(getattr(self, "_gpr_workspace_override", "") or "").strip()
-        if not start:
-            root = self._active_project_root()
-            start = (
-                os.path.join(root, "GPR_Processing") if root else os.path.expanduser("~")
-            )
-        folder = QFileDialog.getExistingDirectory(
-            self, "Cartella di lavoro GPR (dove salvare raw/processed/timeslices)", start
-        )
-        if folder:
-            self._set_active_workspace(folder)
-
-    def _new_gpr_project(self):
-        """Crea un nuovo progetto GPR in una cartella scelta e azzera la sessione."""
-        start = str(getattr(self, "_gpr_workspace_override", "") or "").strip() \
-            or os.path.expanduser("~")
-        folder = QFileDialog.getExistingDirectory(
-            self, "Nuovo progetto GPR — scegli la cartella", start
-        )
-        if not folder:
-            return
-        self._set_active_workspace(folder)
-        self._reset_session_state()
-        self._ensure_gpr_processing_layout()
-        try:
-            self._save_gpr_processing_project_meta()
-        except Exception:
-            pass
-        self._safe_set_text(
-            self._lbl_status,
-            f"Nuovo progetto GPR: {os.path.normpath(folder)}. Importa i .ogpr per iniziare.",
-        )
-
-    def _open_gpr_project(self):
-        """Apre un progetto GPR esistente da una cartella scelta."""
-        start = str(getattr(self, "_gpr_workspace_override", "") or "").strip() \
-            or os.path.expanduser("~")
-        folder = QFileDialog.getExistingDirectory(
-            self, "Apri progetto GPR — scegli la cartella del progetto", start
-        )
-        if not folder:
-            return
-        folder = os.path.normpath(folder)
-        # Accetta sia la cartella-progetto (contiene GPR_Processing) sia la
-        # cartella GPR_Processing stessa (in tal caso usa la cartella superiore).
-        if (not os.path.isfile(os.path.join(folder, "GPR_Processing", "project.json"))
-                and os.path.isfile(os.path.join(folder, "project.json"))):
-            folder = os.path.dirname(folder)
-        self._set_active_workspace(folder)
-        if not self._try_import_saved_gpr_processing_project(force=True):
-            QMessageBox.information(
-                self, "Apri progetto GPR",
-                "Nessun profilo trovato nel progetto selezionato.\n"
-                "Verifica che la cartella contenga GPR_Processing/project.json.",
-            )
+            self._apply_processing_async()
 
     def import_files(self):
+        # Il progetto (con GPR_Processing e cartelle Project Manager) esiste gia':
+        # l'import non chiede piu' dove creare le cartelle di lavoro.
+        if not self._gpr_processing_paths():
+            ret = QMessageBox.question(
+                self, "Importa profili GPR",
+                "Nessun progetto GPR attivo. Vuoi crearne uno nuovo adesso?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if ret != QMessageBox.Yes or not self._new_gpr_project():
+                return
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Importa profili GPR", "",
             import_dialog_filter(),
         )
         if not paths:
             return
-        # L'utente sceglie dove salvare i file di lavoro a ogni import.
-        self._prompt_workspace_dir()
+        self._ensure_gpr_processing_layout()
         staged_paths = [self._stage_profile_in_project_raw(p) for p in paths]
         # Nuova sessione import: reset completo stato+UI per evitare riferimenti stale a widget Qt.
         self._reset_session_state()
@@ -3561,6 +3217,11 @@ class GprProfileViewer(QMainWindow):
                 pass
 
         def _on_positioning_applied(result: dict):
+            _dbg.log("VIEWER", f"posizionamento applicato a {len(result.get('profiles', []))} profilo/i; "
+                     f"georef={result.get('georef')} nav={result.get('navigation')}")
+            # la geometria e' cambiata: invalida le anteprime da variante in cache
+            self._geometry_rev = int(getattr(self, "_geometry_rev", 0)) + 1
+            self._preview_variant_cache = None
             # Salva parametri per il progetto
             self._grid_positioning_params = result
             try:
@@ -3589,12 +3250,12 @@ class GprProfileViewer(QMainWindow):
     def _prev_profile(self):
         if self._profiles:
             self._prof_idx = max(0, self._prof_idx - 1)
-            self._load_current_profile()
+            self._load_current_profile(deferred=True)
 
     def _next_profile(self):
         if self._profiles:
             self._prof_idx = min(len(self._profiles) - 1, self._prof_idx + 1)
-            self._load_current_profile()
+            self._load_current_profile(deferred=True)
 
     def keyPressEvent(self, event):
         key = int(event.key()) if event is not None else 0
@@ -3611,7 +3272,7 @@ class GprProfileViewer(QMainWindow):
     def _on_channel_changed(self, idx):
         if idx >= 0:
             self._ch_idx = idx
-            self._reload_data()
+            self._reload_data(deferred=True)
             # Auto reset zoom on channel change (same behavior as Reset Zoom button).
             self._reset_zoom()
 
@@ -3686,9 +3347,9 @@ class GprProfileViewer(QMainWindow):
                     self._spin_trim_start.blockSignals(False)
         self._trim_start_traces = int(start)
         self._trim_end_traces = int(end)
-        self._reload_data()
+        self._reload_data(deferred=True)
 
-    def _load_current_profile(self):
+    def _load_current_profile(self, deferred: bool = False):
         if not self._profiles:
             self._update_slice_profile_info()
             return
@@ -3716,7 +3377,8 @@ class GprProfileViewer(QMainWindow):
         for i in range(prof.n_channels):
             try:
                 score = self._channel_signal_score(prof.channel(i).data)
-            except Exception:
+            except Exception as exc:
+                self._note_swallowed(f"punteggio segnale del canale {i}", exc)
                 score = -1.0
             if score > best_score:
                 best_score = score
@@ -3729,7 +3391,8 @@ class GprProfileViewer(QMainWindow):
             pass
         try:
             self._update_trim_controls_for_channel(int(prof.channel(self._ch_idx).data.shape[1]))
-        except Exception:
+        except Exception as exc:
+            self._note_swallowed("controlli di trim del canale", exc)
             self._update_trim_controls_for_channel(0)
         try:
             v_prof = self._profile_reference_velocity(prof)
@@ -3737,7 +3400,7 @@ class GprProfileViewer(QMainWindow):
             self._spin_hyperbola_rdp.setValue(rdp_prof)
         except Exception:
             pass
-        self._reload_data()
+        self._reload_data(deferred=deferred)
         # Auto reset zoom on profile change (same behavior as Reset Zoom button).
         self._reset_zoom()
         if self._ch_idx != 0:
@@ -3747,7 +3410,79 @@ class GprProfileViewer(QMainWindow):
             )
         self._draw_profile_line_on_canvas()
 
-    def _reload_data(self):
+    def _trace_indices_for(self, n_t: int) -> np.ndarray:
+        """Indici delle tracce visibili (trim + flip) per un profilo di n_t tracce."""
+        start = int(np.clip(self._trim_start_traces, 0, max(0, n_t - 1)))
+        end_trim = int(np.clip(self._trim_end_traces, 0, max(0, n_t - 1)))
+        end = min(max(start + 1, n_t - end_trim), n_t)
+        idx = np.arange(start, end, dtype=np.int64)
+        if bool(getattr(self, "_chk_flip_profile", None) and self._chk_flip_profile.isChecked()):
+            idx = idx[::-1]
+        if idx.size <= 0:
+            idx = np.arange(0, min(1, n_t), dtype=np.int64)
+        return idx
+
+    def _grid_bg_reference(self, params: dict, channel_idx: int):
+        """Traccia media globale per il background grid_by_grid (due passate).
+
+        Prima passata: dewow + time-zero su tutti i profili, poi media di tutte le
+        tracce (stessa logica dello slicer). Ritorna None se non serve."""
+        if not (params.get("bg_removal") and str(params.get("bg_mode")) == "grid_by_grid"):
+            return None
+        if not self._profiles:
+            return None
+        pre_keys = ("dewow", "dewow_win", "timezero", "tz_method", "tz_mode", "tz_threshold",
+                    "tz_backup_nsamp", "tz_fixed_sample")
+        key = (
+            tuple(str(getattr(p, "path", "")) for p in self._profiles), int(channel_idx),
+            int(self._trim_start_traces), int(self._trim_end_traces),
+            bool(getattr(self, "_chk_flip_profile", None) and self._chk_flip_profile.isChecked()),
+            tuple((k, params.get(k)) for k in pre_keys),
+        )
+        cache = getattr(self, "_grid_bg_ref_cache", None)
+        if cache and cache[0] == key:
+            return cache[1]
+        from .gpr_processing import apply_pre_bg_pipeline
+        pres = []
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for prof in self._profiles:
+                if channel_idx >= int(getattr(prof, "n_channels", 0) or 0):
+                    continue
+                d = np.asarray(prof.channel(channel_idx).data, dtype=np.float32)
+                if d.ndim != 2 or d.size == 0:
+                    continue
+                d = d[:, self._trace_indices_for(d.shape[1])]
+                try:
+                    pre = apply_pre_bg_pipeline(d, params, dt_ns=getattr(prof, "dt_ns", 0.117))
+                except Exception as exc:
+                    # Il profilo esce dalla media del background: il riferimento
+                    # grid_by_grid si basa su meno profili senza che si veda.
+                    self._note_swallowed(
+                        f"background grid_by_grid, profilo escluso "
+                        f"({os.path.basename(str(getattr(prof, 'path', '?')))})",
+                        exc,
+                    )
+                    continue
+                if pre is not None and pre.ndim == 2 and pre.shape[0] > 0 and pre.shape[1] > 0:
+                    pres.append(pre)
+        finally:
+            QApplication.restoreOverrideCursor()
+        ref = None
+        if pres:
+            min_ns = min(t.shape[0] for t in pres)
+            ref = np.concatenate([t[:min_ns, :] for t in pres], axis=1).mean(axis=1).astype(np.float64)
+        self._grid_bg_ref_cache = (key, ref)
+        return ref
+
+    def _reload_data(self, deferred: bool = False):
+        """Ricarica i dati grezzi del profilo/canale e rielabora.
+
+        deferred=True: la pipeline gira in un thread (comandi interattivi: cambio
+        canale, flip, trim, profilo precedente/successivo) e fino al risultato il
+        dato mostrato e' considerato assente. deferred=False: sincrono, per chi
+        legge `_proc_data` subito dopo (import, ripristino progetto, preset).
+        """
         if not self._profiles:
             return
         if not self._is_qt_alive(self):
@@ -3764,25 +3499,24 @@ class GprProfileViewer(QMainWindow):
         full = ch.data.copy()
         n_t = int(full.shape[1]) if full.ndim == 2 else 0
         self._update_trim_controls_for_channel(n_t)
-        start = int(np.clip(self._trim_start_traces, 0, max(0, n_t - 1)))
-        end_trim = int(np.clip(self._trim_end_traces, 0, max(0, n_t - 1)))
-        end = max(start + 1, n_t - end_trim)
-        end = min(end, n_t)
-        idx = np.arange(start, end, dtype=np.int64)
-        if bool(getattr(self, "_chk_flip_profile", None) and self._chk_flip_profile.isChecked()):
-            idx = idx[::-1]
-        if idx.size <= 0:
-            idx = np.arange(0, min(1, n_t), dtype=np.int64)
+        idx = self._trace_indices_for(n_t)
         if full.ndim == 2 and idx.size > 0:
             self._raw_data = full[:, idx].copy()
         else:
             self._raw_data = full.copy()
         self._trace_source_indices = idx.astype(np.int64, copy=False)
         self._proc_data = None
+        self._proc_pre_agc = False
         self._stage_cache = {}
         self._hyper_apex_x = None
         self._hyper_apex_depth = None
-        self._apply_processing()
+        if deferred:
+            # `_disp_data` appartiene al profilo/canale precedente: cursore, A-scan e
+            # pick lo trattano come 'nessun dato' finche' il nuovo non e' pronto.
+            self._disp_data = None
+            self._apply_processing_async()
+        else:
+            self._apply_processing()
 
     # ------------------------------------------------------------------
     # Processing
@@ -3837,6 +3571,7 @@ class GprProfileViewer(QMainWindow):
             "agc_win": int(self._spin_agc.value()),
             "agc_max_gain": float(self._spin_agc_max_gain.value()) if hasattr(self, "_spin_agc_max_gain") else 0.0,
             "agc_sample_start": int(self._spin_agc_sample_start.value()) if getattr(self, "_spin_agc_sample_start", None) else 0,
+            "agc_lateral": int(self._spin_agc_lateral.value()) if getattr(self, "_spin_agc_lateral", None) else 0,
             "pre_agc_gain": bool(self._chk_range_gain.isChecked()),
             "pre_agc_surface_gain": float(self._spin_gain_surface.value()),
             "pre_agc_deep_gain": float(self._spin_gain_deep.value()),
@@ -3856,11 +3591,26 @@ class GprProfileViewer(QMainWindow):
             "chain_order": self._current_chain_order(),
         }
 
-    def _apply_processing(self):
+    WORKING_VARIANT_NAME = "Lavoro"
+
+    _PIPELINE_FILTER_KEYS = (
+        "timezero", "dewow", "bg_removal", "bandpass", "migration", "agc",
+        "envelope", "pre_agc_gain", "manual_gain", "dcshift", "boxcar", "notch",
+        "whiten", "amp_eq", "rad_threshold", "power_gain", "eigen_filter",
+        "median2d", "fk_dip", "kirchhoff", "inst_attr",
+    )
+
+    def _begin_processing(self, deferred: bool):
+        """Prologo comune di _apply_processing / _apply_processing_async.
+
+        Ritorna None se non c'e' nulla da eseguire (nessun dato, caso RAW,
+        variante gia' su disco); altrimenti il job da passare ad apply_pipeline.
+        `deferred=True` = il risultato arrivera' piu' tardi da un thread.
+        """
         if self._raw_data is None:
-            return
+            return None
         if not self._is_qt_alive(self):
-            return
+            return None
         for w in (
             getattr(self, "_chk_dewow", None),
             getattr(self, "_spin_dewow", None),
@@ -3872,37 +3622,17 @@ class GprProfileViewer(QMainWindow):
             getattr(self, "_chk_envelope", None),
         ):
             if not self._is_qt_alive(w):
-                return
+                return None
+        self._reveal_enabled_hidden_blocks()
         params = self._current_processing_params()
-        self._last_pipeline_params = dict(params)
-        has_active_filters = any(
-            bool(params.get(k, False))
-            for k in (
-                "timezero",
-                "dewow",
-                "bg_removal",
-                "bandpass",
-                "migration",
-                "agc",
-                "envelope",
-                "pre_agc_gain",
-                "manual_gain",
-                "dcshift",
-                "boxcar",
-                "notch",
-                "whiten",
-                "amp_eq",
-                "rad_threshold",
-                "power_gain",
-                "eigen_filter",
-                "median2d",
-                "fk_dip",
-                "kirchhoff",
-                "inst_attr",
-            )
-        )
+        self._schedule_recipe_autosave()
+        # Ogni nuova richiesta rende obsoleto un eventuale risultato in volo.
+        self._proc_job_seq += 1
+        has_active_filters = any(bool(params.get(k, False)) for k in self._PIPELINE_FILTER_KEYS)
         if not has_active_filters:
+            self._last_pipeline_params = dict(params)
             self._proc_data = np.array(self._raw_data, dtype=np.float32, copy=True)
+            self._proc_pre_agc = False
             self._refresh_bp_histogram()
             self._apply_gain_only()
             self._safe_set_text(
@@ -3910,27 +3640,43 @@ class GprProfileViewer(QMainWindow):
                 "Modalita' RAW: nessun filtro pipeline attivo.",
             )
             self._request_preview_update(immediate=False)
-            return
+            return None
         if not self._profiles or self._prof_idx < 0 or self._prof_idx >= len(self._profiles):
-            return
+            return None
         prof = self._profiles[self._prof_idx]
         dt_ns_val = float(getattr(prof, "dt_ns", 0.117) or 0.117)
-        try:
-            self._proc_data = apply_pipeline(
-                self._raw_data,
-                params,
-                dt_ns=dt_ns_val,
-                normalize_output=False,
-                chain_order=params.get("chain_order"),
-                stage_cache=self._stage_cache,
+        cached = self._load_variant_channel(
+            prof, int(self._ch_idx),
+            self._recipe_signature(params, self._view_geom_sig()),
+            getattr(self._raw_data, "shape", None),
+        )
+        if cached is not None:
+            self._last_pipeline_params = dict(params)
+            self._proc_data = cached
+            self._proc_pre_agc = bool(params.get("pre_agc_gain", False))
+            self._refresh_bp_histogram()
+            self._apply_gain_only()
+            self._safe_set_text(
+                self._lbl_status,
+                "Dato processato caricato dalla variante salvata su disco.",
             )
-        except Exception as e:
-            log_exception("apply_pipeline", e)
-            QMessageBox.critical(
-                self, "Errore processing",
-                f"{e}\n\nDettagli in: {LOG_FILE_PATH}",
-            )
-            return
+            self._request_preview_update(immediate=False)
+            return None
+        return {
+            "seq": int(self._proc_job_seq),
+            "raw": self._raw_data,
+            "params": params,
+            "dt_ns": dt_ns_val,
+            "bg_reference_trace": self._grid_bg_reference(params, int(self._ch_idx)),
+            "chain_order": params.get("chain_order"),
+            "stage_cache": self._stage_cache,
+        }
+
+    def _finish_processing(self, params: dict, result: np.ndarray) -> None:
+        """Coda comune: valida il risultato e aggiorna vista e anteprima."""
+        self._last_pipeline_params = dict(params)
+        self._proc_data = result
+        self._proc_pre_agc = bool(params.get("pre_agc_gain", False))
 
         # Fallback robusto: evita profilo "vuoto" quando il risultato e' quasi nullo o non finito.
         proc = np.asarray(self._proc_data)
@@ -3941,6 +3687,7 @@ class GprProfileViewer(QMainWindow):
         if finite_ratio < 0.5 or spread < 1e-6:
             try:
                 self._proc_data = np.asarray(self._raw_data, dtype=np.float32)
+                self._proc_pre_agc = False  # dato grezzo: il range-gain NON e' incorporato
                 fallback_msg = (
                     f"Processing inconcludente "
                     f"(finite={finite_ratio:.0%}, spread={spread:.2e}): "
@@ -3967,6 +3714,114 @@ class GprProfileViewer(QMainWindow):
             # alcun effetto visibile.
             self._safe_set_text(self._lbl_status, fallback_msg)
         self._request_preview_update(immediate=False)
+
+    def _show_processing_error(self, exc) -> None:
+        log_exception("apply_pipeline", exc)
+        QMessageBox.critical(
+            self, "Errore processing",
+            f"{exc}\n\nDettagli in: {LOG_FILE_PATH}",
+        )
+
+    def _apply_processing(self):
+        """Esegue la pipeline nel thread della GUI (chi chiama si aspetta
+        `_proc_data` pronto al ritorno). Per i comandi interattivi usare
+        `_apply_processing_async`."""
+        self._wait_processing_job()
+        job = self._begin_processing(deferred=False)
+        if job is None:
+            return
+        try:
+            result = _run_pipeline_job(job)
+        except Exception as e:
+            self._show_processing_error(e)
+            return
+        self._finish_processing(job["params"], result)
+
+    # -- versione asincrona (comandi interattivi) ------------------------
+
+    def _apply_processing_async(self, *_args):
+        """Come _apply_processing ma la pipeline gira in un QThread.
+
+        La GUI resta libera durante filtri pesanti (kirchhoff, fk, eigen...).
+        Se un job e' gia' in corso non lo si interrompe: se ne ricorda solo la
+        richiesta e, a job finito, si riparte con lo stato piu' recente dei
+        controlli scartando il risultato ormai vecchio.
+        """
+        if self._raw_data is None:
+            return
+        if self._proc_thread_running():
+            self._proc_rerun = True
+            return
+        job = self._begin_processing(deferred=True)
+        if job is None:
+            return
+        self._start_processing_thread(job)
+
+    def _proc_thread_running(self) -> bool:
+        thread = getattr(self, "_proc_thread", None)
+        return bool(self._is_qt_alive(thread) and thread.isRunning())
+
+    def _start_processing_thread(self, job: dict) -> None:
+        self._set_processing_busy(True)
+        thread = QThread(self)
+        worker = _PipelineWorker(job)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_processing_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._proc_thread = thread
+        self._proc_worker = worker
+        self._proc_job = job
+        thread.start()
+
+    def _on_processing_finished(self, seq: int, result, error: str) -> None:
+        job = self._proc_job
+        self._proc_job = None
+        self._set_processing_busy(False)
+        rerun = bool(self._proc_rerun)
+        self._proc_rerun = False
+        if not self._is_qt_alive(self):
+            return
+        if rerun:
+            # Nel frattempo i parametri sono cambiati: il risultato e' vecchio.
+            # Il thread sta chiudendo (worker.finished -> quit): va atteso, se no
+            # _apply_processing_async lo vedrebbe ancora attivo e perderebbe la richiesta.
+            thread = self._proc_thread
+            if self._is_qt_alive(thread) and thread.isRunning():
+                thread.quit()
+                thread.wait(5000)
+            self._apply_processing_async()
+            return
+        if job is None or int(seq) != int(self._proc_job_seq):
+            return  # cambiato profilo/canale/dato: risultato non piu' valido
+        if error or result is None:
+            self._show_processing_error(RuntimeError(error or "risultato vuoto"))
+            return
+        self._finish_processing(job["params"], result)
+
+    def _wait_processing_job(self, timeout_ms: int = 60000) -> None:
+        """Attende un job in volo e ne scarta il risultato."""
+        self._proc_job_seq += 1
+        self._proc_rerun = False
+        thread = getattr(self, "_proc_thread", None)
+        if self._is_qt_alive(thread) and thread.isRunning():
+            try:
+                thread.quit()
+                thread.wait(int(timeout_ms))
+            except Exception:
+                pass
+        if self._proc_job is not None:
+            self._proc_job = None
+            self._set_processing_busy(False)
+
+    def _set_processing_busy(self, busy: bool) -> None:
+        self._proc_busy = bool(busy)
+        title = "GPR Profile Viewer"
+        self.setWindowTitle(title + ("  —  elaborazione in corso..." if busy else ""))
+        if busy:
+            self._safe_set_text(self._lbl_status, "Elaborazione pipeline in corso...")
 
     # ------------------------------------------------------------------
     # Auto-tune
@@ -4249,12 +4104,10 @@ class GprProfileViewer(QMainWindow):
 
     def _apply_range_gain_change(self):
         if bool(getattr(self, "_chk_range_gain", None) and self._chk_range_gain.isChecked()):
-            self._apply_processing()
+            self._apply_processing_async()
         else:
-            # Gain disabled: update last params so _compose_display_data knows
-            # pre_agc is no longer baked into _proc_data.
-            if hasattr(self, "_last_pipeline_params"):
-                self._last_pipeline_params["pre_agc_gain"] = False
+            # Gain disattivato: _compose_display_data legge _proc_pre_agc dal
+            # dato, quindi basta ridisegnare.
             self._apply_gain_only()
 
     def _on_range_gain_surface_changed(self, _value: float):
@@ -4405,73 +4258,6 @@ class GprProfileViewer(QMainWindow):
         self._update_hyperbola_readout()
         if self._chk_hyperbola.isChecked():
             self._redraw()
-
-    def _channel_trace_vector(self, values, n_t: int) -> np.ndarray:
-        target = max(0, int(n_t))
-        if target <= 0:
-            return np.zeros(0, dtype=np.float64)
-        arr = np.asarray(values if values is not None else [], dtype=np.float64)
-        idx = self._trace_source_indices
-        if (
-            isinstance(idx, np.ndarray)
-            and idx.ndim == 1
-            and idx.size == target
-            and arr.size > 0
-        ):
-            try:
-                imin = int(np.nanmin(idx))
-                imax = int(np.nanmax(idx))
-            except Exception:
-                imin, imax = 0, -1
-            if imin >= 0 and imax < arr.size:
-                try:
-                    return np.asarray(arr[idx.astype(np.int64)], dtype=np.float64)
-                except Exception:
-                    pass
-        if arr.size == target:
-            return arr.astype(np.float64, copy=False)
-        if arr.size <= 0:
-            return np.full(target, np.nan, dtype=np.float64)
-        if arr.size == 1:
-            return np.full(target, float(arr[0]), dtype=np.float64)
-        src = np.linspace(0.0, 1.0, arr.size, dtype=np.float64)
-        dst = np.linspace(0.0, 1.0, target, dtype=np.float64)
-        return np.interp(dst, src, arr).astype(np.float64)
-
-    def _display_distance_axis(self, prof, n_traces: int) -> np.ndarray:
-        n_t = max(1, int(n_traces))
-        try:
-            ch = prof.channel(self._ch_idx)
-            distances = self._channel_trace_vector(getattr(ch, "distances", []), n_t)
-        except Exception:
-            distances = np.zeros(0, dtype=np.float64)
-        if distances.size != n_t:
-            if distances.size > 1:
-                src = np.linspace(0.0, 1.0, distances.size, dtype=np.float64)
-                dst = np.linspace(0.0, 1.0, n_t, dtype=np.float64)
-                distances = np.interp(dst, src, distances).astype(np.float64)
-            else:
-                step = float(getattr(prof, "sampling_step_m", 0.1) or 0.1)
-                step = max(step, 1e-6)
-                distances = (np.arange(n_t, dtype=np.float64) * step).astype(np.float64)
-        finite = np.isfinite(distances)
-        if not finite.any():
-            return np.linspace(0.0, float(max(1, n_t - 1)), n_t, dtype=np.float64)
-        if not finite.all():
-            idx = np.arange(distances.size, dtype=np.float64)
-            ok = np.where(finite)[0].astype(np.float64)
-            distances = np.interp(idx, ok, distances[finite]).astype(np.float64)
-        d0 = float(distances[0]) if np.isfinite(distances[0]) else 0.0
-        distances = distances - d0
-        if distances.size > 1:
-            # Enforce monotonic axis for noisy/raw cumulative distance vectors.
-            distances = np.maximum.accumulate(distances)
-        span = float(distances[-1] - distances[0]) if distances.size > 1 else 0.0
-        if (not np.isfinite(span)) or span <= 1e-9:
-            step = float(getattr(prof, "sampling_step_m", 0.1) or 0.1)
-            step = max(step, 1e-6)
-            distances = (np.arange(n_t, dtype=np.float64) * step).astype(np.float64)
-        return distances
 
     def _auto_fit_hyperbola_rdp(self):
         if self._disp_data is None or not self._profiles:
@@ -4714,6 +4500,7 @@ class GprProfileViewer(QMainWindow):
             "agc_win": getattr(self, "_spin_agc", None),
             "agc_max_gain": getattr(self, "_spin_agc_max_gain", None),
             "agc_sample_start": getattr(self, "_spin_agc_sample_start", None),
+            "agc_lateral": getattr(self, "_spin_agc_lateral", None),
             "bp_low_mhz": getattr(self, "_spin_bp_lo", None),
             "bp_high_mhz": getattr(self, "_spin_bp_hi", None),
         }
@@ -4776,6 +4563,60 @@ class GprProfileViewer(QMainWindow):
                 self._request_preview_update(immediate=True)
         except Exception:
             pass
+
+    def _clear_profile_cache(self):
+        clear_ogpr_cache()
+        self._preview_variant_cache = None
+        self._safe_set_text(
+            self._lbl_status,
+            "Cache profili svuotata: i prossimi import rileggono i file da disco.",
+        )
+
+    def _show_coord_log_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Log coordinate (debug)")
+        dlg.resize(980, 520)
+        lay = QVBoxLayout(dlg)
+        from qgis.PyQt.QtWidgets import QPlainTextEdit, QPushButton
+        box = QPlainTextEdit()
+        box.setReadOnly(True)
+        box.setLineWrapMode(QPlainTextEdit.NoWrap)
+        box.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt;")
+        lay.addWidget(box, 1)
+
+        def refresh():
+            box.setPlainText(_dbg.get_text() or "(log vuoto)")
+            sb = box.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+        def clear_log():
+            _dbg.clear()
+            refresh()
+
+        def clear_cache():
+            clear_ogpr_cache()
+            refresh()
+
+        def copy_all():
+            QApplication.clipboard().setText(_dbg.get_text())
+
+        row = QHBoxLayout()
+        for text, fn in (
+            ("Aggiorna", refresh),
+            ("Copia", copy_all),
+            ("Pulisci log", clear_log),
+            ("Pulisci cache", clear_cache),
+        ):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch(1)
+        b_close = QPushButton("Chiudi")
+        b_close.clicked.connect(dlg.accept)
+        row.addWidget(b_close)
+        lay.addLayout(row)
+        refresh()
+        dlg.exec_()
 
     def _apply_full_processing_state(self, state: dict) -> None:
         """Ripristina l'intero stato di processing salvato nel progetto e
@@ -4982,4625 +4823,6 @@ class GprProfileViewer(QMainWindow):
             self._safe_set_text(self._lbl_status, f"Preset caricato: {path}")
         except Exception as exc:
             QMessageBox.critical(self, "Load Preset", f"Errore caricamento preset:\n{exc}")
-
-    def _draw_hyperbola_overlay_on_axis(self, ax, prof, dist_max: float, depth_max: float):
-        if ax is None:
-            return
-        if not bool(getattr(self, "_chk_hyperbola", None) and self._chk_hyperbola.isChecked()):
-            return
-        if self._hyper_apex_x is None or self._hyper_apex_depth is None:
-            return
-        x0 = float(self._hyper_apex_x)
-        z0_disp = float(self._hyper_apex_depth)
-        if not (np.isfinite(x0) and np.isfinite(z0_disp) and np.isfinite(dist_max) and np.isfinite(depth_max)):
-            return
-        if z0_disp < 0 or z0_disp > depth_max:
-            return
-
-        v_ref = self._profile_reference_velocity(prof)
-        rdp = float(self._spin_hyperbola_rdp.value())
-        v_fit = self._rdp_to_velocity_m_s(rdp)
-        s = self._hyperbola_txrx_offset()
-        # Apex sample time from current displayed depth scale.
-        t0 = (2.0 * z0_disp) / max(v_ref, 1e-9)
-        x = np.linspace(0.0, float(dist_max), 600, dtype=np.float64)
-        dx = x - x0
-        # Bistatic model (s=0 -> monostatico), poi rimappato in profondita' display.
-        z_disp = self._hyperbola_curve_depth(dx, t0, v_fit, v_ref, s)
-        finite = np.isfinite(z_disp) & (z_disp >= 0.0) & (z_disp <= (depth_max * 1.02))
-        if not finite.any():
-            return
-        ax.plot(x[finite], z_disp[finite], color="#ffd000", lw=1.5, alpha=0.95, zorder=7)
-        ax.scatter([x0], [z0_disp], s=28, color="#ff8c00", edgecolor="#1f1f1f", linewidths=0.5, zorder=8)
-        ax.text(
-            x0,
-            min(depth_max, z0_disp + 0.03 * max(depth_max, 1e-6)),
-            f"RDP {rdp:.2f}",
-            color="#ffd000",
-            fontsize=8,
-            ha="left",
-            va="bottom",
-            zorder=8,
-        )
-
-    def _draw_hyperbola_overlay(self, prof, dist_max: float, depth_max: float):
-        self._draw_hyperbola_overlay_on_axis(self._ax, prof, dist_max, depth_max)
-
-    def _build_depth_range_gain(self, n_samples: int) -> np.ndarray:
-        n = max(1, int(n_samples))
-        if not bool(getattr(self, "_chk_range_gain", None) and self._chk_range_gain.isChecked()):
-            return np.ones((n, 1), dtype=np.float32)
-        t = np.linspace(0.0, 1.0, n, dtype=np.float64)
-        pts = self._sanitize_range_gain_breakpoints(self._range_gain_breakpoints)
-        x = np.asarray(pts[:, 0], dtype=np.float64)
-        y = np.asarray(pts[:, 1], dtype=np.float64)
-        g = np.interp(t, x, y)
-        g = np.clip(g, 1e-6, 1e6).astype(np.float32)
-        return g.reshape(-1, 1)
-
-    def _compose_display_data(self) -> np.ndarray | None:
-        if self._proc_data is None:
-            return None
-        proc = np.asarray(self._proc_data, dtype=np.float32)
-        if proc.ndim != 2 or proc.size <= 0:
-            return None
-
-        # The range-gain is applied inside the pipeline (pre_agc_gain step) only
-        # when the checkbox is currently checked AND the pipeline was actually run
-        # with that parameter. We detect this by checking both the current UI state
-        # AND the last pipeline params — they must agree to avoid double-application
-        # or missed application (e.g. when the checkbox is toggled after processing).
-        chk_rg_on = bool(getattr(self, "_chk_range_gain", None) and self._chk_range_gain.isChecked())
-        last_pre_agc = bool(getattr(self, "_last_pipeline_params", {}).get("pre_agc_gain", False))
-        pre_agc_in_proc = chk_rg_on and last_pre_agc
-        depth_gain = None
-        if not pre_agc_in_proc:
-            # Apply depth gain as display-only transform BEFORE normalize_display.
-            depth_gain = self._build_depth_range_gain(int(proc.shape[0]))
-        gain_key = None if depth_gain is None else np.asarray(depth_gain).tobytes()
-
-        # La normalizzazione (percentile su tutto il radargramma) non dipende dal
-        # gain scalare/manuale, applicati dopo: si riusa finche' non cambiano il
-        # dato processato (identita' dell'array) o il range-gain.
-        cache = self._display_base_cache
-        if cache is not None and cache[0] is self._proc_data and cache[1] == gain_key:
-            base = cache[2]
-        else:
-            proc_disp = proc
-            if depth_gain is not None:
-                proc_disp = (proc * depth_gain).astype(np.float32, copy=False)
-            base = normalize_display(proc_disp).astype(np.float32, copy=False)
-            self._display_base_cache = (self._proc_data, gain_key, base)
-
-        # Normalize to ±1 range first, then apply display gains on top.
-        # The scalar gain and manual_gain are applied AFTER normalization so that
-        # normalize_display does not cancel them.  Values that exceed ±1 after
-        # the gains are intentionally saturated by the final clip — this is the
-        # correct visual behaviour (deep samples clamp to full black/white).
-        #
-        # The burst zone is now attenuated by pre_agc_gain (TVG) before AGC,
-        # so the amplitude is already uniform across the full profile here.
-        # No special zeroing of the burst zone is needed.
-
-        # Scalar display gain (brightness knob).
-        gain = float(self._spin_gain.value()) if hasattr(self, "_spin_gain") else 1.0
-        disp = (base * gain).astype(np.float32, copy=False)
-
-        # Manual depth-varying gain — applied last so it is not undone by
-        # normalize_display.  The pipeline no longer runs manual_gain; the
-        # function is called directly here as a display-only transform.
-        chk_mg = getattr(self, "_chk_manual_gain", None)
-        if chk_mg is not None and bool(chk_mg.isChecked()):
-            try:
-                mg_type = str(
-                    self._cb_manual_gain_type.currentData() or "linear"
-                ) if getattr(self, "_cb_manual_gain_type", None) else "linear"
-                mg_start = float(
-                    self._spin_manual_gain_start.value()
-                ) if getattr(self, "_spin_manual_gain_start", None) else 1.0
-                mg_end = float(
-                    self._spin_manual_gain_end.value()
-                ) if getattr(self, "_spin_manual_gain_end", None) else 10.0
-                mg_s0 = int(
-                    self._spin_manual_gain_sample_start.value()
-                ) if getattr(self, "_spin_manual_gain_sample_start", None) else 0
-                mg_s1 = int(
-                    self._spin_manual_gain_sample_end.value()
-                ) if getattr(self, "_spin_manual_gain_sample_end", None) else 0
-                disp = manual_gain(
-                    disp,
-                    gain_type=mg_type,
-                    gain_start=mg_start,
-                    gain_end=mg_end,
-                    sample_start=mg_s0,
-                    sample_end=mg_s1,
-                ).astype(np.float32, copy=False)
-            except Exception:
-                pass
-
-        # `disp` e' sempre un array nuovo (mai `base`): clip in place.
-        return np.clip(disp, -1.0, 1.0, out=disp).astype(np.float32, copy=False)
-
-    def _apply_gain_only(self):
-        if self._proc_data is None:
-            self._apply_processing()
-            return
-        self._disp_data = self._compose_display_data()
-        if self._disp_data is None:
-            return
-        gain = float(self._spin_gain.value())
-        disp_arr = np.asarray(self._disp_data, dtype=np.float64)
-        finite = np.isfinite(disp_arr)
-        if finite.any():
-            disp_min = float(np.nanmin(disp_arr))
-            disp_max = float(np.nanmax(disp_arr))
-        else:
-            disp_min = float("nan")
-            disp_max = float("nan")
-        self._safe_set_text(
-            self._lbl_status,
-            f"proc: min={self._proc_data.min():.3f}  "
-            f"max={self._proc_data.max():.3f}  "
-            f"disp: min={disp_min:.3f} max={disp_max:.3f}  "
-            f"gain={gain:.1f}x  "
-            f"range_gain={'on' if self._chk_range_gain.isChecked() else 'off'}"
-        )
-        if not self._refresh_image_only():
-            self._redraw()
-
-    @staticmethod
-    def _clamp_axis_limits(
-        lim0: float, lim1: float, axis_min: float, axis_max: float, min_span_ratio: float = 1e-3
-    ) -> tuple[float, float]:
-        if not (np.isfinite(lim0) and np.isfinite(lim1)):
-            return axis_min, axis_max
-        span_total = max(axis_max - axis_min, 1e-12)
-        forward = lim1 >= lim0
-        lo = min(lim0, lim1)
-        hi = max(lim0, lim1)
-        min_span = span_total * min_span_ratio
-        if (hi - lo) < min_span:
-            c = 0.5 * (lo + hi)
-            lo = c - 0.5 * min_span
-            hi = c + 0.5 * min_span
-        if lo < axis_min:
-            shift = axis_min - lo
-            lo += shift
-            hi += shift
-        if hi > axis_max:
-            shift = hi - axis_max
-            lo -= shift
-            hi -= shift
-        lo = max(axis_min, lo)
-        hi = min(axis_max, hi)
-        return (lo, hi) if forward else (hi, lo)
-
-    def _reset_zoom(self):
-        self._view_xlim = None
-        self._view_ylim = None
-        # Explicit reset should restore full extent, not the initial short-window view.
-        self._profile_view_initialized = True
-        self._slice_view_xlim = None
-        self._slice_view_ylim = None
-        self._redraw()
-
-    def _axis_pixel_size(self) -> tuple[float, float]:
-        fig_w_px = fig_h_px = None
-        try:
-            if self._canvas_mpl is not None:
-                fig_w_px, fig_h_px = self._canvas_mpl.get_width_height()
-        except Exception:
-            fig_w_px = fig_h_px = None
-        if not (fig_w_px and fig_h_px):
-            fig_w_px = float(self._fig.get_figwidth() * 100.0)
-            fig_h_px = float(self._fig.get_figheight() * 100.0)
-        bbox = self._ax.get_position()
-        ax_w_px = max(1.0, float(fig_w_px) * float(bbox.width))
-        ax_h_px = max(1.0, float(fig_h_px) * float(bbox.height))
-        return float(ax_w_px), float(ax_h_px)
-
-    def _compute_initial_xview(
-        self,
-        dist_max: float,
-        depth_max: float,
-        aspect_factor: float,
-    ) -> tuple[float, float]:
-        if not (np.isfinite(dist_max) and np.isfinite(depth_max)):
-            return (0.0, 1.0)
-        if dist_max <= 0.0 or depth_max <= 0.0:
-            return (0.0, float(max(1.0, dist_max)))
-        ax_w_px, ax_h_px = self._axis_pixel_size()
-        if ax_h_px <= 1e-6:
-            return (0.0, float(dist_max))
-        af = float(np.clip(aspect_factor, 1e-6, 1e6))
-        ideal_dist_window = float((ax_w_px * depth_max) / (ax_h_px * af))
-        ideal_dist_window = float(np.clip(ideal_dist_window, 1.0, dist_max))
-        # Keep full extent for short profiles; constrain only when profile is much longer.
-        if dist_max <= (ideal_dist_window * 1.05):
-            return (0.0, float(dist_max))
-        return (0.0, float(ideal_dist_window))
-
-    def _full_x_limits(self) -> tuple[float, float]:
-        if self._disp_data is None or not self._profiles:
-            return 0.0, 1.0
-        prof = self._profiles[self._prof_idx]
-        dist_arr = self._display_distance_axis(prof, int(self._disp_data.shape[1]))
-        if dist_arr.size and np.isfinite(dist_arr).any():
-            x_full_min = float(np.nanmin(dist_arr))
-            x_full_max = float(np.nanmax(dist_arr))
-        else:
-            x_full_min = 0.0
-            x_full_max = float(max(1.0, prof.sampling_step_m * max(self._disp_data.shape[1] - 1, 1)))
-        if not (np.isfinite(x_full_min) and np.isfinite(x_full_max)) or x_full_max <= x_full_min:
-            x_full_min, x_full_max = 0.0, 1.0
-        return x_full_min, x_full_max
-
-    def _sync_xpan_slider(self):
-        if not hasattr(self, "_xpan_slider") or self._xpan_slider is None:
-            return
-        x_full_min, x_full_max = self._full_x_limits()
-        full_w = float(max(x_full_max - x_full_min, 1e-9))
-        x_view = self._view_xlim if self._view_xlim is not None else (x_full_min, x_full_max)
-        x_view = self._clamp_axis_limits(x_view[0], x_view[1], x_full_min, x_full_max)
-        view_w = float(max(abs(x_view[1] - x_view[0]), 1e-9))
-
-        can_pan = view_w < (full_w - 1e-6)
-        self._updating_xpan = True
-        try:
-            self._xpan_slider.setEnabled(can_pan)
-            if not can_pan:
-                self._xpan_slider.setValue(0)
-                if self._lbl_xpan is not None:
-                    self._safe_set_text(self._lbl_xpan, "Full")
-                return
-            movable = full_w - view_w
-            ratio = (float(min(x_view)) - x_full_min) / max(movable, 1e-9)
-            ratio = float(np.clip(ratio, 0.0, 1.0))
-            self._xpan_slider.setValue(int(round(ratio * 1000.0)))
-            if self._lbl_xpan is not None:
-                self._safe_set_text(self._lbl_xpan, f"{min(x_view):.1f}-{max(x_view):.1f} m")
-        finally:
-            self._updating_xpan = False
-
-    def _on_xpan_slider_changed(self, value: int):
-        if bool(getattr(self, "_updating_xpan", False)):
-            return
-        if self._disp_data is None or self._ax is None:
-            return
-        x_full_min, x_full_max = self._full_x_limits()
-        full_w = float(max(x_full_max - x_full_min, 1e-9))
-        x_view = self._view_xlim if self._view_xlim is not None else (x_full_min, x_full_max)
-        x_view = self._clamp_axis_limits(x_view[0], x_view[1], x_full_min, x_full_max)
-        view_w = float(max(abs(x_view[1] - x_view[0]), 1e-9))
-        movable = full_w - view_w
-        if movable <= 1e-9:
-            self._sync_xpan_slider()
-            return
-        ratio = float(np.clip(float(value) / 1000.0, 0.0, 1.0))
-        lo = x_full_min + ratio * movable
-        hi = lo + view_w
-        self._view_xlim = (lo, hi)
-        self._ax.set_xlim(*self._view_xlim)
-        if self._canvas_mpl is not None:
-            self._safe_draw_idle(self._canvas_mpl)
-        self._sync_xpan_slider()
-
-    def _export_radargram_image(self):
-        if not HAS_MPL or self._disp_data is None or not self._profiles:
-            QMessageBox.information(self, "Export Radargram", "Nessun radargramma da esportare.")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Radargram",
-            "radargram_export.png",
-            "PNG (*.png);;TIFF (*.tif *.tiff)",
-        )
-        if not path:
-            return
-        dpi, ok = QInputDialog.getInt(
-            self,
-            "Export Radargram",
-            "DPI:",
-            300,
-            72,
-            2400,
-            10,
-        )
-        if not ok:
-            return
-        prof = self._profiles[self._prof_idx]
-        arr = np.asarray(self._disp_data, dtype=np.float64)
-        if arr.ndim != 2 or arr.size <= 0:
-            QMessageBox.information(self, "Export Radargram", "Dati radargramma non validi.")
-            return
-        n_s, n_t = arr.shape
-        dist_arr = self._display_distance_axis(prof, n_t)
-        if dist_arr.size > 0 and np.isfinite(dist_arr).any():
-            dist_max = float(np.nanmax(dist_arr))
-        else:
-            dist_max = float(max(1.0, getattr(prof, "sampling_step_m", 0.1) * max(n_t - 1, 1)))
-        depth_max = self._depth_max_display(prof)
-        if not np.isfinite(depth_max) or depth_max <= 0:
-            depth_max = float(max(1, n_s))
-
-        finite = arr[np.isfinite(arr)]
-        if finite.size:
-            vmin = float(np.percentile(finite, 1.0))
-            vmax = float(np.percentile(finite, 99.0))
-            if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmax - vmin < 1e-6):
-                vmin = float(np.nanmin(finite))
-                vmax = float(np.nanmax(finite))
-            if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmax - vmin < 1e-6):
-                vmin, vmax = -1.0, 1.0
-        else:
-            vmin, vmax = -1.0, 1.0
-        cmap = self._cb_cmap.currentText()
-        interpolation_mode = str(self._cb_interp.currentData() or "bilinear")
-        real_aspect = bool(self._chk_real_aspect.isChecked())
-        vertical_exag = 1.0
-        if hasattr(self, "_spin_vertical_exag") and self._spin_vertical_exag is not None:
-            try:
-                vertical_exag = float(self._spin_vertical_exag.value())
-            except Exception:
-                vertical_exag = 1.0
-        vertical_exag = float(np.clip(vertical_exag, 0.5, 20.0))
-
-        fig = Figure(figsize=(12.0, 5.5), tight_layout=True)
-        ax = fig.add_subplot(111)
-        aspect_export = "auto"
-        if real_aspect and dist_max > 1e-9 and depth_max > 1e-9:
-            # VE=1.0 preserves metric scale; VE>1 increases vertical readability.
-            aspect_export = float(vertical_exag)
-        disp_export = self._resample_disp_to_uniform_grid(self._disp_data, dist_arr)
-        ax.imshow(
-            disp_export,
-            aspect=aspect_export,
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-            extent=[0, dist_max, depth_max, 0],
-            interpolation=interpolation_mode,
-            resample=True,
-        )
-        ax.set_xlim(0.0, dist_max)
-        ax.set_ylim(depth_max, 0.0)
-        ax.set_xlabel("Distanza (m)")
-        ax.set_ylabel("Profondita' (m)")
-        ax.set_title(
-            f"{os.path.basename(prof.path)}  |  Ch {self._ch_idx}  |  {float(getattr(prof, 'frequency_mhz', 0.0)):.0f} MHz"
-        )
-        self._draw_hyperbola_overlay_on_axis(ax, prof, dist_max, depth_max)
-
-        ext = os.path.splitext(path)[1].strip().lower()
-        if ext not in {".png", ".tif", ".tiff"}:
-            path = f"{path}.png"
-        try:
-            fig.savefig(path, dpi=int(dpi), bbox_inches="tight", facecolor="white")
-            self._safe_set_text(self._lbl_status, f"Radargram export: {path}  dpi={int(dpi)}")
-        except Exception as exc:
-            QMessageBox.critical(self, "Export Radargram", f"Errore export:\n{exc}")
-
-    # ------------------------------------------------------------------
-    # Disegno
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _resample_disp_to_uniform_grid(
-        disp: np.ndarray,
-        dist_arr: np.ndarray,
-    ) -> np.ndarray:
-        """Resample disp (n_samples, n_traces) onto a uniform distance grid.
-
-        Each column of *disp* corresponds to a trace at the cumulative distance
-        dist_arr[i].  Because surveys are driven at variable speed the trace
-        spacing is usually non-uniform.  imshow maps every column to an equal-
-        width pixel, so non-uniform spacing produces a geometrically distorted
-        radargram.  This function corrects that by interpolating each sample row
-        onto a regular grid before rendering.
-        """
-        n_s, n_t = disp.shape
-        if n_t < 2 or dist_arr.size < 2:
-            return disp
-        d = np.asarray(dist_arr, dtype=np.float64)
-        if d.size != n_t:
-            return disp
-        d_min = float(d[0])
-        d_max = float(d[-1])
-        if not (np.isfinite(d_min) and np.isfinite(d_max)) or d_max <= d_min:
-            return disp
-        # Check whether the grid is already sufficiently uniform (saves CPU).
-        steps = np.diff(d)
-        step_mean = float(np.mean(steps))
-        if step_mean > 0.0 and float(np.std(steps)) / step_mean < 0.01:
-            return disp  # < 1 % variation — no resampling needed
-        uniform = np.linspace(d_min, d_max, n_t, dtype=np.float64)
-        out = np.empty((n_s, n_t), dtype=np.float32)
-        for i in range(n_s):
-            out[i] = np.interp(uniform, d, disp[i]).astype(np.float32)
-        return out
-
-    def _image_geometry(self, prof) -> tuple[np.ndarray, float, float]:
-        """(asse distanze, dist_max, depth_max) dell'immagine del radargramma."""
-        dist_arr = self._display_distance_axis(prof, int(self._disp_data.shape[1]))
-        if dist_arr.size and np.isfinite(dist_arr).any():
-            dist_max = float(np.nanmax(dist_arr))
-        else:
-            dist_max = float(max(1.0, prof.sampling_step_m * max(self._disp_data.shape[1] - 1, 1)))
-        if not np.isfinite(dist_max) or dist_max <= 0:
-            dist_max = float(max(1.0, prof.sampling_step_m * max(self._disp_data.shape[1] - 1, 1)))
-
-        n_out     = self._disp_data.shape[0]
-        n_orig    = prof.n_samples
-        depth_base = float(prof.depth_max_m) if np.isfinite(prof.depth_max_m) else 0.0
-        depth_max = depth_base * (n_out / n_orig) if n_orig > 0 else depth_base
-        if not np.isfinite(depth_max) or depth_max <= 0:
-            depth_max = max(1.0, float(n_out))
-        return dist_arr, dist_max, depth_max
-
-    def _image_key(self, dist_max: float, depth_max: float) -> tuple:
-        """Cio' che, se invariato, permette di aggiornare solo i pixel dell'immagine."""
-        interp = "bilinear"
-        if getattr(self, "_cb_interp", None) is not None:
-            interp = str(self._cb_interp.currentData() or "bilinear")
-        return (
-            tuple(self._disp_data.shape),
-            round(float(dist_max), 9),
-            round(float(depth_max), 9),
-            self._cb_cmap.currentText(),
-            interp,
-        )
-
-    def _refresh_image_only(self) -> bool:
-        """Aggiorna i soli pixel (es. dopo un cambio di gain) senza ricostruire gli assi.
-
-        Restituisce False se la geometria/colormap sono cambiate e serve un
-        `_redraw()` completo.
-        """
-        im = getattr(self, "_im", None)
-        key = getattr(self, "_im_key", None)
-        if (
-            im is None or key is None or not HAS_MPL
-            or self._disp_data is None or not self._profiles
-            or getattr(im, "axes", None) is not self._ax
-        ):
-            return False
-        prof = self._profiles[self._prof_idx]
-        dist_arr, dist_max, depth_max = self._image_geometry(prof)
-        if self._image_key(dist_max, depth_max) != key:
-            return False
-        im.set_data(self._resample_disp_to_uniform_grid(self._disp_data, dist_arr))
-        self._safe_draw_idle(self._canvas_mpl)
-        return True
-
-    def _redraw(self):
-        if not HAS_MPL or self._disp_data is None:
-            return
-        prof = self._profiles[self._prof_idx]
-        ch   = prof.channel(self._ch_idx)
-        cmap = self._cb_cmap.currentText()
-        dist_arr, dist_max, depth_max = self._image_geometry(prof)
-
-        # Resample to uniform distance grid so imshow is not geometrically distorted
-        # by variable survey speed (non-uniform trace spacing).
-        disp_uniform = self._resample_disp_to_uniform_grid(self._disp_data, dist_arr)
-
-        self._ax.clear()
-        # Keep fixed display limits so gain controls affect what the user sees.
-        vmin, vmax = -1.0, 1.0
-        real_aspect = bool(
-            getattr(self, "_chk_real_aspect", None)
-            and self._chk_real_aspect.isChecked()
-        )
-        interpolation_mode = "bilinear"
-        if hasattr(self, "_cb_interp") and self._cb_interp is not None:
-            interpolation_mode = str(self._cb_interp.currentData() or "bilinear")
-        ve = 1.0
-        if hasattr(self, "_spin_vertical_exag") and self._spin_vertical_exag is not None:
-            try:
-                ve = float(self._spin_vertical_exag.value())
-            except Exception:
-                ve = 1.0
-        ve = float(np.clip(ve, 0.5, 20.0))
-        self._im = self._ax.imshow(
-            disp_uniform,
-            # Mantieni il riempimento del pannello; la scala reale e' gestita sotto con set_aspect+datalim.
-            aspect="auto",
-            cmap=cmap,
-            vmin=vmin, vmax=vmax,
-            extent=[0, dist_max, depth_max, 0],
-            interpolation=interpolation_mode,
-            # Interpolare i dati prima della colormap: stesso risultato visivo
-            # ma ~2.7x piu' veloce a ogni draw (zoom, pan, gain).
-            interpolation_stage="data",
-            resample=True,
-        )
-        self._im_key = self._image_key(dist_max, depth_max)
-        x_full = (0.0, dist_max)
-        y_full = (depth_max, 0.0)
-        if self._view_xlim is None:
-            if not bool(getattr(self, "_profile_view_initialized", True)):
-                init_af = ve if real_aspect else 1.0
-                self._view_xlim = self._compute_initial_xview(dist_max, depth_max, init_af)
-            else:
-                self._view_xlim = x_full
-        x_view = self._view_xlim
-        y_view = self._view_ylim if self._view_ylim is not None else y_full
-        x_view = self._clamp_axis_limits(x_view[0], x_view[1], x_full[0], x_full[1])
-        y_view = self._clamp_axis_limits(y_view[0], y_view[1], 0.0, depth_max)
-        self._view_xlim = x_view
-        self._view_ylim = y_view
-        self._ax.set_xlim(*x_view)
-        self._ax.set_ylim(*y_view)
-        if real_aspect and dist_max > 1e-9 and depth_max > 1e-9:
-            # VE=1.0 keeps metric proportions, VE>1.0 increases vertical emphasis.
-            self._ax.set_aspect(float(np.clip(ve, 0.5, 20.0)), adjustable="box")
-        else:
-            # In auto mode avoid excessive horizontal stretch on short profiles.
-            ax_w_px, ax_h_px = self._axis_pixel_size()
-            x_range = max(1e-9, float(abs(x_view[1] - x_view[0])))
-            y_range = max(1e-9, float(abs(y_view[0] - y_view[1])))
-            px_per_m_x = ax_w_px / x_range
-            px_per_m_y = ax_h_px / y_range
-            max_ratio = 4.0
-            if px_per_m_x > (px_per_m_y * max_ratio):
-                ratio = float((y_range / x_range) / max_ratio)
-                self._ax.set_aspect(float(np.clip(ratio, 1e-4, 1e4)), adjustable="box")
-            else:
-                self._ax.set_aspect("auto", adjustable="box")
-        self._ax.set_xlabel("Distanza (m)")
-        self._ax.set_ylabel("Profondit\u00e0 (m)")
-        self._ax.set_title(
-            f"{os.path.basename(prof.path)}  |  "
-            f"Ch {self._ch_idx}  |  "
-            f"{prof.frequency_mhz:.0f} MHz"
-        )
-        self._draw_hyperbola_overlay(prof, dist_max, depth_max)
-        self._vline = self._ax.axvline(x=0, color="yellow", lw=1, visible=False)
-        self._hline = self._ax.axhline(y=0, color="cyan",   lw=1, linestyle="--", visible=False)
-        self._apply_wiggle_visibility_layout()
-        self._sync_xpan_slider()
-        self._update_wiggle_plot(draw=False, force=True)
-        self._refresh_blit_artists()
-        self._profile_view_initialized = True
-        self._safe_draw_idle(self._canvas_mpl)
-        self._redraw_slice_view()
-
-    def _depth_max_display(self, prof) -> float:
-        if self._disp_data is not None:
-            n_out = int(self._disp_data.shape[0])
-        elif self._proc_data is not None:
-            n_out = int(self._proc_data.shape[0])
-        elif self._raw_data is not None:
-            n_out = int(self._raw_data.shape[0])
-        else:
-            n_out = int(getattr(prof, "n_samples", 0) or 0)
-        n_orig = int(getattr(prof, "n_samples", 0) or 0)
-        depth_base = float(getattr(prof, "depth_max_m", 0.0) or 0.0)
-        depth_max = depth_base * (n_out / n_orig) if n_orig > 0 else depth_base
-        if not np.isfinite(depth_max) or depth_max <= 0:
-            depth_max = max(1.0, float(n_out))
-        return float(depth_max)
-
-    @staticmethod
-    def _nearest_index(sorted_values: np.ndarray, x: float) -> int:
-        """Indice del valore piu' vicino a x in un vettore ordinato crescente."""
-        n = int(sorted_values.size)
-        if n <= 1:
-            return 0
-        i = int(np.searchsorted(sorted_values, x))
-        if i <= 0:
-            return 0
-        if i >= n:
-            return n - 1
-        # searchsorted da' il vicino a destra: scegli il piu' vicino dei due.
-        return i if (sorted_values[i] - x) < (x - sorted_values[i - 1]) else i - 1
-
-    def _cursor_metrics(self):
-        if (
-            not self._profiles
-            or self._disp_data is None
-            or self._cursor_x is None
-            or self._cursor_z is None
-        ):
-            return None
-        try:
-            prof = self._profiles[self._prof_idx]
-            ch = prof.channel(self._ch_idx)
-        except Exception:
-            return None
-
-        n_tr = int(self._disp_data.shape[1])
-        distances = self._channel_trace_vector(getattr(ch, "distances", []), n_tr)
-        if distances.size != n_tr:
-            step = float(getattr(prof, "sampling_step_m", 0.1) or 0.1)
-            distances = (np.arange(n_tr, dtype=np.float64) * max(step, 1e-6)).astype(np.float64)
-        if distances.size <= 0:
-            return None
-
-        # Normalize distances to start at 0, matching the display axis extent
-        # built by _display_distance_axis (which subtracts d0).
-        if distances.size > 0 and np.isfinite(distances[0]):
-            distances = distances - distances[0]
-        finite_d = np.isfinite(distances)
-        if not finite_d.any():
-            return None
-        if not finite_d.all():
-            idx_arr = np.arange(distances.size, dtype=np.float64)
-            ok = np.where(finite_d)[0].astype(np.float64)
-            distances = np.interp(idx_arr, ok, distances[finite_d]).astype(np.float64)
-        if distances.size > 1:
-            distances = np.maximum.accumulate(distances)
-
-        depth_max = self._depth_max_display(prof)
-        idx_t = self._nearest_index(distances, float(self._cursor_x))
-        idx_s = self._depth_to_sample_index(float(self._cursor_z), depth_max)
-        if idx_s is None:
-            return None
-
-        amp = None
-        try:
-            a = float(self._disp_data[idx_s, idx_t])
-            amp = a if np.isfinite(a) else None
-        except Exception:
-            amp = None
-
-        east = north = None
-        try:
-            e_vec = self._channel_trace_vector(getattr(ch, "easting", []), n_tr)
-            n_vec = self._channel_trace_vector(getattr(ch, "northing", []), n_tr)
-            if idx_t < e_vec.size:
-                east = float(e_vec[idx_t])
-            if idx_t < n_vec.size:
-                north = float(n_vec[idx_t])
-            if east is not None and not np.isfinite(east):
-                east = None
-            if north is not None and not np.isfinite(north):
-                north = None
-        except Exception:
-            east = north = None
-
-        return {
-            "idx_trace": int(idx_t),
-            "idx_sample": int(idx_s),
-            "distance_m": float(distances[idx_t]),
-            "depth_m": float(self._cursor_z),
-            "time_ns": float(idx_s * float(getattr(prof, "dt_ns", 0.0) or 0.0)),
-            "amplitude": amp,
-            "east": east,
-            "north": north,
-            "depth_max_m": depth_max,
-        }
-
-    def _wiggle_reset_artists(self) -> None:
-        """Dimentica gli artisti dell'A-scan (asse svuotato o dati assenti)."""
-        self._wiggle_trace_idx = None
-        self._wiggle_depth_line = None
-        self._wiggle_raw_line = None
-        self._wiggle_fil_line = None
-        self._refresh_blit_artists()
-
-    def _wiggle_show_empty(self, draw: bool) -> None:
-        axw = self._ax_wiggle
-        axw.clear()
-        axw.set_xticks([])
-        axw.set_yticks([])
-        self._wiggle_reset_artists()
-        if draw:
-            self._safe_draw_idle(self._canvas_mpl)
-
-    @staticmethod
-    def _wiggle_scale(trace: np.ndarray) -> float:
-        """Ampiezza di normalizzazione (99-esimo percentile) di una traccia."""
-        finite = np.isfinite(trace)
-        if not finite.any():
-            return 1.0
-        vals = np.abs(trace[finite])
-        try:
-            scale = float(np.percentile(vals, 99.0))
-        except Exception:
-            scale = float(vals.max())
-        return scale if (np.isfinite(scale) and scale > 1e-9) else 1.0
-
-    def _update_wiggle_plot(self, draw: bool = True, force: bool = False):
-        if not HAS_MPL or not hasattr(self, "_ax_wiggle"):
-            return
-        axw = self._ax_wiggle
-        if not bool(getattr(self, "_show_wiggle", True)):
-            try:
-                axw.set_visible(False)
-            except Exception:
-                pass
-            return
-        else:
-            try:
-                axw.set_visible(True)
-            except Exception:
-                pass
-        if self._disp_data is None or not self._profiles:
-            self._wiggle_show_empty(draw)
-            return
-
-        metrics = self._cursor_metrics()
-        if metrics is None:
-            idx_t = int(np.clip(self._disp_data.shape[1] // 2, 0, max(0, self._disp_data.shape[1] - 1)))
-            idx_s = 0
-            depth_max = self._depth_max_display(self._profiles[self._prof_idx])
-        else:
-            idx_t = int(metrics["idx_trace"])
-            idx_s = int(metrics["idx_sample"])
-            depth_max = float(metrics["depth_max_m"])
-
-        filt_src = self._proc_data if self._proc_data is not None else self._disp_data
-        raw_src = self._raw_data if self._raw_data is not None else filt_src
-        if filt_src is None or raw_src is None:
-            self._wiggle_show_empty(draw)
-            return
-
-        idx_t_f = int(np.clip(idx_t, 0, max(0, int(filt_src.shape[1]) - 1)))
-        idx_t_r = int(np.clip(idx_t, 0, max(0, int(raw_src.shape[1]) - 1)))
-        trace_f = np.asarray(filt_src[:, idx_t_f], dtype=np.float64)
-        trace_r = np.asarray(raw_src[:, idx_t_r], dtype=np.float64)
-        if trace_f.size <= 0 or trace_r.size <= 0:
-            self._wiggle_show_empty(draw)
-            return
-
-        # Align raw to filtered length without distorting waveform:
-        # if processing shortens the trace (e.g. time-zero), drop the leading
-        # raw samples instead of interpolating the whole raw trace.
-        n = int(trace_f.size)
-        n_raw = int(trace_r.size)
-        if n_raw >= n:
-            off = max(0, n_raw - n)
-            trace_r_plot = trace_r[off:off + n]
-        else:
-            trace_r_plot = np.full((n,), np.nan, dtype=np.float64)
-            trace_r_plot[:n_raw] = trace_r
-        trace_f_plot = trace_f[:n]
-        depth_axis = np.linspace(0.0, float(depth_max), n, dtype=np.float64)
-        y_line = float(depth_axis[idx_s]) if 0 <= idx_s < depth_axis.size else None
-
-        have_lines = (
-            self._wiggle_raw_line is not None
-            and self._wiggle_fil_line is not None
-            and self._wiggle_depth_line is not None
-        )
-        # Stessa traccia: si sposta solo la linea di profondita'.
-        if (
-            (not force)
-            and have_lines
-            and self._wiggle_trace_idx is not None
-            and int(self._wiggle_trace_idx) == int(idx_t)
-        ):
-            if y_line is not None:
-                self._wiggle_depth_line.set_ydata([y_line, y_line])
-            if draw:
-                self._blit_update()
-            return
-
-        # Separate normalization keeps RAW visible/stable across filter toggles.
-        fil_norm = np.nan_to_num(
-            trace_f_plot / self._wiggle_scale(trace_f_plot), nan=0.0, posinf=0.0, neginf=0.0
-        )
-        raw_norm = np.nan_to_num(
-            trace_r_plot / self._wiggle_scale(trace_r_plot), nan=0.0, posinf=0.0, neginf=0.0
-        )
-        xlim = float(np.max(np.abs(np.r_[raw_norm, fil_norm]))) if raw_norm.size > 0 else 1.0
-        if (not np.isfinite(xlim)) or xlim <= 0.1:
-            xlim = 1.0
-        xlim = float(np.clip(xlim * 1.05, 0.5, 5.0))
-
-        if force or not have_lines:
-            # Parte statica (sfondo, zero, spine) + artisti che poi si aggiornano
-            # con set_data: il "clear()" completo a ogni traccia costava molto.
-            axw.clear()
-            axw.set_facecolor("#1a1a1a")
-            axw.axvline(0.0, color="#555555", lw=0.5)
-            axw.set_xticks([])
-            axw.set_yticks([])
-            axw.set_xlabel("")
-            axw.set_ylabel("")
-            axw.grid(False)
-            for spine in axw.spines.values():
-                spine.set_edgecolor("#333333")
-                spine.set_linewidth(0.5)
-            (self._wiggle_raw_line,) = axw.plot(
-                raw_norm, depth_axis, color="#dc5050", lw=0.9, alpha=0.45, antialiased=True
-            )
-            (self._wiggle_fil_line,) = axw.plot(
-                fil_norm, depth_axis, color="#50dc78", lw=0.9, alpha=0.95, antialiased=True
-            )
-            self._wiggle_depth_line = axw.axhline(
-                y_line if y_line is not None else 0.0,
-                color="goldenrod", lw=0.8, ls="--", visible=y_line is not None,
-            )
-            # L'asse Y e' condiviso col radargramma: lo si legge, non lo si
-            # impone (altrimenti azzererebbe lo zoom in profondita').
-            y0, y1 = self._ax.get_ylim()
-            axw.set_ylim(y0, y1)
-            self._refresh_blit_artists()
-        else:
-            self._wiggle_raw_line.set_data(raw_norm, depth_axis)
-            self._wiggle_fil_line.set_data(fil_norm, depth_axis)
-            if y_line is not None:
-                self._wiggle_depth_line.set_ydata([y_line, y_line])
-                self._wiggle_depth_line.set_visible(True)
-            else:
-                self._wiggle_depth_line.set_visible(False)
-        axw.set_xlim(-xlim, xlim)
-        axw.set_title(f"A-scan T{idx_t}", fontsize=7, pad=2)
-        self._wiggle_trace_idx = int(idx_t)
-        if draw:
-            self._blit_update()
-
-    # ------------------------------------------------------------------
-    # Cursore
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Pick-mode: click sul profilo → imposta un campo sample
-    # ------------------------------------------------------------------
-
-    def _set_pick_mode(self, target: str | None, source_btn=None):
-        """Attiva/disattiva la modalità pick-from-profile.
-
-        target: nome logico del campo da popolare ('agc_sample_start', ...).
-                None = disattiva.
-        source_btn: il QPushButton che ha scatenato l'azione (per sincronizzare
-                    lo stato checked se la disattivazione arriva dall'esterno).
-        """
-        self._pick_mode_target = target
-        # Deseleziona tutti i bottoni pick tranne quello sorgente
-        for btn_name in ("_btn_pick_agc_s0",):
-            btn = getattr(self, btn_name, None)
-            if btn is not None and self._is_qt_alive(btn) and btn is not source_btn:
-                btn.blockSignals(True)
-                btn.setChecked(False)
-                btn.blockSignals(False)
-        # Cambia il cursore del canvas per dare feedback visivo
-        if HAS_MPL and getattr(self, "_canvas_mpl", None) and self._is_qt_alive(self._canvas_mpl):
-            if target is not None:
-                self._canvas_mpl.setCursor(Qt.CrossCursor)
-            else:
-                self._canvas_mpl.unsetCursor()
-
-    def _depth_to_sample_index(self, depth_m: float, depth_max: float | None = None) -> int | None:
-        """Profondita' del canvas (m) -> indice sample nel dato mostrato.
-
-        Unica conversione usata da cursore e pick: usa l'asse di profondita'
-        *visualizzato* (che si accorcia dopo il time-zero), non quello del
-        profilo originale.
-        """
-        if self._disp_data is None or not self._profiles:
-            return None
-        n_s = int(self._disp_data.shape[0])
-        if n_s <= 0:
-            return None
-        if depth_max is None:
-            depth_max = self._depth_max_display(self._profiles[self._prof_idx])
-        try:
-            frac = float(depth_m) / max(float(depth_max), 1e-9)
-        except (TypeError, ValueError):
-            return None
-        if not np.isfinite(frac):
-            return None
-        return int(np.clip(int(np.rint(frac * (n_s - 1))), 0, n_s - 1))
-
-    def _sample_from_ydata(self, ydata: float) -> int | None:
-        """Converte la coordinata Y del canvas (profondita') in indice sample."""
-        return self._depth_to_sample_index(ydata)
-
-    def _on_mouse_move(self, event):
-        if event.inaxes != self._ax or self._disp_data is None:
-            return
-        self._cursor_x = event.xdata
-        self._cursor_z = event.ydata
-        self._update_cursor_lines(draw=False)
-        self._update_wiggle_plot(draw=False)
-        self._update_status()
-        self._blit_update()
-        self._canvas_timer.start()
-
-    def _on_mouse_press(self, event):
-        if event.inaxes == self._ax and event.button == 1:
-            self._cursor_x = event.xdata
-            self._cursor_z = event.ydata
-
-            # Pick-mode: popola il campo target e disattiva la modalità
-            if self._pick_mode_target is not None and event.ydata is not None:
-                sample_idx = self._sample_from_ydata(float(event.ydata))
-                if sample_idx is not None:
-                    if self._pick_mode_target == "agc_sample_start":
-                        if getattr(self, "_spin_agc_sample_start", None) and self._is_qt_alive(self._spin_agc_sample_start):
-                            self._spin_agc_sample_start.setValue(sample_idx)
-                    # Disattiva pick-mode dopo la selezione
-                    self._set_pick_mode(None, None)
-                return
-
-            self._update_wiggle_plot(draw=False)
-            self._blit_update()
-            if bool(getattr(event, "dblclick", False)) and bool(self._chk_hyperbola.isChecked()):
-                self._set_hyperbola_apex_from_cursor()
-            self._update_dial()
-            self._emit_cursor_moved()
-
-    def _on_scroll_zoom(self, event):
-        if event.inaxes != self._ax or self._im is None:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-
-        step = float(getattr(event, "step", 0.0) or 0.0)
-        btn = str(getattr(event, "button", "") or "").lower()
-        if step > 0 or btn == "up":
-            scale = 1.0 / 1.2
-        elif step < 0 or btn == "down":
-            scale = 1.2
-        else:
-            return
-
-        x0, x1 = self._ax.get_xlim()
-        y0, y1 = self._ax.get_ylim()
-        x = float(event.xdata)
-        y = float(event.ydata)
-
-        nx0 = x - (x - x0) * scale
-        nx1 = x + (x1 - x) * scale
-        ny0 = y - (y - y0) * scale
-        ny1 = y + (y1 - y) * scale
-
-        ex0, ex1, ey0, ey1 = self._im.get_extent()
-        x_min, x_max = float(min(ex0, ex1)), float(max(ex0, ex1))
-        y_min, y_max = float(min(ey0, ey1)), float(max(ey0, ey1))
-
-        self._view_xlim = self._clamp_axis_limits(nx0, nx1, x_min, x_max)
-        self._view_ylim = self._clamp_axis_limits(ny0, ny1, y_min, y_max)
-
-        self._ax.set_xlim(*self._view_xlim)
-        self._ax.set_ylim(*self._view_ylim)
-        self._sync_xpan_slider()
-        self._safe_draw_idle(self._canvas_mpl)
-
-    def _on_axes_leave(self, event):
-        if self._vline: self._vline.set_visible(False)
-        if self._hline: self._hline.set_visible(False)
-        self._blit_update()
-
-    def _update_cursor_lines(self, draw: bool = True):
-        if self._vline and self._cursor_x is not None:
-            self._vline.set_xdata([self._cursor_x])
-            self._vline.set_visible(True)
-        if self._hline and self._cursor_z is not None:
-            self._hline.set_ydata([self._cursor_z])
-            self._hline.set_visible(True)
-        if draw:
-            self._blit_update()
-
-    def _update_status(self):
-        if not self._profiles:
-            return
-        m = self._cursor_metrics()
-        if not m:
-            z_str = f"{self._cursor_z:.3f} m" if self._cursor_z is not None else "\u2014"
-            x_str = f"{self._cursor_x:.2f} m" if self._cursor_x is not None else "\u2014"
-            self._safe_set_text(
-                self._lbl_status,
-                f"Dist: {x_str}  |  Profondita': {z_str}"
-            )
-            return
-        amp = m.get("amplitude")
-        amp_str = f"{float(amp):.6g}" if amp is not None else "n/a"
-        east = m.get("east")
-        north = m.get("north")
-        east_str = f"{float(east):.2f}" if east is not None else "n/a"
-        north_str = f"{float(north):.2f}" if north is not None else "n/a"
-        self._safe_set_text(
-            self._lbl_status,
-            f"Trace={int(m['idx_trace'])}  Sample={int(m['idx_sample'])}  "
-            f"Amp={amp_str}  Time={float(m['time_ns']):.3f} ns  "
-            f"Depth={float(m['depth_m']):.3f} m  Dist={float(m['distance_m']):.3f} m  "
-            f"E {east_str}  N {north_str}"
-        )
-
-    def _cursor_world_position(self):
-        m = self._cursor_metrics()
-        if not m:
-            return None, None, None
-        east = m.get("east")
-        north = m.get("north")
-        depth = float(m.get("depth_m", np.nan))
-        if east is None or north is None:
-            return None, None, None
-        if not (np.isfinite(float(east)) and np.isfinite(float(north)) and np.isfinite(depth)):
-            return None, None, None
-        return float(east), float(north), float(depth)
-
-    def _emit_cursor_moved(self):
-        east, north, depth = self._cursor_world_position()
-        if east is None or north is None or depth is None:
-            return
-        try:
-            self.cursor_moved.emit(float(east), float(north), float(depth))
-        except Exception:
-            pass
-        if not self._suppress_3d_depth_sync and self._gpr_3d_viewer is not None:
-            try:
-                self._gpr_3d_viewer.set_depth_from_external(float(depth))
-            except Exception:
-                pass
-
-    def _on_3d_depth_changed(self, depth: float):
-        if not np.isfinite(depth):
-            return
-        if self._profiles:
-            try:
-                prof = self._profiles[self._prof_idx]
-                n_out = int(self._disp_data.shape[0]) if self._disp_data is not None else int(prof.n_samples)
-                n_orig = int(prof.n_samples) if int(prof.n_samples) > 0 else max(1, n_out)
-                depth_base = float(prof.depth_max_m) if np.isfinite(prof.depth_max_m) else 0.0
-                depth_max = depth_base * (n_out / n_orig) if n_orig > 0 else depth_base
-                if not np.isfinite(depth_max) or depth_max <= 0:
-                    depth_max = max(1.0, float(n_out))
-                depth = float(np.clip(float(depth), 0.0, depth_max))
-            except Exception:
-                depth = float(depth)
-        else:
-            depth = float(depth)
-
-        self._suppress_3d_depth_sync = True
-        try:
-            self._cursor_z = depth
-            self._update_cursor_lines(draw=False)
-            self._update_wiggle_plot(draw=False)
-            self._blit_update()
-            self._update_status()
-            self._update_dial()
-            self._emit_cursor_moved()
-            self._canvas_timer.start()
-        finally:
-            self._suppress_3d_depth_sync = False
-
-    # ------------------------------------------------------------------
-    # Bridge QGIS
-    # ------------------------------------------------------------------
-
-    def _flush_canvas_update(self):
-        if not self._is_qt_alive(self):
-            return
-        try:
-            self._update_rubber_band()
-            self._update_dial()
-            self._update_timeslice_visibility_in_canvas()
-            self._update_timeslice_crosshair()
-            self._emit_cursor_moved()
-            if bool(getattr(self, "_preview_mode_active", False)):
-                self._request_preview_update(immediate=False)
-            if self._is_qt_alive(getattr(self, "_canvas_slice", None)):
-                self._redraw_slice_view()
-        except RuntimeError:
-            pass
-
-    def _to_canvas_point(self, prof, east: float, north: float) -> QgsPointXY:
-        pt = QgsPointXY(float(east), float(north))
-        if self.iface is None:
-            return pt
-        canvas = self.iface.mapCanvas()
-        if canvas is None:
-            return pt
-        try:
-            epsg = int(getattr(prof, "epsg", 0) or 0)
-        except Exception:
-            epsg = 0
-        if epsg <= 0:
-            # Fallback: prova CRS progetto QGIS quando l'EPSG profilo manca.
-            try:
-                src = QgsProject.instance().crs()
-                dst = canvas.mapSettings().destinationCrs()
-                if src.isValid() and dst.isValid() and src != dst:
-                    tr = QgsCoordinateTransform(src, dst, QgsProject.instance())
-                    return tr.transform(pt)
-            except Exception:
-                pass
-            return pt
-        try:
-            src = QgsCoordinateReferenceSystem.fromEpsgId(epsg)
-            dst = canvas.mapSettings().destinationCrs()
-            if not src.isValid() or not dst.isValid() or src == dst:
-                return pt
-            tr = QgsCoordinateTransform(src, dst, QgsProject.instance())
-            return tr.transform(pt)
-        except Exception:
-            return pt
-
-    def _update_rubber_band(self):
-        if self._cursor_x is None or not self._profiles or self.iface is None:
-            return
-        m = self._cursor_metrics()
-        if not m:
-            return
-        east = m.get("east")
-        north = m.get("north")
-        if east is None or north is None:
-            return
-        prof = self._profiles[self._prof_idx]
-        canvas = self.iface.mapCanvas()
-        if self._rb_point is None:
-            self._rb_point = QgsRubberBand(canvas, QgsWkbTypes.PointGeometry)
-            self._rb_point.setColor(QColor(255, 220, 0))
-        self._rb_point.setIconSize(12)
-        self._rb_point.setWidth(3)
-        self._rb_point.setVisible(True)
-        self._rb_point.reset(QgsWkbTypes.PointGeometry)
-        pt_canvas = self._to_canvas_point(prof, float(east), float(north))
-        self._rb_point.addPoint(
-            pt_canvas, True
-        )
-
-    def _draw_profile_line_on_canvas(self):
-        if not self._profiles or self.iface is None:
-            return
-        prof   = self._profiles[self._prof_idx]
-        ch     = prof.channel(self._ch_idx)
-        canvas = self.iface.mapCanvas()
-        if self._rb_line is None:
-            self._rb_line = QgsRubberBand(canvas, QgsWkbTypes.LineGeometry)
-            self._rb_line.setColor(QColor(255, 165, 0))
-            self._rb_line.setWidth(2)
-            self._rb_line.setVisible(True)
-        else:
-            self._rb_line.reset(QgsWkbTypes.LineGeometry)
-        if self._disp_data is not None and np.asarray(self._disp_data).ndim == 2:
-            n_t = int(self._disp_data.shape[1])
-        else:
-            try:
-                n_t = int(np.asarray(ch.data).shape[1])
-            except Exception:
-                n_t = 0
-        e_vec = self._channel_trace_vector(getattr(ch, "easting", []), n_t)
-        n_vec = self._channel_trace_vector(getattr(ch, "northing", []), n_t)
-        finite = np.isfinite(e_vec) & np.isfinite(n_vec)
-        if int(np.count_nonzero(finite)) < 2:
-            return
-        e_use = e_vec[finite]
-        n_use = n_vec[finite]
-        for i in range(len(e_use)):
-            pt_canvas = self._to_canvas_point(prof, e_use[i], n_use[i])
-            self._rb_line.addPoint(
-                pt_canvas,
-                i == len(e_use) - 1
-            )
-
-    def _clear_timeslice_crosshair(self):
-        for rb in (self._rb_crosshair_h, self._rb_crosshair_v):
-            if rb is not None:
-                try:
-                    rb.setVisible(False)
-                except Exception:
-                    pass
-                try:
-                    rb.reset(QgsWkbTypes.LineGeometry)
-                except Exception:
-                    pass
-
-    def _get_cached_catalog(self, project_root: str):
-        if not project_root:
-            return None
-        cat_path = os.path.join(project_root, "metadata", "project_catalog.json")
-        try:
-            mtime = float(os.path.getmtime(cat_path))
-        except Exception:
-            mtime = None
-        needs_reload = (
-            self._cached_catalog is None
-            or self._cached_catalog_pr != project_root
-            or self._cached_catalog_mtime != mtime
-        )
-        if needs_reload:
-            from .project_catalog import load_catalog
-
-            self._cached_catalog = load_catalog(project_root)
-            self._cached_catalog_pr = project_root
-            self._cached_catalog_mtime = mtime
-        return self._cached_catalog
-
-    def _active_group_timeslices_context(self):
-        if self.plugin is None:
-            return None, None
-        settings = getattr(self.plugin, "settings", None)
-        settings_key = getattr(self.plugin, "settings_key_active_project", None)
-        if settings is None or not settings_key:
-            return None, None
-        try:
-            pr = (settings.value(settings_key, "", type=str) or "").strip()
-        except Exception:
-            pr = ""
-        if not pr:
-            return None, None
-        catalog = self._get_cached_catalog(pr)
-        if not isinstance(catalog, dict):
-            return None, None
-
-        groups = [g for g in catalog.get("raster_groups", []) if isinstance(g, dict)]
-        if not groups:
-            return None, None
-
-        active_group = None
-        active_group_id = str(getattr(self.plugin, "_active_group_id", "") or "").strip()
-        if active_group_id:
-            active_group = next((g for g in groups if str(g.get("id") or "").strip() == active_group_id), None)
-
-        if active_group is None:
-            dlg = getattr(self.plugin, "dlg", None)
-            glw = getattr(dlg, "groupListWidget", None)
-            current_item = None
-            try:
-                current_item = glw.currentItem() if glw is not None else None
-                if current_item is None and glw is not None:
-                    selected_items = list(glw.selectedItems() or [])
-                    current_item = selected_items[0] if selected_items else None
-            except Exception:
-                current_item = None
-            if current_item is not None:
-                gid = str(current_item.data(Qt.UserRole) or "").strip()
-                gname = str(current_item.text() or "").strip()
-                if gid:
-                    active_group = next((g for g in groups if str(g.get("id") or "").strip() == gid), None)
-                if active_group is None and gname:
-                    active_group = next(
-                        (g for g in groups if str(g.get("name") or "").strip().lower() == gname.lower()),
-                        None,
-                    )
-
-        if active_group is None and hasattr(self.plugin, "_selected_group_names"):
-            try:
-                selected_names = list(getattr(self.plugin, "_selected_group_names")() or [])
-            except Exception:
-                selected_names = []
-            for name in selected_names:
-                key = str(name or "").strip().lower()
-                if not key:
-                    continue
-                active_group = next(
-                    (g for g in groups if str(g.get("name") or "").strip().lower() == key),
-                    None,
-                )
-                if active_group is not None:
-                    break
-
-        if active_group is None:
-            active_group = next((g for g in groups if g.get("timeslice_ids")), None)
-        if active_group is None:
-            return None, None
-
-        tids = [str(tid).strip() for tid in (active_group.get("timeslice_ids") or []) if str(tid).strip()]
-        if not tids:
-            return active_group, []
-        ts_by_id = {
-            str(t.get("id") or "").strip(): t
-            for t in catalog.get("timeslices", [])
-            if isinstance(t, dict) and str(t.get("id") or "").strip()
-        }
-        slices = [ts_by_id[tid] for tid in tids if tid in ts_by_id]
-        if not slices:
-            tids_set = set(tids)
-            slices = [
-                t for t in catalog.get("timeslices", [])
-                if isinstance(t, dict) and str(t.get("id") or "").strip() in tids_set
-            ]
-        return active_group, slices
-
-    def _nearest_timeslice_index(self, slices, depth_m: float):
-        if not slices:
-            return None
-        centers = []
-        for t in slices:
-            try:
-                d0 = float(t.get("depth_from", 0.0) or 0.0)
-                d1 = float(t.get("depth_to", d0) or d0)
-            except Exception:
-                d0 = 0.0
-                d1 = 0.0
-            centers.append((d0 + d1) * 0.5)
-        depth_arr = np.asarray(centers, dtype=np.float64)
-        if depth_arr.size <= 0 or not np.isfinite(depth_arr).any():
-            return None
-        try:
-            target = float(depth_m)
-        except Exception:
-            return None
-        if not np.isfinite(target):
-            return None
-        return int(np.nanargmin(np.abs(depth_arr - target)))
-
-    def _active_project_root(self) -> str:
-        root = ""
-        if self.plugin is not None:
-            settings = getattr(self.plugin, "settings", None)
-            settings_key = getattr(self.plugin, "settings_key_active_project", None)
-            if settings is not None and settings_key:
-                try:
-                    root = (settings.value(settings_key, "", type=str) or "").strip()
-                except Exception:
-                    root = ""
-        if root:
-            return root
-        # Fallback: directory of current QGIS project file.
-        try:
-            qgs_file = str(QgsProject.instance().fileName() or "").strip()
-        except Exception:
-            qgs_file = ""
-        if qgs_file:
-            try:
-                return os.path.dirname(os.path.normpath(qgs_file))
-            except Exception:
-                return ""
-        return ""
-
-    def _set_active_workspace(self, root: str) -> None:
-        """Imposta la cartella-progetto attiva (dove vive GPR_Processing).
-
-        Aggiorna sia l'override locale del viewer sia il setting del plugin,
-        cosi' viewer e plugin (slicer/catalogo) puntano allo stesso progetto.
-        Il valore persiste tra sessioni tramite le impostazioni del plugin.
-        """
-        root = os.path.normpath(str(root or "").strip())
-        if not root:
-            return
-        self._gpr_workspace_override = root
-        try:
-            settings = getattr(self.plugin, "settings", None)
-            key = getattr(self.plugin, "settings_key_active_project", None)
-            if settings is not None and key:
-                settings.setValue(key, root)
-        except Exception:
-            pass
-
-    def _gpr_processing_paths(self) -> dict:
-        # Workspace scelto dall'utente (Nuovo/Apri/import): priorita' sul setting.
-        root = str(getattr(self, "_gpr_workspace_override", "") or "").strip()
-        if not root:
-            root = self._active_project_root()
-        if not root:
-            return {}
-        base = os.path.normpath(os.path.join(root, "GPR_Processing"))
-        return {
-            "base": base,
-            "raw": os.path.join(base, "raw"),
-            "processed": os.path.join(base, "processed"),
-            "timeslices": os.path.join(base, "timeslices"),
-            "project_json": os.path.join(base, "project.json"),
-        }
-
-    def _ensure_gpr_processing_layout(self) -> dict:
-        paths = self._gpr_processing_paths()
-        if not paths:
-            return {}
-        try:
-            os.makedirs(paths["raw"], exist_ok=True)
-            os.makedirs(paths["processed"], exist_ok=True)
-            os.makedirs(paths["timeslices"], exist_ok=True)
-            os.makedirs(paths["base"], exist_ok=True)
-        except Exception:
-            return {}
-        return paths
-
-    def _path_to_gpr_processing_store(self, path: str) -> str:
-        p = os.path.normpath(str(path or "").strip())
-        if not p:
-            return ""
-        paths = self._gpr_processing_paths()
-        base = paths.get("base", "")
-        if not base:
-            return p
-        try:
-            cp = os.path.commonpath([os.path.abspath(p), os.path.abspath(base)])
-            if cp == os.path.abspath(base):
-                rel = os.path.relpath(os.path.abspath(p), os.path.abspath(base))
-                return rel.replace("\\", "/")
-        except Exception:
-            pass
-        return p
-
-    def _path_from_gpr_processing_store(self, stored_path: str) -> str:
-        raw = str(stored_path or "").strip()
-        if not raw:
-            return ""
-        paths = self._gpr_processing_paths()
-        base = paths.get("base", "")
-        if os.path.isabs(raw) or not base:
-            return os.path.normpath(raw)
-        return os.path.normpath(os.path.join(base, raw))
-
-    def _load_gpr_processing_project_meta(self) -> dict:
-        paths = self._gpr_processing_paths()
-        pj = paths.get("project_json", "")
-        if not pj or (not os.path.exists(pj)):
-            return {}
-        try:
-            with open(pj, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-
-    def _save_gpr_processing_project_meta(
-        self,
-        last_processing: Optional[str] = None,
-        last_timeslice: Optional[str] = None,
-    ) -> bool:
-        paths = self._ensure_gpr_processing_layout()
-        if not paths:
-            return False
-        now_iso = datetime.now().isoformat(timespec="seconds")
-        meta = self._load_gpr_processing_project_meta()
-        created = str(meta.get("created") or now_iso)
-        profiles_payload = []
-        for prof in list(getattr(self, "_profiles", []) or []):
-            try:
-                p_abs = os.path.normpath(str(getattr(prof, "path", "") or ""))
-                if not p_abs:
-                    continue
-                profiles_payload.append({
-                    "filename": os.path.basename(p_abs),
-                    "path": self._path_to_gpr_processing_store(p_abs),
-                    "channels": list(range(int(getattr(prof, "n_channels", 0) or 0))),
-                    "loaded": True,
-                })
-            except Exception:
-                continue
-        ui_state = {
-            "colormap": (
-                str(self._cb_cmap.currentText())
-                if self._is_qt_alive(getattr(self, "_cb_cmap", None))
-                else ""
-            ),
-            "ve": (
-                float(self._spin_vertical_exag.value())
-                if self._is_qt_alive(getattr(self, "_spin_vertical_exag", None))
-                else 1.0
-            ),
-            "render": (
-                str(self._cb_interp.currentText())
-                if self._is_qt_alive(getattr(self, "_cb_interp", None))
-                else "Smooth"
-            ),
-            "show_wiggle": bool(
-                self._chk_show_wiggle.isChecked()
-                if self._is_qt_alive(getattr(self, "_chk_show_wiggle", None))
-                else self._show_wiggle
-            ),
-        }
-        # Fase D: persist the SliceSpec form verbatim.
-        _panel = getattr(self, "_slice_spec_panel", None)
-        if _panel is not None and self._is_qt_alive(_panel):
-            try:
-                ui_state["slice_spec"] = _panel.get_spec().to_dict()
-            except Exception:
-                pass
-        if last_timeslice is None:
-            try:
-                outdir = str(self._le_slice_outdir.text() or "").strip()
-            except Exception:
-                outdir = ""
-            if outdir:
-                last_timeslice = self._path_to_gpr_processing_store(os.path.normpath(outdir))
-        payload = {
-            "version": "1.0",
-            "created": created,
-            "updated": now_iso,
-            "profiles": profiles_payload,
-            "last_processing": (
-                last_processing
-                if last_processing is not None
-                else meta.get("last_processing")
-            ),
-            "last_timeslice": (
-                last_timeslice
-                if last_timeslice is not None
-                else meta.get("last_timeslice")
-            ),
-            "ui_state": ui_state,
-            # Preserve manual grid positioning params across sessions
-            "grid_positioning": getattr(self, "_grid_positioning_params", None) or meta.get("grid_positioning"),
-            # Ricetta completa della pipeline: evita di riprocessare da zero a
-            # ogni riapertura del viewer.
-            "processing_state": (
-                self._collect_full_processing_state()
-                if self._is_qt_alive(getattr(self, "_filter_chain_widget", None))
-                else meta.get("processing_state")
-            ),
-        }
-        try:
-            with open(paths["project_json"], "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, ensure_ascii=False, indent=2)
-            return True
-        except Exception:
-            return False
-
-    def _stage_profile_in_project_raw(self, src_path: str) -> str:
-        p_src = os.path.normpath(str(src_path or "").strip())
-        if (not p_src) or (not os.path.exists(p_src)):
-            return p_src
-        paths = self._ensure_gpr_processing_layout()
-        raw_dir = paths.get("raw", "")
-        if not raw_dir:
-            return p_src
-        try:
-            cp = os.path.commonpath([os.path.abspath(p_src), os.path.abspath(raw_dir)])
-            if cp == os.path.abspath(raw_dir):
-                return p_src
-        except Exception:
-            pass
-
-        name = os.path.basename(p_src)
-        base, ext = os.path.splitext(name)
-        candidate = os.path.join(raw_dir, name)
-        i = 1
-        while os.path.exists(candidate):
-            try:
-                if os.path.getsize(candidate) == os.path.getsize(p_src):
-                    return candidate
-            except Exception:
-                pass
-            candidate = os.path.join(raw_dir, f"{base}_{i}{ext}")
-            i += 1
-            if i > 999:
-                break
-
-        # Prefer lightweight link, fallback to real copy.
-        staged = None
-        try:
-            rel_src = os.path.relpath(p_src, raw_dir)
-            os.symlink(rel_src, candidate)
-            staged = candidate
-        except Exception:
-            pass
-        if staged is None:
-            try:
-                shutil.copy2(p_src, candidate)
-                staged = candidate
-            except Exception:
-                return p_src
-
-        # Alcuni formati (es. .DT) hanno file sidecar (.gec/.gps/.gps.sav)
-        # indispensabili per il posizionamento GNSS: li porta con se' nella
-        # stessa cartella raw, accanto al file principale.
-        try:
-            for sc_src in sidecar_paths(p_src):
-                sc_name = os.path.basename(sc_src)
-                sc_dst = os.path.join(raw_dir, sc_name)
-                if os.path.exists(sc_dst):
-                    continue
-                try:
-                    rel_sc = os.path.relpath(sc_src, raw_dir)
-                    os.symlink(rel_sc, sc_dst)
-                except Exception:
-                    try:
-                        shutil.copy2(sc_src, sc_dst)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        return staged
-
-    def _apply_gpr_processing_ui_state(self, ui_state: dict) -> None:
-        if not isinstance(ui_state, dict):
-            return
-        try:
-            cmap = str(ui_state.get("colormap") or "").strip()
-            if cmap and self._is_qt_alive(getattr(self, "_cb_cmap", None)):
-                self._cb_cmap.setCurrentText(cmap)
-        except Exception:
-            pass
-        try:
-            if self._is_qt_alive(getattr(self, "_spin_vertical_exag", None)):
-                self._spin_vertical_exag.setValue(float(ui_state.get("ve", self._spin_vertical_exag.value())))
-        except Exception:
-            pass
-        try:
-            render = str(ui_state.get("render") or "").strip()
-            if render and self._is_qt_alive(getattr(self, "_cb_interp", None)):
-                self._cb_interp.setCurrentText(render)
-        except Exception:
-            pass
-        try:
-            if self._is_qt_alive(getattr(self, "_chk_show_wiggle", None)):
-                self._chk_show_wiggle.setChecked(bool(ui_state.get("show_wiggle", self._chk_show_wiggle.isChecked())))
-        except Exception:
-            pass
-        try:
-            spec_d = ui_state.get("slice_spec")
-            panel = getattr(self, "_slice_spec_panel", None)
-            if isinstance(spec_d, dict) and panel is not None and self._is_qt_alive(panel):
-                from .slice_spec import SliceSpec
-                panel.set_spec(SliceSpec.from_dict(spec_d))
-        except Exception as exc:
-            print(f"[GPR viewer][WARN] ripristino SliceSpec fallito: {exc}")
-
-    def _try_import_saved_gpr_processing_project(self, force: bool = False) -> bool:
-        if self._profiles and (not bool(force)):
-            return False
-        if self._profiles and bool(force):
-            ans = QMessageBox.question(
-                self,
-                "Import progetto GPR",
-                "Sostituire i profili correnti con quelli del progetto GPR salvato?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if ans != QMessageBox.Yes:
-                return False
-        meta = self._load_gpr_processing_project_meta()
-        entries = list(meta.get("profiles") or [])
-        if not entries:
-            return False
-        paths = []
-        for e in entries:
-            if not isinstance(e, dict):
-                continue
-            p = self._path_from_gpr_processing_store(str(e.get("path") or ""))
-            if p and os.path.exists(p):
-                paths.append(p)
-        if not paths:
-            return False
-
-        self._reset_session_state()
-        errors = []
-        for p in paths:
-            try:
-                self._profiles.append(detect_and_read(p, verify_md5=True))
-            except Exception:
-                try:
-                    self._profiles.append(detect_and_read(p, verify_md5=False))
-                except Exception as exc:
-                    errors.append(f"{os.path.basename(p)}: {exc}")
-        if not self._profiles:
-            if errors:
-                self._safe_set_text(self._lbl_status, f"Import progetto: {errors[0]}")
-            return False
-        self._prof_idx = 0
-        self._load_current_profile()
-        self._apply_gpr_processing_ui_state(meta.get("ui_state") or {})
-        try:
-            ps = meta.get("processing_state")
-            if isinstance(ps, dict) and ps:
-                self._apply_full_processing_state(ps)
-        except Exception as exc:
-            print(f"[GPR viewer][WARN] ripristino processing_state fallito: {exc}")
-        self._update_slice_profile_info()
-        try:
-            ts_saved = self._path_from_gpr_processing_store(str(meta.get("last_timeslice") or ""))
-            if ts_saved and self._is_qt_alive(getattr(self, "_le_slice_outdir", None)):
-                self._le_slice_outdir.setText(ts_saved)
-        except Exception:
-            pass
-        self._safe_set_text(self._lbl_status, f"Progetto GPR importato: {len(self._profiles)} profili.")
-        return True
-
-    def _resolve_timeslice_raster_path(self, ts: dict) -> str:
-        if not isinstance(ts, dict):
-            return ""
-        project_root = self._active_project_root()
-        candidates = []
-        for key in ("raster_path", "project_path", "path", "file_path", "source_path"):
-            raw = str(ts.get(key) or "").strip()
-            if raw:
-                candidates.append(raw)
-        for raw in candidates:
-            p = raw
-            if not os.path.isabs(p) and project_root:
-                p = os.path.normpath(os.path.join(project_root, p))
-            p = os.path.normpath(p)
-            if os.path.exists(p):
-                return p
-        if candidates:
-            fallback = candidates[0]
-            if not os.path.isabs(fallback) and project_root:
-                fallback = os.path.normpath(os.path.join(project_root, fallback))
-            return os.path.normpath(fallback)
-        return ""
-
-    def _load_slice_raster_cached(self, raster_path: str):
-        p = str(raster_path or "").strip()
-        if not p:
-            return None, None
-        try:
-            mtime = float(os.path.getmtime(p))
-        except Exception:
-            mtime = None
-
-        cache_hit = (
-            self._slice_cache_path == p
-            and self._slice_cache_arr is not None
-            and self._slice_cache_extent is not None
-            and self._slice_cache_mtime == mtime
-        )
-        if cache_hit:
-            return self._slice_cache_arr, self._slice_cache_extent
-
-        from osgeo import gdal
-
-        ds = gdal.Open(p)
-        if ds is None:
-            return None, None
-        band = ds.GetRasterBand(1)
-        if band is None:
-            ds = None
-            return None, None
-        arr = band.ReadAsArray()
-        if arr is None:
-            ds = None
-            return None, None
-        arr = np.asarray(arr, dtype=np.float32)
-        nodata = band.GetNoDataValue()
-        if nodata is not None and np.isfinite(float(nodata)):
-            arr[arr == float(nodata)] = np.nan
-        arr[~np.isfinite(arr)] = np.nan
-
-        gt = ds.GetGeoTransform(can_return_null=True)
-        if gt:
-            xmin = float(gt[0])
-            xmax = float(gt[0] + gt[1] * ds.RasterXSize)
-            ymax = float(gt[3])
-            ymin = float(gt[3] + gt[5] * ds.RasterYSize)
-        else:
-            xmin, xmax = 0.0, float(arr.shape[1])
-            ymin, ymax = 0.0, float(arr.shape[0])
-        ds = None
-
-        extent = (xmin, xmax, ymin, ymax)
-        self._slice_cache_path = p
-        self._slice_cache_mtime = mtime
-        self._slice_cache_arr = arr
-        self._slice_cache_extent = extent
-        return arr, extent
-
-    def _slice_world_to_pixel(self, east: float, north: float) -> tuple[float, float] | tuple[None, None]:
-        if self._slice_current_extent is None:
-            return None, None
-        xmin, xmax, ymin, ymax = [float(v) for v in self._slice_current_extent]
-        if not (np.isfinite(xmin) and np.isfinite(xmax) and np.isfinite(ymin) and np.isfinite(ymax)):
-            return None, None
-        # Ora la slice e' visualizzata direttamente in coordinate geografiche (extent su imshow),
-        # quindi il crosshair puo' usare world-coordinates senza conversione in pixel.
-        if abs(float(xmax - xmin)) < 1e-12 or abs(float(ymax - ymin)) < 1e-12:
-            return None, None
-        ex = float(east)
-        ny = float(north)
-        if not (np.isfinite(ex) and np.isfinite(ny)):
-            return None, None
-        return ex, ny
-
-    def _update_slice_crosshair_overlay(self, draw: bool = True) -> bool:
-        if self._ax_slice is None or self._slice_im is None:
-            return False
-        m = self._cursor_metrics()
-        if not m:
-            return False
-        east = m.get("east")
-        north = m.get("north")
-        try:
-            east_f = float(east) if east is not None else np.nan
-            north_f = float(north) if north is not None else np.nan
-        except Exception:
-            return False
-        if not (np.isfinite(east_f) and np.isfinite(north_f)):
-            return False
-        xw, yw = self._slice_world_to_pixel(east_f, north_f)
-        if xw is None or yw is None:
-            return False
-        if self._slice_vline is None:
-            self._slice_vline = self._ax_slice.axvline(xw, color="yellow", lw=1.0, alpha=0.85)
-        else:
-            self._slice_vline.set_xdata([xw, xw])
-        if self._slice_hline is None:
-            self._slice_hline = self._ax_slice.axhline(yw, color="cyan", lw=1.0, ls="--", alpha=0.8)
-        else:
-            self._slice_hline.set_ydata([yw, yw])
-        if draw and self._canvas_slice is not None:
-            self._safe_draw_idle(self._canvas_slice)
-        return True
-
-    def _on_slice_clip_changed(self, _value):
-        if not hasattr(self, "_spin_slice_vmin_pct") or not hasattr(self, "_spin_slice_vmax_pct"):
-            return
-        lo = float(self._spin_slice_vmin_pct.value())
-        hi = float(self._spin_slice_vmax_pct.value())
-        if hi <= lo + 0.1:
-            sender = self.sender()
-            if sender is self._spin_slice_vmin_pct:
-                hi = min(100.0, lo + 0.1)
-                self._spin_slice_vmax_pct.blockSignals(True)
-                try:
-                    self._spin_slice_vmax_pct.setValue(hi)
-                finally:
-                    self._spin_slice_vmax_pct.blockSignals(False)
-            else:
-                lo = max(0.0, hi - 0.1)
-                self._spin_slice_vmin_pct.blockSignals(True)
-                try:
-                    self._spin_slice_vmin_pct.setValue(lo)
-                finally:
-                    self._spin_slice_vmin_pct.blockSignals(False)
-        self._redraw_slice_view(force=True)
-        self._request_preview_update(immediate=False)
-
-    def _preview_resolution_m(self) -> float:
-        quality = "medium"
-        try:
-            quality = str(self._cb_preview_quality.currentData() or "medium").strip().lower()
-        except Exception:
-            quality = "medium"
-        mapping = {
-            "low": 0.20,
-            "medium": 0.10,
-            "high": 0.05,
-        }
-        return float(mapping.get(quality, 0.10))
-
-    def _preview_depth_window(self) -> tuple[float, float]:
-        try:
-            step = float(self._spin_slice_thickness.value())
-        except Exception:
-            step = 0.10
-        if (not np.isfinite(step)) or step <= 0.0:
-            step = 0.10
-        z0 = 0.0
-        if self._cursor_z is not None:
-            try:
-                z0 = float(self._cursor_z)
-            except Exception:
-                z0 = 0.0
-        if not np.isfinite(z0):
-            z0 = 0.0
-        z0 = float(max(0.0, z0))
-        z1 = float(z0 + step)
-        return z0, z1
-
-    def _on_toggle_preview_mode(self, checked: bool):
-        self._preview_mode_active = bool(checked)
-        if not self._preview_mode_active:
-            try:
-                self._preview_timer.stop()
-            except Exception:
-                pass
-            self._preview_request_id += 1  # scarta un eventuale risultato ancora in volo
-            self._set_preview_busy(False)
-            self._preview_slice_grid = None
-            self._preview_slice_extent = None
-            self._preview_slice_z_from = None
-            self._preview_slice_z_to = None
-            self._preview_signature = None
-            self._redraw_slice_view(force=True)
-            return
-        if not self._profiles:
-            if self._is_qt_alive(getattr(self, "_btn_preview_slice", None)):
-                self._btn_preview_slice.blockSignals(True)
-                try:
-                    self._btn_preview_slice.setChecked(False)
-                finally:
-                    self._btn_preview_slice.blockSignals(False)
-            self._preview_mode_active = False
-            QMessageBox.information(self, "Preview", "Importa almeno un profilo .ogpr.")
-            return
-        self._request_preview_update(immediate=True)
-
-    def _request_preview_update(self, immediate: bool = False):
-        if not bool(getattr(self, "_preview_mode_active", False)):
-            return
-        if not self._profiles:
-            return
-        if not self._is_qt_alive(getattr(self, "_preview_timer", None)):
-            return
-        try:
-            self._preview_timer.start(1 if immediate else 300)
-        except Exception:
-            pass
-
-    def _stop_preview_worker_blocking(self, timeout_ms: int = 3000):
-        """Attende la fine di un eventuale thread di preview in corso.
-
-        Chiamato solo alla chiusura reale della finestra, per evitare di
-        distruggere il QThread mentre e' ancora attivo.
-        """
-        self._preview_request_id += 1  # scarta comunque il risultato
-        thread = getattr(self, "_preview_thread", None)
-        if self._is_qt_alive(thread) and thread.isRunning():
-            try:
-                thread.quit()
-                thread.wait(int(timeout_ms))
-            except Exception:
-                pass
-
-    def _set_preview_busy(self, busy: bool, message: str = ""):
-        """Mostra/nasconde l'indicatore di avanzamento del preview.
-
-        Non esiste una % reale (compute_timeslice_preview non riporta stati
-        intermedi), quindi la QProgressBar resta in modalita' indeterminata
-        (range 0,0): comunica "sta lavorando" senza promettere una % finta.
-        """
-        self._preview_busy = bool(busy)
-        if self._is_qt_alive(getattr(self, "_progress_preview", None)):
-            self._progress_preview.setVisible(bool(busy))
-        if self._is_qt_alive(getattr(self, "_lbl_preview_status", None)):
-            if busy:
-                self._lbl_preview_status.setText(message or "Preview: elaborazione in corso...")
-                self._lbl_preview_status.setVisible(True)
-            elif message:
-                self._lbl_preview_status.setText(message)
-                self._lbl_preview_status.setVisible(True)
-            else:
-                self._lbl_preview_status.setVisible(False)
-
-    @staticmethod
-    def _stable_preview_signature(value):
-        """Converte ricorsivamente un valore (dict/list/float inclusi) in una
-        tupla hashabile e stabile, usata per capire se i parametri di preview
-        sono davvero cambiati rispetto all'ultimo calcolo."""
-        if isinstance(value, float):
-            return round(value, 6)
-        if isinstance(value, dict):
-            return tuple(sorted(
-                (k, GprProfileViewer._stable_preview_signature(v)) for k, v in value.items()
-            ))
-        if isinstance(value, (list, tuple)):
-            return tuple(GprProfileViewer._stable_preview_signature(v) for v in value)
-        return value
-
-    def _compute_and_show_preview(self):
-        if not bool(getattr(self, "_preview_mode_active", False)):
-            return
-        if not self._profiles:
-            return
-        try:
-            from .gpr_ogpr_slicer import compute_timeslice_preview  # noqa: F401 (verifica disponibilita')
-        except Exception as exc:
-            self._set_preview_busy(False, f"Preview non disponibile: {exc}")
-            return
-
-        z_from, z_to = self._preview_depth_window()
-        res = self._preview_resolution_m()
-        slice_params = dict(self.get_slice_params() or {})
-        chain_order = list(self._current_chain_order() or [])
-
-        # Fase D: spec-native preview when the SliceSpec panel is active.
-        preview_spec = None
-        _panel = getattr(self, "_slice_spec_panel", None)
-        if _panel is not None and self._is_qt_alive(_panel):
-            try:
-                preview_spec = _panel.get_spec().resolve(self._profiles)
-            except Exception as exc:
-                self._set_preview_busy(False, f"Parametri slice non validi: {exc}")
-                return
-            # Never render the preview finer than the final output; the
-            # "Qualita' preview" combo only makes it coarser.
-            res = max(float(res), float(preview_spec.resolution_m))
-
-        kwargs = {
-            "channel": int(self._ch_idx),
-            "combine_method": "mean",
-            "pipeline_params": dict(slice_params.get("pipeline_params") or {}),
-            "normalize_channels": bool(slice_params.get("normalize_channels", False)),
-            "extraction_mode": str(slice_params.get("extraction_mode", "las_like") or "las_like"),
-            "use_hilbert": bool(slice_params.get("use_hilbert", True)),
-            "use_processing": bool(slice_params.get("use_processing", False)),
-            "amplitude_sigma": slice_params.get("amplitude_sigma"),
-            "use_anisotropic_idw": bool(slice_params.get("use_anisotropic_idw", False)),
-            "auto_radius": bool(slice_params.get("auto_radius", True)),
-            "idw_mode": str(slice_params.get("idw_mode", "quality") or "quality"),
-            "radius": slice_params.get("search_radius"),
-            "idw_power": float(slice_params.get("idw_power", 2) or 2),
-            "min_points": int(slice_params.get("min_points", 1) or 1),
-            "fill_nodata": bool(slice_params.get("fill_nodata", True)),
-            "fill_nodata_max_distance": 0.0,
-            "blanking_distance": float(slice_params.get("blanking_distance", 0.0) or 0.0),
-            "smooth_sigma": float(slice_params.get("smooth_sigma", 0.0) or 0.0),
-            "depth_radius_factor": float(slice_params.get("depth_radius_factor", 0.6) or 0.0),
-            "balance_profiles": bool(slice_params.get("balance_profiles", True)),
-            "pre_slice_bg_removal": bool(slice_params.get("pre_slice_bg_removal", False)),
-            "pre_slice_bg_mode": str(slice_params.get("pre_slice_bg_mode", "line_by_line") or "line_by_line"),
-            "pre_slice_bg_window": int(slice_params.get("pre_slice_bg_window", 0) or 0),
-            "pre_slice_bg_sample_start": int(slice_params.get("pre_slice_bg_sample_start", 0) or 0),
-            "pre_slice_bg_sample_end": int(slice_params.get("pre_slice_bg_sample_end", 0) or 0),
-            "stack_n": int(slice_params.get("stack_n", 1) or 1),
-            "stack_kernel": str(slice_params.get("stack_kernel", "boxcar") or "boxcar"),
-            "flip_traces_mode": str(slice_params.get("flip_traces_mode", "none") or "none"),
-            "topographic_correction": bool(slice_params.get("topographic_correction", False)),
-            "topo_reference_mode": str(slice_params.get("topo_reference_mode", "median") or "median"),
-            "topo_reference_elevation": slice_params.get("topo_reference_elevation"),
-            "parallel_profiles": bool(slice_params.get("parallel_profiles", False)),
-            "profile_workers": int(slice_params.get("profile_workers", 0) or 0),
-        }
-
-        # La firma di cache e' derivata direttamente da kwargs (invece di una
-        # lista di campi mantenuta a mano): cosi' un parametro come Blanking
-        # o Search radius che cambia non puo' piu' passare inosservato e
-        # lasciare il preview "congelato" sul risultato precedente.
-        sig = (
-            round(float(z_from), 4),
-            round(float(z_to), 4),
-            round(float(res), 4),
-            tuple(chain_order),
-            (self._stable_preview_signature(preview_spec.to_dict())
-             if preview_spec is not None
-             else self._stable_preview_signature(kwargs)),
-        )
-        if sig == self._preview_signature:
-            return
-
-        # Calcolo su thread separato: il thread GUI resta reattivo e Windows
-        # non mostra piu' il cursore "in caricamento" per l'intera durata.
-        self._preview_request_id += 1
-        request_id = self._preview_request_id
-        self._preview_signature = sig
-        self._preview_pending_zwindow = (float(z_from), float(z_to))
-        self._set_preview_busy(True)
-
-        old_thread = getattr(self, "_preview_thread", None)
-        if self._is_qt_alive(old_thread):
-            try:
-                old_thread.finished.disconnect()
-            except Exception:
-                pass
-
-        thread = QThread(self)
-        worker = _PreviewSliceWorker(
-            request_id, self._profiles, float(z_from), float(z_to), float(res), chain_order, kwargs,
-            spec=preview_spec,
-        )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_preview_worker_finished)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._preview_thread = thread
-        self._preview_worker = worker
-        thread.start()
-
-    def _on_preview_worker_finished(self, request_id: int, grid, extent, error: str):
-        if int(request_id) != int(self._preview_request_id):
-            return  # superato da una richiesta di preview piu' recente
-        self._set_preview_busy(False)
-        if error:
-            self._safe_set_text(self._lbl_status, f"Preview errore: {error}")
-            return
-        if grid is None or extent is None:
-            self._safe_set_text(self._lbl_status, "Preview: nessun dato nella finestra selezionata.")
-            return
-
-        z_from, z_to = getattr(self, "_preview_pending_zwindow", (0.0, 0.0))
-        self._preview_slice_grid = np.asarray(grid, dtype=np.float32)
-        self._preview_slice_extent = tuple(float(v) for v in extent)
-        self._preview_slice_z_from = float(z_from)
-        self._preview_slice_z_to = float(z_to)
-        self._redraw_slice_view(force=True)
-
-    def _redraw_slice_view(self, force: bool = False):
-        if not HAS_MPL or self._ax_slice is None or self._canvas_slice is None:
-            return
-
-        if bool(getattr(self, "_preview_mode_active", False)):
-            arr = np.asarray(getattr(self, "_preview_slice_grid", None)) if getattr(self, "_preview_slice_grid", None) is not None else None
-            extent = getattr(self, "_preview_slice_extent", None)
-            if arr is None or extent is None or arr.ndim != 2 or arr.size <= 0:
-                self._ax_slice.clear()
-                self._slice_im = None
-                self._slice_vline = None
-                self._slice_hline = None
-                self._ax_slice.text(
-                    0.5,
-                    0.5,
-                    "Preview in attesa...\nMuovi il cursore nel radargramma.",
-                    transform=self._ax_slice.transAxes,
-                    ha="center",
-                    va="center",
-                    fontsize=9,
-                    color="#666666",
-                )
-                self._ax_slice.set_title("Timeslice preview")
-                self._ax_slice.set_xticks([])
-                self._ax_slice.set_yticks([])
-                self._safe_draw_idle(self._canvas_slice)
-                return
-
-            finite = arr[np.isfinite(arr)]
-            p_lo = 2.0
-            p_hi = 98.0
-            if hasattr(self, "_spin_slice_vmin_pct") and self._spin_slice_vmin_pct is not None:
-                try:
-                    p_lo = float(self._spin_slice_vmin_pct.value())
-                except Exception:
-                    p_lo = 2.0
-            if hasattr(self, "_spin_slice_vmax_pct") and self._spin_slice_vmax_pct is not None:
-                try:
-                    p_hi = float(self._spin_slice_vmax_pct.value())
-                except Exception:
-                    p_hi = 98.0
-            if p_hi <= p_lo + 0.1:
-                p_hi = min(100.0, p_lo + 0.1)
-            if finite.size > 0:
-                vmin = float(np.nanpercentile(finite, p_lo))
-                vmax = float(np.nanpercentile(finite, p_hi))
-                if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmax <= vmin):
-                    vmin = float(np.nanmin(finite))
-                    vmax = float(np.nanmax(finite))
-            else:
-                vmin, vmax = 0.0, 1.0
-            if not np.isfinite(vmin):
-                vmin = 0.0
-            if not np.isfinite(vmax) or vmax <= vmin:
-                vmax = vmin + 1e-6
-
-            cmap = (
-                self._cb_slice_cmap.currentText()
-                if hasattr(self, "_cb_slice_cmap") and self._cb_slice_cmap is not None
-                else DEFAULT_CMAP
-            )
-            arr_masked = np.ma.masked_invalid(arr)
-            slice_cmap = cmap
-            try:
-                from matplotlib import colormaps
-
-                cm_obj = colormaps.get_cmap(str(cmap)).copy()
-                cm_obj.set_bad(color="#e6e6e6", alpha=1.0)
-                slice_cmap = cm_obj
-            except Exception:
-                slice_cmap = cmap
-            self._ax_slice.clear()
-            self._slice_im = self._ax_slice.imshow(
-                arr_masked,
-                cmap=slice_cmap,
-                vmin=vmin,
-                vmax=vmax,
-                extent=[float(extent[0]), float(extent[1]), float(extent[2]), float(extent[3])],
-                origin="upper",
-                aspect="equal",
-                interpolation="bilinear",
-            )
-            xmin, xmax, ymin, ymax = [float(v) for v in extent]
-            x_full = (min(xmin, xmax), max(xmin, xmax))
-            y_full = (min(ymin, ymax), max(ymin, ymax))
-            if self._slice_view_xlim is None:
-                self._slice_view_xlim = x_full
-            if self._slice_view_ylim is None:
-                self._slice_view_ylim = y_full
-            self._slice_view_xlim = self._clamp_axis_limits(
-                self._slice_view_xlim[0], self._slice_view_xlim[1], x_full[0], x_full[1]
-            )
-            self._slice_view_ylim = self._clamp_axis_limits(
-                self._slice_view_ylim[0], self._slice_view_ylim[1], y_full[0], y_full[1]
-            )
-            self._ax_slice.set_xlim(*self._slice_view_xlim)
-            self._ax_slice.set_ylim(*self._slice_view_ylim)
-            self._ax_slice.set_aspect("equal", adjustable="datalim")
-            self._ax_slice.grid(False)
-            self._ax_slice.set_xticks([])
-            self._ax_slice.set_yticks([])
-            self._ax_slice.set_xlabel("")
-            self._ax_slice.set_ylabel("")
-            self._ax_slice.set_facecolor("#e6e6e6")
-            for spine in self._ax_slice.spines.values():
-                spine.set_visible(False)
-            z0 = float(getattr(self, "_preview_slice_z_from", 0.0) or 0.0)
-            z1 = float(getattr(self, "_preview_slice_z_to", z0) or z0)
-            self._ax_slice.set_title(f"Timeslice preview {z0:.2f}-{z1:.2f} m")
-            self._slice_vline = None
-            self._slice_hline = None
-            self._update_slice_crosshair_overlay(draw=False)
-            self._safe_draw_idle(self._canvas_slice)
-            return
-
-        local_catalog = list(getattr(self, "_slice_catalog", []) or [])
-        using_local_catalog = len(local_catalog) > 0
-        slices = local_catalog if using_local_catalog else []
-
-        if not slices:
-            self._ax_slice.clear()
-            self._slice_im = None
-            self._slice_vline = None
-            self._slice_hline = None
-            self._slice_current_idx = None
-            self._slice_current_path = None
-            self._slice_current_extent = None
-            self._slice_current_shape = None
-            self._slice_current_cmap = ""
-            self._ax_slice.text(
-                0.5,
-                0.5,
-                "Nessuna timeslice calcolata.\nUsa 'Crea Timeslice...' nel pannello Timeslice.",
-                transform=self._ax_slice.transAxes,
-                ha="center",
-                va="center",
-                fontsize=9,
-                color="#666666",
-            )
-            self._ax_slice.set_title("Timeslice locale")
-            self._ax_slice.set_xticks([])
-            self._ax_slice.set_yticks([])
-            self._safe_draw_idle(self._canvas_slice)
-            return
-
-        idx = 0 if self._slice_current_idx is None else int(self._slice_current_idx)
-        idx = int(np.clip(idx, 0, len(slices) - 1))
-        ts = dict(slices[idx] or {})
-        raster_path = str(ts.get("path") or "").strip()
-        cmap = (
-            self._cb_slice_cmap.currentText()
-            if hasattr(self, "_cb_slice_cmap") and self._cb_slice_cmap is not None
-            else (self._cb_cmap.currentText() if hasattr(self, "_cb_cmap") else DEFAULT_CMAP)
-        )
-
-        if not raster_path:
-            self._ax_slice.clear()
-            self._slice_im = None
-            self._ax_slice.set_title(f"Slice {idx} - percorso raster non disponibile")
-            self._ax_slice.set_xticks([])
-            self._ax_slice.set_yticks([])
-            self._safe_draw_idle(self._canvas_slice)
-            return
-        if not os.path.exists(raster_path):
-            self._ax_slice.clear()
-            self._slice_im = None
-            self._ax_slice.set_title(f"Slice {idx} - file non trovato")
-            self._ax_slice.set_xticks([])
-            self._ax_slice.set_yticks([])
-            self._safe_draw_idle(self._canvas_slice)
-            return
-
-        needs_full_redraw = bool(
-            force
-            or self._slice_im is None
-            or self._slice_current_idx != idx
-            or str(self._slice_current_path or "") != str(raster_path)
-        )
-
-        if needs_full_redraw:
-            try:
-                arr, extent = self._load_slice_raster_cached(raster_path)
-            except Exception as exc:
-                self._ax_slice.clear()
-                self._slice_im = None
-                self._ax_slice.set_title(f"Errore lettura raster: {exc}")
-                self._ax_slice.set_xticks([])
-                self._ax_slice.set_yticks([])
-                self._safe_draw_idle(self._canvas_slice)
-                return
-            if arr is None or extent is None:
-                self._ax_slice.clear()
-                self._slice_im = None
-                self._ax_slice.set_title("Errore lettura raster")
-                self._ax_slice.set_xticks([])
-                self._ax_slice.set_yticks([])
-                self._safe_draw_idle(self._canvas_slice)
-                return
-
-            finite = arr[np.isfinite(arr)]
-            p_lo = 2.0
-            p_hi = 98.0
-            if hasattr(self, "_spin_slice_vmin_pct") and self._spin_slice_vmin_pct is not None:
-                try:
-                    p_lo = float(self._spin_slice_vmin_pct.value())
-                except Exception:
-                    p_lo = 2.0
-            if hasattr(self, "_spin_slice_vmax_pct") and self._spin_slice_vmax_pct is not None:
-                try:
-                    p_hi = float(self._spin_slice_vmax_pct.value())
-                except Exception:
-                    p_hi = 98.0
-            if p_hi <= p_lo + 0.1:
-                p_hi = min(100.0, p_lo + 0.1)
-            if finite.size > 0:
-                vmin = float(np.nanpercentile(finite, p_lo))
-                vmax = float(np.nanpercentile(finite, p_hi))
-                if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmax <= vmin):
-                    vmin = float(np.nanmin(finite))
-                    vmax = float(np.nanmax(finite))
-            else:
-                vmin, vmax = 0.0, 1.0
-            if not np.isfinite(vmin):
-                vmin = 0.0
-            if not np.isfinite(vmax) or vmax <= vmin:
-                vmax = vmin + 1e-6
-
-            self._ax_slice.clear()
-            self._slice_vline = None
-            self._slice_hline = None
-            arr_masked = np.ma.masked_invalid(arr)
-            slice_cmap = cmap
-            try:
-                from matplotlib import colormaps
-
-                cm_obj = colormaps.get_cmap(str(cmap)).copy()
-                cm_obj.set_bad(color="#e6e6e6", alpha=1.0)
-                slice_cmap = cm_obj
-            except Exception:
-                slice_cmap = cmap
-            self._slice_im = self._ax_slice.imshow(
-                arr_masked,
-                cmap=slice_cmap,
-                vmin=vmin,
-                vmax=vmax,
-                extent=[float(extent[0]), float(extent[1]), float(extent[2]), float(extent[3])],
-                origin="upper",
-                aspect="equal",
-                interpolation="bilinear",
-            )
-
-            n_rows, n_cols = int(arr.shape[0]), int(arr.shape[1])
-            xmin, xmax, ymin, ymax = [float(v) for v in extent]
-            x_full = (min(xmin, xmax), max(xmin, xmax))
-            y_full = (min(ymin, ymax), max(ymin, ymax))
-            if self._slice_view_xlim is None:
-                self._slice_view_xlim = x_full
-            if self._slice_view_ylim is None:
-                self._slice_view_ylim = y_full
-            self._slice_view_xlim = self._clamp_axis_limits(
-                self._slice_view_xlim[0], self._slice_view_xlim[1], x_full[0], x_full[1]
-            )
-            self._slice_view_ylim = self._clamp_axis_limits(
-                self._slice_view_ylim[0], self._slice_view_ylim[1], y_full[0], y_full[1]
-            )
-            self._ax_slice.set_xlim(*self._slice_view_xlim)
-            self._ax_slice.set_ylim(*self._slice_view_ylim)
-            self._ax_slice.set_aspect("equal", adjustable="datalim")
-
-            self._ax_slice.grid(False)
-            self._ax_slice.set_xticks([])
-            self._ax_slice.set_yticks([])
-            self._ax_slice.set_xlabel("")
-            self._ax_slice.set_ylabel("")
-            self._ax_slice.set_facecolor("#e6e6e6")
-            for spine in self._ax_slice.spines.values():
-                spine.set_visible(False)
-
-            try:
-                d0 = float(ts.get("z_top", 0.0) or 0.0)
-                d1 = float(ts.get("z_bot", d0) or d0)
-            except Exception:
-                d0 = 0.0
-                d1 = 0.0
-            source_name = os.path.basename(str(self._slice_catalog_source_dir or "")) or "local"
-            title_left = f"{source_name} | "
-            base = os.path.basename(raster_path)
-            self._ax_slice.set_title(f"{title_left}Timeslice {d0:.2f}-{d1:.2f} m  |  {base}")
-
-            self._slice_current_idx = idx
-            self._slice_current_path = raster_path
-            self._slice_current_extent = tuple(float(v) for v in extent)
-            self._slice_current_shape = (n_rows, n_cols)
-            self._slice_current_cmap = str(cmap)
-        else:
-            if self._slice_im is not None and str(self._slice_current_cmap) != str(cmap):
-                cm_to_set = cmap
-                try:
-                    from matplotlib import colormaps
-
-                    cm_obj = colormaps.get_cmap(str(cmap)).copy()
-                    cm_obj.set_bad(color="#e6e6e6", alpha=1.0)
-                    cm_to_set = cm_obj
-                except Exception:
-                    cm_to_set = cmap
-                self._slice_im.set_cmap(cm_to_set)
-                self._slice_current_cmap = str(cmap)
-
-        changed = self._update_slice_crosshair_overlay(draw=False)
-        if changed or needs_full_redraw:
-            self._safe_draw_idle(self._canvas_slice)
-
-    def _on_slice_press(self, event):
-        if event is None or event.inaxes != self._ax_slice:
-            return
-        if int(getattr(event, "button", 0) or 0) != 1:
-            return
-        if self._slice_im is None or event.xdata is None or event.ydata is None:
-            return
-        try:
-            xlim0 = tuple(self._ax_slice.get_xlim())
-            ylim0 = tuple(self._ax_slice.get_ylim())
-            self._slice_pan_anchor = (
-                float(event.xdata),
-                float(event.ydata),
-                (float(xlim0[0]), float(xlim0[1])),
-                (float(ylim0[0]), float(ylim0[1])),
-            )
-        except Exception:
-            self._slice_pan_anchor = None
-
-    def _on_slice_release(self, _event):
-        self._slice_pan_anchor = None
-
-    def _on_slice_mouse_move(self, event):
-        if event is None or event.inaxes != self._ax_slice:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-        if self._slice_pan_anchor is not None and self._slice_im is not None:
-            try:
-                px, py, xlim0, ylim0 = self._slice_pan_anchor
-                dx = float(px) - float(event.xdata)
-                dy = float(py) - float(event.ydata)
-                nx0 = float(xlim0[0]) + dx
-                nx1 = float(xlim0[1]) + dx
-                ny0 = float(ylim0[0]) + dy
-                ny1 = float(ylim0[1]) + dy
-                ex0, ex1, ey0, ey1 = self._slice_im.get_extent()
-                x_min, x_max = float(min(ex0, ex1)), float(max(ex0, ex1))
-                y_min, y_max = float(min(ey0, ey1)), float(max(ey0, ey1))
-                self._slice_view_xlim = self._clamp_axis_limits(nx0, nx1, x_min, x_max)
-                self._slice_view_ylim = self._clamp_axis_limits(ny0, ny1, y_min, y_max)
-                self._ax_slice.set_xlim(*self._slice_view_xlim)
-                self._ax_slice.set_ylim(*self._slice_view_ylim)
-                self._safe_draw_idle(self._canvas_slice)
-            except Exception:
-                pass
-            return
-        try:
-            self._safe_set_text(
-                self._lbl_status,
-                f"Slice cursor: x {float(event.xdata):.1f}  y {float(event.ydata):.1f}"
-            )
-        except Exception:
-            pass
-
-    def _on_slice_scroll_zoom(self, event):
-        if event is None or event.inaxes != self._ax_slice or self._slice_im is None:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-        step = float(getattr(event, "step", 0.0) or 0.0)
-        btn = str(getattr(event, "button", "") or "").lower()
-        if step > 0 or btn == "up":
-            scale = 1.0 / 1.2
-        elif step < 0 or btn == "down":
-            scale = 1.2
-        else:
-            return
-
-        x0, x1 = self._ax_slice.get_xlim()
-        y0, y1 = self._ax_slice.get_ylim()
-        x = float(event.xdata)
-        y = float(event.ydata)
-
-        nx0 = x - (x - x0) * scale
-        nx1 = x + (x1 - x) * scale
-        ny0 = y - (y - y0) * scale
-        ny1 = y + (y1 - y) * scale
-
-        ex0, ex1, ey0, ey1 = self._slice_im.get_extent()
-        x_min, x_max = float(min(ex0, ex1)), float(max(ex0, ex1))
-        y_min, y_max = float(min(ey0, ey1)), float(max(ey0, ey1))
-
-        self._slice_view_xlim = self._clamp_axis_limits(nx0, nx1, x_min, x_max)
-        self._slice_view_ylim = self._clamp_axis_limits(ny0, ny1, y_min, y_max)
-        self._ax_slice.set_xlim(*self._slice_view_xlim)
-        self._ax_slice.set_ylim(*self._slice_view_ylim)
-        self._safe_draw_idle(self._canvas_slice)
-
-    def _update_dial(self):
-        if self._cursor_z is None or self.plugin is None:
-            return
-        settings = getattr(self.plugin, "settings", None)
-        settings_key = getattr(self.plugin, "settings_key_active_project", None)
-        if settings is None or not settings_key:
-            return
-        dlg = getattr(self.plugin, "dlg", None)
-        if dlg is None:
-            return
-        dial = getattr(dlg, "Dial", None) or getattr(dlg, "dial", None)
-        if dial is None:
-            return
-        try:
-            slices = list(getattr(self, "_slice_catalog", []) or [])
-            if not slices:
-                return
-            centers = []
-            for i, s in enumerate(slices):
-                try:
-                    zc = s.get("z_center", None)
-                    if zc is None:
-                        z0 = float(s.get("z_top", 0.0) or 0.0)
-                        z1 = float(s.get("z_bot", z0) or z0)
-                        zc = 0.5 * (z0 + z1)
-                    centers.append((i, float(zc)))
-                except Exception:
-                    continue
-            if not centers:
-                idx = int(self._slice_current_idx if self._slice_current_idx is not None else 0)
-                idx = int(np.clip(idx, 0, len(slices) - 1))
-            else:
-                target = float(self._cursor_z)
-                idx = min(centers, key=lambda p: abs(p[1] - target))[0]
-            dial_val = int(np.clip(idx, 0, int(dial.maximum())))
-            if dial.value() != dial_val:
-                dial.setValue(dial_val)
-        except Exception:
-            pass
-
-    def _update_timeslice_visibility_in_canvas(self):
-        if not bool(getattr(self, "_chk_timeslice_sync", None) and self._chk_timeslice_sync.isChecked()):
-            return
-        if self._cursor_z is None or self.plugin is None:
-            return
-
-        slices = list(getattr(self, "_slice_catalog", []) or [])
-        if not slices:
-            return
-
-        centers = []
-        for i, s in enumerate(slices):
-            try:
-                zc = s.get("z_center", None)
-                if zc is None:
-                    z0 = float(s.get("z_top", 0.0) or 0.0)
-                    z1 = float(s.get("z_bot", z0) or z0)
-                    zc = 0.5 * (z0 + z1)
-                centers.append((i, float(zc)))
-            except Exception:
-                continue
-        if not centers:
-            return
-
-        target = float(self._cursor_z)
-        idx = min(centers, key=lambda p: abs(p[1] - target))[0]
-
-        try:
-            root = QgsProject.instance().layerTreeRoot()
-            qgis_group = root.findGroup("GPR Timeslices")
-            if qgis_group is None:
-                return
-
-            raster_nodes = []
-            for child in qgis_group.children():
-                if not hasattr(child, "setItemVisibilityChecked"):
-                    continue
-                layer = child.layer() if hasattr(child, "layer") else None
-                if layer is None:
-                    continue
-                if not hasattr(layer, "bandCount"):
-                    continue
-                raster_nodes.append(child)
-            if not raster_nodes:
-                return
-            index = int(np.clip(idx, 0, len(raster_nodes) - 1))
-            for i, node in enumerate(raster_nodes):
-                node.setItemVisibilityChecked(i == index)
-        except Exception:
-            pass
-
-    def _update_timeslice_crosshair(self):
-        if not bool(getattr(self, "_chk_timeslice_sync", None) and self._chk_timeslice_sync.isChecked()):
-            self._clear_timeslice_crosshair()
-            return
-        if self.iface is None or not self._profiles:
-            self._clear_timeslice_crosshair()
-            return
-        m = self._cursor_metrics()
-        if not m:
-            self._clear_timeslice_crosshair()
-            return
-        east = m.get("east")
-        north = m.get("north")
-        if east is None or north is None:
-            self._clear_timeslice_crosshair()
-            return
-        try:
-            east_f = float(east)
-            north_f = float(north)
-        except Exception:
-            self._clear_timeslice_crosshair()
-            return
-        if not (np.isfinite(east_f) and np.isfinite(north_f)):
-            self._clear_timeslice_crosshair()
-            return
-        prof = self._profiles[self._prof_idx]
-        canvas = self.iface.mapCanvas()
-        if canvas is None:
-            self._clear_timeslice_crosshair()
-            return
-        try:
-            size = float(getattr(self, "_spin_crosshair_size").value())
-        except Exception:
-            size = float(getattr(self, "_crosshair_size_m", 5.0) or 5.0)
-        size = float(np.clip(size, 0.5, 1000.0))
-
-        if self._rb_crosshair_h is None:
-            self._rb_crosshair_h = QgsRubberBand(canvas, QgsWkbTypes.LineGeometry)
-            self._rb_crosshair_h.setColor(QColor(255, 50, 50))
-            self._rb_crosshair_h.setWidth(2)
-        if self._rb_crosshair_v is None:
-            self._rb_crosshair_v = QgsRubberBand(canvas, QgsWkbTypes.LineGeometry)
-            self._rb_crosshair_v.setColor(QColor(255, 50, 50))
-            self._rb_crosshair_v.setWidth(2)
-
-        try:
-            self._rb_crosshair_h.reset(QgsWkbTypes.LineGeometry)
-            p_left = self._to_canvas_point(prof, east_f - size, north_f)
-            p_right = self._to_canvas_point(prof, east_f + size, north_f)
-            self._rb_crosshair_h.addPoint(p_left, False)
-            self._rb_crosshair_h.addPoint(p_right, True)
-            self._rb_crosshair_h.setVisible(True)
-        except Exception:
-            pass
-        try:
-            self._rb_crosshair_v.reset(QgsWkbTypes.LineGeometry)
-            p_bottom = self._to_canvas_point(prof, east_f, north_f - size)
-            p_top = self._to_canvas_point(prof, east_f, north_f + size)
-            self._rb_crosshair_v.addPoint(p_bottom, False)
-            self._rb_crosshair_v.addPoint(p_top, True)
-            self._rb_crosshair_v.setVisible(True)
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # Timeslice
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _parse_slice_depth_label(label: str) -> Optional[float]:
-        tok = str(label or "").strip().lower()
-        if not tok:
-            return None
-        sign = -1.0 if tok.startswith("m") else 1.0
-        if tok.startswith("m"):
-            tok = tok[1:]
-        if "_" in tok:
-            tok = tok.replace("_", ".", 1)
-        try:
-            return sign * float(tok)
-        except Exception:
-            return None
-
-    def _scan_slice_catalog(self, outdir: str, dz: float) -> list[dict]:
-        base = str(outdir or "").strip()
-        if not base or not os.path.isdir(base):
-            return []
-
-        # Manifesto autorevole: se c'e' un sliceset.json valido leggi da li'
-        # profondita'/ordine/nomi invece di dedurli dai nomi file.
-        try:
-            from . import slice_manifest as _sm
-            if _sm.has_sliceset(base):
-                rows = _sm.slice_catalog_from_sliceset(base)
-                if rows:
-                    rows.sort(key=lambda it: (float(it.get("z_center", 0.0)),
-                                              int(it.get("index", 0))))
-                    self._slice_catalog_from_manifest = True
-                    return rows
-        except Exception:
-            pass
-        self._slice_catalog_from_manifest = False
-
-        paths = sorted(glob.glob(os.path.join(base, "slice_*.tif")))
-        if not paths:
-            paths = sorted(glob.glob(os.path.join(base, "slice_*.tiff")))
-        if not paths:
-            return []
-
-        catalog = []
-        centers = []
-        for fallback_idx, path in enumerate(paths):
-            name = os.path.basename(path)
-            idx = fallback_idx
-            z_center = None
-            m = re.search(r"^slice_(\d+)_z([A-Za-z0-9_]+)\.tiff?$", name, flags=re.IGNORECASE)
-            if m:
-                try:
-                    idx = int(m.group(1))
-                except Exception:
-                    idx = fallback_idx
-                z_center = self._parse_slice_depth_label(m.group(2))
-            if z_center is not None and np.isfinite(z_center):
-                centers.append(float(z_center))
-            catalog.append(
-                {
-                    "path": os.path.normpath(path),
-                    "index": int(idx),
-                    "z_center": float(z_center) if z_center is not None else None,
-                    "name": os.path.splitext(name)[0],
-                }
-            )
-
-        catalog.sort(key=lambda item: (int(item.get("index", 0)), str(item.get("path", ""))))
-
-        dz_use = float(dz) if np.isfinite(dz) and float(dz) > 0.0 else 0.0
-        if dz_use <= 0.0:
-            z_vals = [
-                float(item["z_center"])
-                for item in catalog
-                if item.get("z_center") is not None and np.isfinite(float(item.get("z_center")))
-            ]
-            if len(z_vals) >= 2:
-                z_vals = sorted(z_vals)
-                diffs = np.diff(np.asarray(z_vals, dtype=np.float64))
-                diffs = diffs[np.isfinite(diffs) & (diffs > 1e-9)]
-                if diffs.size > 0:
-                    dz_use = float(np.nanmedian(diffs))
-        if dz_use <= 0.0:
-            dz_use = 0.10
-
-        for i, item in enumerate(catalog):
-            zc = item.get("z_center")
-            if zc is None or not np.isfinite(float(zc)):
-                z_top = float(i) * dz_use
-                z_center = z_top + 0.5 * dz_use
-            else:
-                z_center = float(zc)
-                z_top = z_center - 0.5 * dz_use
-            item["z_top"] = float(z_top)
-            item["z_bot"] = float(z_top + dz_use)
-            item["z_center"] = float(z_center)
-        return catalog
-
-    def _refresh_slice_catalog(
-        self,
-        outdir: str,
-        dz: float,
-        reset_index: bool = False,
-        redraw: bool = True,
-    ):
-        base = os.path.normpath(str(outdir or "").strip()) if str(outdir or "").strip() else ""
-        catalog = self._scan_slice_catalog(base, dz)
-        self._slice_catalog = list(catalog or [])
-        self._slice_catalog_source_dir = base
-        try:
-            self._slice_catalog_dz = float(dz) if np.isfinite(float(dz)) else 0.0
-        except Exception:
-            self._slice_catalog_dz = 0.0
-        if not self._slice_catalog:
-            self._slice_current_idx = None
-        else:
-            if reset_index or self._slice_current_idx is None:
-                self._slice_current_idx = 0
-            else:
-                self._slice_current_idx = int(
-                    np.clip(int(self._slice_current_idx), 0, len(self._slice_catalog) - 1)
-                )
-        self._update_slice_navigator()
-        if redraw:
-            self._slice_view_xlim = None
-            self._slice_view_ylim = None
-            self._redraw_slice_view(force=True)
-
-    def _on_slice_depth_slider(self, value: int):
-        if self._updating_slice_nav:
-            return
-        if not self._slice_catalog:
-            return
-        idx = int(np.clip(int(value), 0, len(self._slice_catalog) - 1))
-        if self._slice_current_idx == idx:
-            return
-        self._slice_current_idx = idx
-        try:
-            center = float(self._slice_catalog[idx].get("z_center"))
-            if np.isfinite(center):
-                self._cursor_z = center
-        except Exception:
-            pass
-        self._update_slice_navigator()
-        self._redraw_slice_view(force=True)
-        self._update_timeslice_visibility_in_canvas()
-
-    def _step_slice(self, delta: int):
-        if not self._slice_catalog:
-            return
-        curr = int(self._slice_current_idx if self._slice_current_idx is not None else 0)
-        nxt = int(np.clip(curr + int(delta), 0, len(self._slice_catalog) - 1))
-        if self._slider_slice_depth is not None:
-            self._slider_slice_depth.setValue(nxt)
-        else:
-            self._on_slice_depth_slider(nxt)
-
-    def _update_slice_navigator(self):
-        has_slider = hasattr(self, "_slider_slice_depth") and self._slider_slice_depth is not None
-        if (not has_slider) or (not hasattr(self, "_lbl_slice_nav")):
-            return
-        if not self._slice_catalog:
-            self._updating_slice_nav = True
-            try:
-                self._slider_slice_depth.setRange(0, 0)
-                self._slider_slice_depth.setValue(0)
-                self._slider_slice_depth.setEnabled(False)
-            finally:
-                self._updating_slice_nav = False
-            if self._is_qt_alive(getattr(self, "_btn_slice_up", None)):
-                self._btn_slice_up.setEnabled(False)
-            if self._is_qt_alive(getattr(self, "_btn_slice_down", None)):
-                self._btn_slice_down.setEnabled(False)
-            self._safe_set_text(self._lbl_slice_nav, "\u2014 nessuna slice \u2014")
-            if hasattr(self, "_lbl_slice_depth_top"):
-                self._safe_set_text(self._lbl_slice_depth_top, "0.00 m")
-            if hasattr(self, "_lbl_slice_depth_bottom"):
-                self._safe_set_text(self._lbl_slice_depth_bottom, "\u2014")
-            return
-
-        idx = int(self._slice_current_idx if self._slice_current_idx is not None else 0)
-        idx = int(np.clip(idx, 0, len(self._slice_catalog) - 1))
-        self._slice_current_idx = idx
-        n = int(len(self._slice_catalog))
-        entry = self._slice_catalog[idx]
-        z_top = float(entry.get("z_top", 0.0) or 0.0)
-        z_bot = float(entry.get("z_bot", z_top) or z_top)
-
-        self._updating_slice_nav = True
-        try:
-            self._slider_slice_depth.setRange(0, n - 1)
-            self._slider_slice_depth.setValue(idx)
-            self._slider_slice_depth.setEnabled(True)
-        finally:
-            self._updating_slice_nav = False
-        if self._is_qt_alive(getattr(self, "_btn_slice_up", None)):
-            self._btn_slice_up.setEnabled(idx > 0)
-        if self._is_qt_alive(getattr(self, "_btn_slice_down", None)):
-            self._btn_slice_down.setEnabled(idx < (n - 1))
-
-        self._safe_set_text(self._lbl_slice_nav, f"Slice {idx + 1}/{n}  |  {z_top:.2f}-{z_bot:.2f} m")
-        if hasattr(self, "_lbl_slice_depth_top"):
-            self._safe_set_text(self._lbl_slice_depth_top, "0.00 m")
-        if hasattr(self, "_lbl_slice_depth_bottom"):
-            z_max = float(self._slice_catalog[-1].get("z_bot", z_bot) or z_bot)
-            self._safe_set_text(self._lbl_slice_depth_bottom, f"{z_max:.2f} m")
-
-    def _on_timeslice_build_finished(self, ok: bool, payload: dict | None = None):
-        if not bool(ok):
-            return
-        data = dict(payload or {})
-        outdir = str(data.get("output_dir") or "").strip()
-        if not outdir:
-            outdir = str(getattr(self, "_le_slice_outdir", None).text() if hasattr(self, "_le_slice_outdir") else "").strip()
-        if outdir and hasattr(self, "_le_slice_outdir") and self._le_slice_outdir is not None:
-            try:
-                self._le_slice_outdir.setText(os.path.normpath(outdir))
-            except Exception:
-                pass
-        dz = data.get("z_step")
-        if dz is None:
-            try:
-                dz = float(self._spin_slice_thickness.value())
-            except Exception:
-                dz = 0.10
-        try:
-            dz_f = float(dz)
-        except Exception:
-            dz_f = 0.10
-        if hasattr(self, "_chk_slice_thickness_locked") and self._chk_slice_thickness_locked is not None:
-            self._chk_slice_thickness_locked.setChecked(True)
-        self._refresh_slice_catalog(outdir, dz=dz_f, reset_index=True, redraw=True)
-        self._save_gpr_processing_project_meta(
-            last_timeslice=self._path_to_gpr_processing_store(outdir),
-        )
-
-    def _default_slice_output_dir(self) -> str:
-        paths = self._ensure_gpr_processing_layout()
-        if paths:
-            return os.path.normpath(paths.get("timeslices", ""))
-        project_root = self._active_project_root()
-        if project_root and os.path.isdir(project_root):
-            return os.path.normpath(os.path.join(project_root, "timeslices_2d"))
-        return ""
-
-    def _choose_slice_outdir(self):
-        start = str(getattr(self, "_le_slice_outdir", None).text() if hasattr(self, "_le_slice_outdir") else "").strip()
-        if not start:
-            start = self._default_slice_output_dir() or os.path.expanduser("~")
-        folder = QFileDialog.getExistingDirectory(self, "Output folder Timeslice", start)
-        if folder:
-            try:
-                norm = os.path.normpath(folder)
-                self._le_slice_outdir.setText(norm)
-                try:
-                    dz = float(self._spin_slice_thickness.value())
-                except Exception:
-                    dz = 0.10
-                self._refresh_slice_catalog(norm, dz=dz, reset_index=True, redraw=True)
-                self._save_gpr_processing_project_meta(
-                    last_timeslice=self._path_to_gpr_processing_store(norm),
-                )
-            except Exception:
-                pass
-
-    def _update_slice_profile_info(self):
-        if not hasattr(self, "_lbl_slice_profiles") or self._lbl_slice_profiles is None:
-            return
-        n_prof = int(len(self._profiles or []))
-        if n_prof <= 0:
-            self._safe_set_text(self._lbl_slice_profiles, "Nessun profilo caricato")
-            return
-        total_traces = 0
-        for prof in self._profiles:
-            try:
-                if int(getattr(prof, "n_channels", 0) or 0) <= 0:
-                    continue
-                total_traces += int(prof.channel(0).data.shape[1])
-            except Exception:
-                continue
-        self._safe_set_text(self._lbl_slice_profiles, f"{n_prof} profili  |  ~{total_traces} tracce")
-
-    def _import_slices_to_canvas(self):
-        outdir = str(getattr(self, "_le_slice_outdir", None).text() if hasattr(self, "_le_slice_outdir") else "").strip()
-        if not outdir:
-            QMessageBox.warning(self, "Import Timeslice", "Seleziona prima la cartella output.")
-            return
-        if not os.path.isdir(outdir):
-            QMessageBox.warning(self, "Import Timeslice", "Cartella output non valida.")
-            return
-
-        tifs = sorted(glob.glob(os.path.join(outdir, "*.tif"))) + sorted(glob.glob(os.path.join(outdir, "*.tiff")))
-        if not tifs:
-            QMessageBox.information(self, "Import Timeslice", "Nessun GeoTIFF trovato nella cartella output.")
-            return
-
-        root = QgsProject.instance().layerTreeRoot()
-        existing = root.findGroup("GPR Timeslices")
-        if existing is not None:
-            try:
-                root.removeChildNode(existing)
-            except Exception:
-                pass
-        group = root.addGroup("GPR Timeslices")
-
-        added = 0
-        for tif in tifs:
-            name = os.path.splitext(os.path.basename(tif))[0]
-            rl = QgsRasterLayer(tif, name)
-            if not rl.isValid():
-                continue
-            QgsProject.instance().addMapLayer(rl, False)
-            group.addLayer(rl)
-            added += 1
-
-        for i, child in enumerate(group.children()):
-            try:
-                child.setItemVisibilityChecked(i == 0)
-            except Exception:
-                pass
-
-        if self.iface is not None and self.iface.mapCanvas() is not None:
-            try:
-                self.iface.mapCanvas().refresh()
-            except Exception:
-                pass
-        self._safe_set_text(
-            self._lbl_status,
-            f"Import completato: {added} layer nel gruppo 'GPR Timeslices'."
-        )
-        if added <= 0:
-            QMessageBox.warning(self, "Import Timeslice", "Nessun layer valido importato.")
-        else:
-            try:
-                dz = float(self._spin_slice_thickness.value())
-            except Exception:
-                dz = 0.10
-            self._refresh_slice_catalog(outdir, dz=dz, reset_index=False, redraw=True)
-            self._save_gpr_processing_project_meta(
-                last_timeslice=self._path_to_gpr_processing_store(outdir),
-            )
-
-    @staticmethod
-    def _set_combo_to_data(combo: QComboBox, value) -> None:
-        if combo is None:
-            return
-        idx = combo.findData(value)
-        if idx >= 0:
-            combo.setCurrentIndex(idx)
-
-    def _save_processed_variant(self):
-        """Applica la pipeline corrente a TUTTI i profili/canali dal grezzo e
-        salva i radargrammi processati come .npz in processed/<nome variante>.
-
-        A differenza di _apply_processing (solo RAM/anteprima), questo scrive
-        davvero i dati filtrati su disco, cosi' da poterli riusare per le
-        time-slice e confrontare varianti diverse.
-        """
-        if not self._profiles:
-            QMessageBox.information(
-                self, "Salva variante", "Importa almeno un profilo .ogpr prima."
-            )
-            return
-        paths = self._ensure_gpr_processing_layout()
-        if not paths:
-            QMessageBox.warning(
-                self, "Salva variante",
-                "Nessun workspace disponibile. Reimporta scegliendo una cartella di lavoro.",
-            )
-            return
-
-        name, ok = QInputDialog.getText(
-            self, "Salva variante processata",
-            "Nome variante (es. bp_bg, solo_bg):",
-        )
-        if not ok:
-            return
-        variant = "".join(
-            c if c.isalnum() or c in "_-" else "_" for c in str(name).strip()
-        ).strip("_")
-        if not variant:
-            QMessageBox.warning(self, "Salva variante", "Nome variante non valido.")
-            return
-
-        params = self._current_processing_params()
-        chain = params.get("chain_order")
-        variant_dir = os.path.join(paths["processed"], variant)
-        if os.path.isdir(variant_dir) and any(
-            f.lower().endswith(".npz") for f in os.listdir(variant_dir)
-        ):
-            ans = QMessageBox.question(
-                self, "Variante esistente",
-                f"La variante '{variant}' esiste gia'. Sovrascrivere i file processati?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if ans != QMessageBox.Yes:
-                return
-        os.makedirs(variant_dir, exist_ok=True)
-
-        from PyQt5.QtWidgets import QProgressDialog
-        from PyQt5.QtCore import Qt as _Qt
-
-        n = len(self._profiles)
-        prog = QProgressDialog("Salvataggio variante in corso...", "Annulla", 0, n, self)
-        prog.setWindowModality(_Qt.WindowModal)
-        prog.setMinimumDuration(0)
-        prog.setValue(0)
-
-        files = []
-        errors = []
-        for i, prof in enumerate(self._profiles):
-            if prog.wasCanceled():
-                break
-            try:
-                proc_by_ch = []
-                for ci in range(int(getattr(prof, "n_channels", 0) or 0)):
-                    raw = np.asarray(prof.channel(ci).data, dtype=np.float32)
-                    p_ch = params
-                    if params.get("kirchhoff") and params.get("kirchhoff_topo"):
-                        p_ch = dict(params)
-                        p_ch["kirchhoff_elev_m"] = self._profile_channel_elevation(prof, ci)
-                    out = apply_pipeline(
-                        raw, p_ch, dt_ns=prof.dt_ns,
-                        normalize_output=False, chain_order=chain,
-                    )
-                    proc_by_ch.append(out)
-                if proc_by_ch:
-                    fp = save_processed_profile_npz(
-                        variant_dir, prof, proc_by_ch, params, chain
-                    )
-                    files.append(fp)
-            except Exception as e:
-                errors.append(f"{os.path.basename(getattr(prof, 'path', '?'))}: {e}")
-            prog.setValue(i + 1)
-        prog.setValue(n)
-
-        if files:
-            try:
-                write_variant_manifest(variant_dir, variant, params, chain, files)
-            except Exception:
-                pass
-            try:
-                from . import variant_provenance as vp
-                parent = getattr(self, "_variant_parent_ctx", None)
-                if parent == variant:
-                    parent = None
-                vp.set_entry(
-                    paths["processed"], variant,
-                    parent=parent,
-                    chain=chain or params.get("chain_order"),
-                    step=self._last_enabled_step(params, chain),
-                    n_profiles=len(files),
-                )
-                # la prossima variante salvata discende da questa
-                self._variant_parent_ctx = variant
-            except Exception:
-                pass
-            self._refresh_slice_variant_choices()
-        if errors:
-            QMessageBox.warning(
-                self, "Salva variante",
-                f"Salvati {len(files)}/{n} profili.\nErrori:\n" + "\n".join(errors[:8]),
-            )
-        elif files:
-            QMessageBox.information(
-                self, "Salva variante",
-                f"Variante '{variant}' salvata: {len(files)} profili in\n{variant_dir}",
-            )
-        else:
-            QMessageBox.warning(self, "Salva variante", "Nessun profilo salvato.")
-        try:
-            self._save_gpr_processing_project_meta(
-                last_processing=self._path_to_gpr_processing_store(variant_dir)
-            )
-        except Exception:
-            pass
-
-    def _blend_multifreq_to_variant(self):
-        """Fonde antenne dual/triple frequenza in un unico radargramma
-        (somma pesata + allineamento tempo-zero) e salva il risultato come
-        variante a 1 canale.
-
-        Due sorgenti:
-          * i canali del profilo corrente (dati multicanale in un solo file);
-          * piu' profili caricati (antenna dual-freq esportata come file
-            separati, es. L1_LF + L1_HF): li si seleziona e vengono fusi in
-            un unico profilo di uscita.
-        La frequenza nominale dell'antenna NON serve per la fusione: conta solo
-        che le sorgenti siano lo stesso tracciato.
-        """
-        if not self._profiles:
-            QMessageBox.information(self, "Combina multi-frequenza",
-                                   "Importa almeno un profilo prima.")
-            return
-        n_ch = int(getattr(self._profiles[self._prof_idx], "n_channels", 0) or 0)
-        n_prof = len(self._profiles)
-        if n_ch < 2 and n_prof < 2:
-            QMessageBox.information(
-                self, "Combina multi-frequenza",
-                "Serve un profilo con >=2 canali, oppure >=2 profili caricati\n"
-                "(un file per frequenza dello stesso tracciato).",
-            )
-            return
-        paths = self._ensure_gpr_processing_layout()
-        if not paths:
-            QMessageBox.warning(self, "Combina multi-frequenza",
-                                "Nessun workspace disponibile.")
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Combina multi-frequenza")
-        outer = QVBoxLayout(dlg)
-        cb_source = QComboBox()
-        if n_ch >= 2:
-            cb_source.addItem(f"Canali del profilo corrente ({n_ch})", "channels")
-        if n_prof >= 2:
-            cb_source.addItem(f"Profili caricati ({n_prof})", "profiles")
-        form_top = QFormLayout()
-        form_top.addRow("Sorgente:", cb_source)
-        outer.addLayout(form_top)
-        outer.addWidget(QLabel(
-            "Seleziona SOLO sorgenti dello stesso tracciato.\n"
-            "Peso e shift tempo-zero (campioni) per sorgente:"
-        ))
-
-        rows_box = QWidget()
-        rows_lay = QVBoxLayout(rows_box)
-        rows_lay.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(rows_box)
-        cb_target = QComboBox()
-        le_name = QLineEdit("blend")
-        form_bot = QFormLayout()
-        form_bot.addRow("Sorgente target (asse tempi/geometria):", cb_target)
-        form_bot.addRow("Nome variante:", le_name)
-        outer.addLayout(form_bot)
-        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
-        outer.addWidget(bb)
-
-        state = {"rows": []}
-
-        def _rebuild_rows():
-            for i in reversed(range(rows_lay.count())):
-                it = rows_lay.takeAt(i)
-                if it.widget():
-                    it.widget().setParent(None)
-            state["rows"] = []
-            cb_target.clear()
-            src = str(cb_source.currentData() or "channels")
-            if src == "channels":
-                labels = [f"Canale {ci}" for ci in range(n_ch)]
-            else:
-                labels = [
-                    os.path.basename(getattr(p, "path", f"prof {i}") or f"prof {i}")
-                    for i, p in enumerate(self._profiles)
-                ]
-            for k, lab in enumerate(labels):
-                chk = QCheckBox(lab)
-                chk.setChecked(src == "channels" or k < 2)
-                ws = QDoubleSpinBox(); ws.setRange(0.0, 10.0); ws.setSingleStep(0.05)
-                ws.setDecimals(3); ws.setValue(round(1.0 / max(2, len(labels)), 3))
-                ss = QSpinBox(); ss.setRange(-8192, 8192); ss.setValue(0)
-                rw = QWidget(); rl = QHBoxLayout(rw); rl.setContentsMargins(0, 0, 0, 0)
-                rl.addWidget(chk, 1)
-                rl.addWidget(QLabel("peso")); rl.addWidget(ws)
-                rl.addWidget(QLabel("shift t0")); rl.addWidget(ss)
-                rows_lay.addWidget(rw)
-                state["rows"].append((k, lab, chk, ws, ss))
-                cb_target.addItem(lab, k)
-
-        cb_source.currentIndexChanged.connect(lambda _i: _rebuild_rows())
-        _rebuild_rows()
-        if dlg.exec_() != QDialog.Accepted:
-            return
-
-        src = str(cb_source.currentData() or "channels")
-        chosen = [(k, w.value(), s.value()) for (k, _l, c, w, s) in state["rows"] if c.isChecked()]
-        if len(chosen) < 2:
-            QMessageBox.warning(self, "Combina multi-frequenza",
-                                "Seleziona almeno 2 sorgenti.")
-            return
-        idxs = [k for (k, _w, _s) in chosen]
-        weights = [float(w) for (_k, w, _s) in chosen]
-        shifts = [int(s) for (_k, _w, s) in chosen]
-        target_k = int(cb_target.currentData() or idxs[0])
-        try:
-            target_pos = idxs.index(target_k)
-        except ValueError:
-            target_pos = 0
-        variant = "".join(
-            c if c.isalnum() or c in "_-" else "_" for c in str(le_name.text()).strip()
-        ).strip("_") or "blend"
-        variant_dir = os.path.join(paths["processed"], variant)
-        os.makedirs(variant_dir, exist_ok=True)
-        meta = {"blend": {"source": src, "indices": idxs, "weights": weights,
-                          "t0_shift_samples": shifts, "target": target_k}}
-
-        files, errors = [], []
-        try:
-            if src == "channels":
-                prof = self._profiles[self._prof_idx]
-                arrs = [np.asarray(prof.channel(ci).data, dtype=np.float32) for ci in idxs]
-                dts = [float(getattr(prof, "dt_ns", 0.1) or 0.1)] * len(arrs)
-                blend = multifreq_blend(arrs, weights, dts, shifts, target=target_pos)
-                # scrivo un profilo mono-canale usando la geometria del canale target
-                fp = save_processed_profile_npz(variant_dir, prof, [blend], meta, [])
-                files.append(fp)
-            else:
-                sel_profs = [self._profiles[k] for k in idxs]
-                arrs = [np.asarray(p.channel(0).data, dtype=np.float32) for p in sel_profs]
-                dts = [float(getattr(p, "dt_ns", 0.1) or 0.1) for p in sel_profs]
-                blend = multifreq_blend(arrs, weights, dts, shifts, target=target_pos)
-                fp = save_processed_profile_npz(
-                    variant_dir, sel_profs[target_pos], [blend], meta, []
-                )
-                files.append(fp)
-        except Exception as e:
-            errors.append(str(e))
-
-        if files:
-            try:
-                write_variant_manifest(variant_dir, variant, meta, [], files)
-            except Exception:
-                pass
-            QMessageBox.information(
-                self, "Combina multi-frequenza",
-                f"Variante '{variant}' salvata ({len(files)} radargramma/i).\n"
-                "Aprila dalla scheda 'Varianti' per generare le time-slice.",
-            )
-            try:
-                self._refresh_variants_list()
-            except Exception:
-                pass
-        else:
-            QMessageBox.warning(self, "Combina multi-frequenza",
-                                "Fusione non riuscita:\n" + "\n".join(errors[:5]))
-
-    def _filter_timeslices_grid(self):
-        """Applica un filtro nel dominio griglia a tutte le GeoTIFF di un set di
-        time-slice, scrivendo un nuovo set filtrato accanto."""
-        start = str(self._le_slice_outdir.text() or "").strip() if self._is_qt_alive(
-            getattr(self, "_le_slice_outdir", None)) else ""
-        if not start or not os.path.isdir(start):
-            paths = self._gpr_processing_paths()
-            start = (paths.get("timeslices", "") if paths else "") or os.path.expanduser("~")
-        folder = QFileDialog.getExistingDirectory(
-            self, "Cartella time-slice (GeoTIFF) da filtrare", start
-        )
-        if not folder:
-            return
-        tifs = sorted(
-            glob.glob(os.path.join(folder, "*.tif"))
-            + glob.glob(os.path.join(folder, "*.tiff"))
-        )
-        if not tifs:
-            QMessageBox.warning(self, "Filtra time-slice",
-                                "Nessuna GeoTIFF nella cartella selezionata.")
-            return
-        try:
-            from .raster_io import (
-                read_tif_singleband, write_tif_singleband, write_qml_singleband,
-            )
-            from . import grid_filters as gf
-        except Exception as exc:
-            QMessageBox.critical(self, "Filtra time-slice",
-                                 f"Modulo non disponibile:\n{exc}")
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Filtra time-slice (dominio griglia)")
-        fl = QFormLayout(dlg)
-        cb = QComboBox()
-        cb.addItem("Passa-basso 3x3", ("lowpass", 3))
-        cb.addItem("Passa-basso 5x5", ("lowpass", 5))
-        cb.addItem("Passa-basso 7x7", ("lowpass", 7))
-        cb.addItem("Passa-alto 3x3", ("hipass", 3))
-        cb.addItem("Laplaciano (enfasi bordi)", ("laplacian", 0))
-        cb.addItem("Background di linea — X (righe)", ("bg_x", 0))
-        cb.addItem("Background di linea — Y (colonne)", ("bg_y", 0))
-        cb.addItem("Notch FFT direzionale", ("fftnotch", 0))
-        fl.addRow("Filtro:", cb)
-        sp_len = QSpinBox(); sp_len.setRange(0, 99999); sp_len.setValue(0)
-        sp_len.setToolTip("Lunghezza del filtro di linea in celle (0 = intera linea).")
-        sp_clip = QDoubleSpinBox(); sp_clip.setRange(50.0, 100.0); sp_clip.setValue(100.0)
-        sp_clip.setToolTip("Background di linea: esclude dal calcolo i valori sopra\n"
-                           "questo percentile della linea (protegge i target forti).")
-        sp_ang = QDoubleSpinBox(); sp_ang.setRange(0.0, 180.0); sp_ang.setValue(0.0)
-        sp_ang.setSuffix(" °")
-        sp_hw = QDoubleSpinBox(); sp_hw.setRange(1.0, 45.0); sp_hw.setValue(10.0)
-        sp_hw.setSuffix(" °")
-        le_suffix = QLineEdit("filt")
-        fl.addRow("Lunghezza filtro linea:", sp_len)
-        fl.addRow("Clip percentile (bg linea):", sp_clip)
-        fl.addRow("Angolo (notch FFT):", sp_ang)
-        fl.addRow("Semi-larghezza (notch FFT):", sp_hw)
-        fl.addRow("Suffisso cartella output:", le_suffix)
-        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
-        fl.addRow(bb)
-        if dlg.exec_() != QDialog.Accepted:
-            return
-
-        kind, param = cb.currentData()
-        suffix = "".join(c if c.isalnum() or c in "_-" else "_"
-                         for c in str(le_suffix.text()).strip()).strip("_") or "filt"
-        out_dir = os.path.normpath(folder).rstrip("\\/") + "_" + suffix
-        os.makedirs(out_dir, exist_ok=True)
-
-        from PyQt5.QtWidgets import QProgressDialog
-        from PyQt5.QtCore import Qt as _Qt
-        prog = QProgressDialog("Filtraggio time-slice...", "Annulla", 0, len(tifs), self)
-        prog.setWindowModality(_Qt.WindowModal)
-        prog.setMinimumDuration(0)
-
-        n_ok, errors = 0, []
-        for i, tif in enumerate(tifs):
-            if prog.wasCanceled():
-                break
-            try:
-                grid, x_min, y_min, y_max, res, epsg = read_tif_singleband(tif)
-                if kind == "lowpass":
-                    out = gf.lowpass(grid, int(param))
-                elif kind == "hipass":
-                    out = gf.hipass(grid, int(param))
-                elif kind == "laplacian":
-                    out = gf.laplacian(grid)
-                elif kind == "bg_x":
-                    out = gf.line_background(grid, "x", int(sp_len.value()),
-                                            0.0, float(sp_clip.value()))
-                elif kind == "bg_y":
-                    out = gf.line_background(grid, "y", int(sp_len.value()),
-                                            0.0, float(sp_clip.value()))
-                elif kind == "fftnotch":
-                    out = gf.fft2d_directional_notch(
-                        grid, float(sp_ang.value()), float(sp_hw.value()), "reject"
-                    )
-                else:
-                    out = grid
-                out_path = os.path.join(out_dir, os.path.basename(tif))
-                write_tif_singleband(out, out_path, x_min, y_min, y_max, res, epsg or 0)
-                try:
-                    write_qml_singleband(out_path, out)
-                except Exception:
-                    pass
-                n_ok += 1
-            except Exception as e:
-                errors.append(f"{os.path.basename(tif)}: {e}")
-            prog.setValue(i + 1)
-        prog.setValue(len(tifs))
-
-        # porta con se' il manifesto (i nomi file combaciano)
-        src_manifest = os.path.join(folder, "sliceset.json")
-        if os.path.isfile(src_manifest):
-            try:
-                shutil.copy2(src_manifest, os.path.join(out_dir, "sliceset.json"))
-            except Exception:
-                pass
-
-        if n_ok:
-            msg = f"{n_ok}/{len(tifs)} time-slice filtrate in\n{out_dir}"
-            if errors:
-                msg += "\n\nErrori:\n" + "\n".join(errors[:5])
-            QMessageBox.information(self, "Filtra time-slice", msg)
-            if self._is_qt_alive(getattr(self, "_le_slice_outdir", None)):
-                self._le_slice_outdir.setText(out_dir)
-                try:
-                    dz0 = float(self._spin_slice_thickness.value())
-                except Exception:
-                    dz0 = 0.10
-                try:
-                    self._refresh_slice_catalog(out_dir, dz=dz0, reset_index=True, redraw=True)
-                except Exception:
-                    pass
-        else:
-            QMessageBox.warning(self, "Filtra time-slice",
-                                "Nessuna slice filtrata.\n" + "\n".join(errors[:5]))
-
-    # ------------------------------------------------------------------
-    # grid_geometry in UI — unione / rototraslazione di set di time-slice
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _gg_list_tifs(folder):
-        return sorted(
-            glob.glob(os.path.join(folder, "*.tif"))
-            + glob.glob(os.path.join(folder, "*.tiff"))
-        )
-
-    @staticmethod
-    def _gg_read_manifest(folder):
-        """Raw sliceset.json (dict) o None; niente rehydrate della spec."""
-        path = os.path.join(folder, "sliceset.json")
-        if not os.path.isfile(path):
-            return None
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else None
-        except Exception:
-            return None
-
-    def _gg_slice_start_dir(self):
-        start = str(self._le_slice_outdir.text() or "").strip() if self._is_qt_alive(
-            getattr(self, "_le_slice_outdir", None)) else ""
-        if not start or not os.path.isdir(start):
-            paths = self._gpr_processing_paths()
-            start = (paths.get("timeslices", "") if paths else "") or os.path.expanduser("~")
-        return start
-
-    def _gg_repoint_slice_view(self, out_dir):
-        if not self._is_qt_alive(getattr(self, "_le_slice_outdir", None)):
-            return
-        self._le_slice_outdir.setText(out_dir)
-        try:
-            dz0 = float(self._spin_slice_thickness.value())
-        except Exception:
-            dz0 = 0.10
-        try:
-            self._refresh_slice_catalog(out_dir, dz=dz0, reset_index=True, redraw=True)
-        except Exception:
-            pass
-
-    def _merge_timeslice_sets(self):
-        """Unisce 2+ cartelle di GeoTIFF (stessa cella, stessi z) in un set unico
-        via ``grid_geometry.append_grids`` (edge-match opzionale sulla giunzione)."""
-        try:
-            from .raster_io import read_tif_singleband, write_tif_singleband, write_qml_singleband
-            from . import grid_geometry as gg
-            from . import slice_manifest as sm
-        except Exception as exc:
-            QMessageBox.critical(self, "Unisci set di time-slice",
-                                 f"Modulo non disponibile:\n{exc}")
-            return
-
-        start = self._gg_slice_start_dir()
-        folders = []
-        while True:
-            title = ("Cartella time-slice #%d (Annulla per terminare)"
-                     % (len(folders) + 1)) if folders else "Prima cartella time-slice"
-            d = QFileDialog.getExistingDirectory(self, title, start)
-            if not d:
-                break
-            d = os.path.normpath(d)
-            if d in folders:
-                continue
-            if not self._gg_list_tifs(d):
-                QMessageBox.warning(self, "Unisci set di time-slice",
-                                    "Nessuna GeoTIFF in:\n" + d)
-                continue
-            folders.append(d)
-            start = os.path.dirname(d)
-            if len(folders) >= 2:
-                if QMessageBox.question(
-                    self, "Unisci set di time-slice",
-                    "Aggiungere un'altra cartella?",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-                ) != QMessageBox.Yes:
-                    break
-        if len(folders) < 2:
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Unisci set di time-slice")
-        fl = QFormLayout(dlg)
-        chk_em = QCheckBox("Edge-match sulla giunzione (pareggia la media)")
-        chk_em.setChecked(True)
-        cb_axis = QComboBox()
-        cb_axis.addItem("Affiancate lungo X (bordo verticale)", "x")
-        cb_axis.addItem("Impilate lungo Y (bordo orizzontale)", "y")
-        sp_ov = QSpinBox(); sp_ov.setRange(1, 999); sp_ov.setValue(3)
-        cb_overlap = QComboBox()
-        for lbl, val in (("Media", "mean"), ("Prima griglia", "first"), ("Ultima griglia", "last")):
-            cb_overlap.addItem(lbl, val)
-        le_suffix = QLineEdit("merged")
-        fl.addRow(chk_em)
-        fl.addRow("Asse giunzione (edge-match):", cb_axis)
-        fl.addRow("Celle di sovrapposizione:", sp_ov)
-        fl.addRow("Celle coperte da piu' griglie:", cb_overlap)
-        fl.addRow("Suffisso cartella output:", le_suffix)
-        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
-        fl.addRow(bb)
-        if dlg.exec_() != QDialog.Accepted:
-            return
-
-        do_em = bool(chk_em.isChecked())
-        em_axis = cb_axis.currentData()
-        em_ov = int(sp_ov.value())
-        overlap = cb_overlap.currentData()
-        suffix = "".join(c if c.isalnum() or c in "_-" else "_"
-                         for c in str(le_suffix.text()).strip()).strip("_") or "merged"
-        out_dir = os.path.normpath(folders[0]).rstrip("\\/") + "_" + suffix
-        os.makedirs(out_dir, exist_ok=True)
-
-        # indicizza ogni cartella per chiave z (manifesto se c'e', altrimenti
-        # posizione ordinata dei file)
-        manifests = [self._gg_read_manifest(f) for f in folders]
-        per_folder = []           # list[dict[zkey] -> (tif_path, z_from, z_to, z_center)]
-        for f, man in zip(folders, manifests):
-            tifs = self._gg_list_tifs(f)
-            entries = {}
-            if man and isinstance(man.get("slices"), list) and len(man["slices"]) == len(tifs):
-                for s in man["slices"]:
-                    gp = os.path.join(f, str(s.get("grid", "")))
-                    if not os.path.isfile(gp):
-                        entries = {}
-                        break
-                    zc = round(float(s.get("z_center", 0.0)), 4)
-                    entries[zc] = (gp, float(s.get("z_from", zc)),
-                                   float(s.get("z_to", zc)), float(s.get("z_center", zc)))
-            if not entries:
-                for i, gp in enumerate(tifs):
-                    entries[float(i)] = (gp, float(i), float(i), float(i))
-            per_folder.append(entries)
-
-        all_keys = sorted(set().union(*[set(d.keys()) for d in per_folder]))
-        if not all_keys:
-            QMessageBox.warning(self, "Unisci set di time-slice", "Nessuna slice da unire.")
-            return
-
-        from PyQt5.QtWidgets import QProgressDialog
-        from PyQt5.QtCore import Qt as _Qt
-        prog = QProgressDialog("Unione time-slice...", "Annulla", 0, len(all_keys), self)
-        prog.setWindowModality(_Qt.WindowModal)
-        prog.setMinimumDuration(0)
-
-        epsg_out = 0
-        for man in manifests:
-            if man and man.get("crs_epsg"):
-                epsg_out = int(man["crs_epsg"]); break
-
-        out_slices = []
-        n_ok, errors = 0, []
-        ext_xmin = ext_ymin = ext_xmax = ext_ymax = None
-        for i, zk in enumerate(all_keys):
-            if prog.wasCanceled():
-                break
-            try:
-                grids, meta = [], None
-                for entries in per_folder:
-                    if zk not in entries:
-                        continue
-                    gp, zf, zt, zc = entries[zk]
-                    arr, x_min, y_min, y_max, res, epsg = read_tif_singleband(gp)
-                    grids.append({"array": arr, "x0": x_min, "y0": y_min, "cell": res})
-                    if meta is None:
-                        meta = (zf, zt, zc)
-                    if not epsg_out and epsg:
-                        epsg_out = int(epsg)
-                if not grids:
-                    continue
-                if do_em and len(grids) >= 2:
-                    base = grids[0]
-                    for k in range(1, len(grids)):
-                        grids[k] = gg.edge_match(base, grids[k], axis=em_axis,
-                                                 overlap_cells=em_ov)
-                merged = grids[0] if len(grids) == 1 else gg.append_grids(grids, overlap=overlap)
-                arr = merged["array"]
-                x0, y0, cell = float(merged["x0"]), float(merged["y0"]), float(merged["cell"])
-                n_y, n_x = arr.shape
-                y_top = y0 + (n_y - 1) * cell
-                x_right = x0 + (n_x - 1) * cell
-                name = "slice_%04d.tif" % i
-                out_path = os.path.join(out_dir, name)
-                write_tif_singleband(arr, out_path, x0, y0, y_top, cell, epsg_out or 0)
-                try:
-                    write_qml_singleband(out_path, arr)
-                except Exception:
-                    pass
-                zf, zt, zc = meta if meta else (float(i), float(i), float(i))
-                out_slices.append({
-                    "index": i, "z_from": zf, "z_to": zt, "z_center": zc,
-                    "grid": name, "stats": sm.compute_slice_stats(arr),
-                })
-                hw = cell / 2.0
-                ext_xmin = (x0 - hw) if ext_xmin is None else min(ext_xmin, x0 - hw)
-                ext_ymin = (y0 - hw) if ext_ymin is None else min(ext_ymin, y0 - hw)
-                ext_xmax = (x_right + hw) if ext_xmax is None else max(ext_xmax, x_right + hw)
-                ext_ymax = (y_top + hw) if ext_ymax is None else max(ext_ymax, y_top + hw)
-                n_ok += 1
-            except Exception as e:
-                errors.append("z=%s: %s" % (zk, e))
-            prog.setValue(i + 1)
-        prog.setValue(len(all_keys))
-
-        # manifesto unito (se almeno una sorgente ne aveva uno)
-        base_man = next((m for m in manifests if m), None)
-        if base_man is not None and out_slices:
-            merged_man = dict(base_man)
-            merged_man["slices"] = out_slices
-            merged_man["extent"] = [ext_xmin, ext_ymin, ext_xmax, ext_ymax]
-            if epsg_out:
-                merged_man["crs_epsg"] = int(epsg_out)
-            src = dict(merged_man.get("source") or {})
-            src["merged_from"] = [os.path.basename(f) for f in folders]
-            merged_man["source"] = src
-            try:
-                with open(os.path.join(out_dir, "sliceset.json"), "w", encoding="utf-8") as f:
-                    json.dump(merged_man, f, indent=2, ensure_ascii=True, sort_keys=True)
-            except Exception:
-                pass
-
-        if n_ok:
-            msg = "%d/%d slice unite in\n%s" % (n_ok, len(all_keys), out_dir)
-            if errors:
-                msg += "\n\nErrori:\n" + "\n".join(errors[:5])
-            QMessageBox.information(self, "Unisci set di time-slice", msg)
-            self._gg_repoint_slice_view(out_dir)
-        else:
-            QMessageBox.warning(self, "Unisci set di time-slice",
-                                "Nessuna slice unita.\n" + "\n".join(errors[:5]))
-
-    def _rotate_translate_timeslice_set(self):
-        """Ruota/trasla ogni GeoTIFF di un set via
-        ``grid_geometry.rotate_translate`` e scrive un nuovo set ``_rt``."""
-        try:
-            from .raster_io import read_tif_singleband, write_tif_singleband, write_qml_singleband
-            from . import grid_geometry as gg
-            from . import slice_manifest as sm
-        except Exception as exc:
-            QMessageBox.critical(self, "Ruota/trasla set", f"Modulo non disponibile:\n{exc}")
-            return
-
-        folder = QFileDialog.getExistingDirectory(
-            self, "Cartella time-slice (GeoTIFF) da ruotare/traslare",
-            self._gg_slice_start_dir()
-        )
-        if not folder:
-            return
-        tifs = self._gg_list_tifs(folder)
-        if not tifs:
-            QMessageBox.warning(self, "Ruota/trasla set",
-                                "Nessuna GeoTIFF nella cartella selezionata.")
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Ruota/trasla set di time-slice")
-        fl = QFormLayout(dlg)
-        sp_ang = QDoubleSpinBox(); sp_ang.setRange(-360.0, 360.0); sp_ang.setDecimals(4)
-        sp_ang.setValue(0.0); sp_ang.setSuffix(" ° CCW")
-        sp_e = QDoubleSpinBox(); sp_e.setRange(-1e9, 1e9); sp_e.setDecimals(3); sp_e.setValue(0.0)
-        sp_n = QDoubleSpinBox(); sp_n.setRange(-1e9, 1e9); sp_n.setDecimals(3); sp_n.setValue(0.0)
-        cb_mode = QComboBox()
-        cb_mode.addItem("Angolo SW sorgente -> origine (fix_origin)", "fix_origin")
-        cb_mode.addItem("Angolo SW inviluppo ruotato -> origine (translate_origin)",
-                        "translate_origin")
-        le_suffix = QLineEdit("rt")
-        fl.addRow("Angolo:", sp_ang)
-        fl.addRow("Origine E:", sp_e)
-        fl.addRow("Origine N:", sp_n)
-        fl.addRow("Modo:", cb_mode)
-        fl.addRow("Suffisso cartella output:", le_suffix)
-        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
-        fl.addRow(bb)
-        if dlg.exec_() != QDialog.Accepted:
-            return
-
-        angle = float(sp_ang.value())
-        origin = (float(sp_e.value()), float(sp_n.value()))
-        mode = cb_mode.currentData()
-        suffix = "".join(c if c.isalnum() or c in "_-" else "_"
-                         for c in str(le_suffix.text()).strip()).strip("_") or "rt"
-        out_dir = os.path.normpath(folder).rstrip("\\/") + "_" + suffix
-        os.makedirs(out_dir, exist_ok=True)
-
-        man = self._gg_read_manifest(folder)
-        stats_by_name = {}
-
-        from PyQt5.QtWidgets import QProgressDialog
-        from PyQt5.QtCore import Qt as _Qt
-        prog = QProgressDialog("Rototraslazione time-slice...", "Annulla", 0, len(tifs), self)
-        prog.setWindowModality(_Qt.WindowModal)
-        prog.setMinimumDuration(0)
-
-        n_ok, errors = 0, []
-        ext_xmin = ext_ymin = ext_xmax = ext_ymax = None
-        for i, tif in enumerate(tifs):
-            if prog.wasCanceled():
-                break
-            try:
-                arr, x_min, y_min, y_max, res, epsg = read_tif_singleband(tif)
-                res_g = gg.rotate_translate(
-                    {"array": arr, "x0": x_min, "y0": y_min, "cell": res},
-                    angle, origin, mode=mode,
-                )
-                oarr = res_g["array"]
-                x0, y0, cell = float(res_g["x0"]), float(res_g["y0"]), float(res_g["cell"])
-                n_y, n_x = oarr.shape
-                y_top = y0 + (n_y - 1) * cell
-                x_right = x0 + (n_x - 1) * cell
-                out_path = os.path.join(out_dir, os.path.basename(tif))
-                write_tif_singleband(oarr, out_path, x0, y0, y_top, cell, epsg or 0)
-                try:
-                    write_qml_singleband(out_path, oarr)
-                except Exception:
-                    pass
-                stats_by_name[os.path.basename(tif)] = sm.compute_slice_stats(oarr)
-                hw = cell / 2.0
-                ext_xmin = (x0 - hw) if ext_xmin is None else min(ext_xmin, x0 - hw)
-                ext_ymin = (y0 - hw) if ext_ymin is None else min(ext_ymin, y0 - hw)
-                ext_xmax = (x_right + hw) if ext_xmax is None else max(ext_xmax, x_right + hw)
-                ext_ymax = (y_top + hw) if ext_ymax is None else max(ext_ymax, y_top + hw)
-                n_ok += 1
-            except Exception as e:
-                errors.append("%s: %s" % (os.path.basename(tif), e))
-            prog.setValue(i + 1)
-        prog.setValue(len(tifs))
-
-        if man is not None and n_ok:
-            new_man = dict(man)
-            slices = []
-            for s in (man.get("slices") or []):
-                s2 = dict(s)
-                nm = str(s.get("grid", ""))
-                if nm in stats_by_name:
-                    s2["stats"] = stats_by_name[nm]
-                slices.append(s2)
-            if slices:
-                new_man["slices"] = slices
-            new_man["extent"] = [ext_xmin, ext_ymin, ext_xmax, ext_ymax]
-            src = dict(new_man.get("source") or {})
-            src["rotate_translate"] = {"angle_deg": angle, "origin": list(origin), "mode": mode}
-            new_man["source"] = src
-            try:
-                with open(os.path.join(out_dir, "sliceset.json"), "w", encoding="utf-8") as f:
-                    json.dump(new_man, f, indent=2, ensure_ascii=True, sort_keys=True)
-            except Exception:
-                pass
-
-        if n_ok:
-            msg = "%d/%d slice rototraslate in\n%s" % (n_ok, len(tifs), out_dir)
-            if errors:
-                msg += "\n\nErrori:\n" + "\n".join(errors[:5])
-            QMessageBox.information(self, "Ruota/trasla set", msg)
-            self._gg_repoint_slice_view(out_dir)
-        else:
-            QMessageBox.warning(self, "Ruota/trasla set",
-                                "Nessuna slice scritta.\n" + "\n".join(errors[:5]))
-
-    # ------------------------------------------------------------------
-    # Pannello "Varianti" — elenco delle varianti processate su disco
-    # ------------------------------------------------------------------
-    def _build_variants_tab(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(6, 6, 6, 6)
-        lay.setSpacing(6)
-
-        lay.addWidget(QLabel(
-            "Varianti di radargrammi processati in GPR_Processing/processed/.\n"
-            "L'albero segue la provenienza (variant_graph.json): ogni variante\n"
-            "e' figlia di quella da cui e' stata derivata. Tasto destro per le azioni."
-        ))
-        self._tree_variants = QTreeWidget()
-        self._tree_variants.setHeaderLabels(["Variante", "Profili", "Ultimo step"])
-        self._tree_variants.setAlternatingRowColors(True)
-        self._tree_variants.setContextMenuPolicy(Qt.CustomContextMenu)
-        self._tree_variants.customContextMenuRequested.connect(self._on_variants_context_menu)
-        self._tree_variants.itemSelectionChanged.connect(self._on_variant_selection_changed)
-        self._tree_variants.itemDoubleClicked.connect(
-            lambda _it, _c: self._slice_selected_variant()
-        )
-        lay.addWidget(self._tree_variants, 1)
-
-        row = QHBoxLayout()
-        self._btn_variants_refresh = QPushButton("Aggiorna")
-        self._btn_variants_refresh.clicked.connect(self._refresh_variants_list)
-        self._btn_variants_newfrom = QPushButton("Nuova variante da qui")
-        self._btn_variants_newfrom.setEnabled(False)
-        self._btn_variants_newfrom.setToolTip(
-            "Carica la pipeline di questa variante nei controlli di processing\n"
-            "e la registra come genitore della prossima variante salvata."
-        )
-        self._btn_variants_newfrom.clicked.connect(self._new_variant_from_selected)
-        self._btn_variants_slice = QPushButton("Genera time-slice")
-        self._btn_variants_slice.setEnabled(False)
-        self._btn_variants_slice.setToolTip(
-            "Genera le time-slice dai .npz della variante selezionata,\n"
-            "senza riapplicare la pipeline (i dati sono gia' filtrati)."
-        )
-        self._btn_variants_slice.clicked.connect(self._slice_selected_variant)
-        self._btn_variants_open = QPushButton("Apri cartella")
-        self._btn_variants_open.setEnabled(False)
-        self._btn_variants_open.clicked.connect(self._open_selected_variant_folder)
-        row.addWidget(self._btn_variants_refresh)
-        row.addWidget(self._btn_variants_newfrom)
-        row.addWidget(self._btn_variants_slice)
-        row.addWidget(self._btn_variants_open)
-        lay.addLayout(row)
-
-        self._lbl_variant_detail = QLabel("—")
-        self._lbl_variant_detail.setWordWrap(True)
-        self._lbl_variant_detail.setStyleSheet("color: palette(mid);")
-        lay.addWidget(self._lbl_variant_detail)
-        return w
-
-    def _refresh_variants_list(self):
-        tree = getattr(self, "_tree_variants", None)
-        if not self._is_qt_alive(tree):
-            return
-        tree.clear()
-        if self._is_qt_alive(getattr(self, "_lbl_variant_detail", None)):
-            self._lbl_variant_detail.setText("—")
-        paths = self._gpr_processing_paths()
-        processed = paths.get("processed", "") if paths else ""
-        if not processed or not os.path.isdir(processed):
-            tree.addTopLevelItem(QTreeWidgetItem(["(nessun progetto GPR attivo)"]))
-            return
-        try:
-            dirs = list_variants(processed)
-        except Exception:
-            dirs = []
-        if not dirs:
-            tree.addTopLevelItem(QTreeWidgetItem(["(nessuna variante salvata)"]))
-            return
-
-        try:
-            from . import variant_provenance as vp
-        except Exception:
-            vp = None
-        entries = vp.load(processed) if vp is not None else {}
-
-        by_name = {}
-        for d in dirs:
-            man = read_variant_manifest(d) or {}
-            nm = str(man.get("name") or os.path.basename(os.path.normpath(d)))
-            chain = [s for s in (man.get("chain_order") or []) if s]
-            n_prof = int(man.get("n_profiles") or len(man.get("files") or []))
-            by_name[nm] = {
-                "dir": os.path.normpath(d),
-                "chain": chain,
-                "n_prof": n_prof,
-                "created": man.get("created", ""),
-            }
-
-        present = list(by_name.keys())
-        if vp is not None:
-            forest = vp.build_forest(entries, present)
-        else:
-            forest = [{"name": n, "meta": {}, "children": []} for n in present]
-
-        def _add(node, parent_item):
-            nm = node["name"]
-            info = by_name.get(nm, {})
-            chain = info.get("chain") or []
-            last_step = (entries.get(nm, {}) or {}).get("step") or (chain[-1] if chain else "")
-            it = QTreeWidgetItem([
-                nm, str(info.get("n_prof", "")), str(last_step or ""),
-            ])
-            it.setData(0, Qt.UserRole, info.get("dir", ""))
-            it.setData(0, Qt.UserRole + 1, {"chain": chain, "created": info.get("created", "")})
-            it.setToolTip(0, f"{info.get('dir','')}\ncatena: "
-                             f"{', '.join(chain) if chain else '(non registrata)'}")
-            if parent_item is None:
-                self._tree_variants.addTopLevelItem(it)
-            else:
-                parent_item.addChild(it)
-            for ch in node.get("children") or []:
-                _add(ch, it)
-
-        for root in forest:
-            _add(root, None)
-        tree.expandAll()
-        self._refresh_slice_variant_choices()
-
-    def _selected_variant_dir(self) -> str:
-        tree = getattr(self, "_tree_variants", None)
-        if not self._is_qt_alive(tree):
-            return ""
-        it = tree.currentItem()
-        if it is None:
-            return ""
-        d = it.data(0, Qt.UserRole)
-        return str(d) if d else ""
-
-    def _selected_variant_name(self) -> str:
-        tree = getattr(self, "_tree_variants", None)
-        if not self._is_qt_alive(tree):
-            return ""
-        it = tree.currentItem()
-        return str(it.text(0)) if it is not None else ""
-
-    def _on_variant_selection_changed(self):
-        d = self._selected_variant_dir()
-        has = bool(d)
-        for b in ("_btn_variants_slice", "_btn_variants_open", "_btn_variants_newfrom"):
-            w = getattr(self, b, None)
-            if self._is_qt_alive(w):
-                w.setEnabled(has)
-        tree = getattr(self, "_tree_variants", None)
-        it = tree.currentItem() if (has and self._is_qt_alive(tree)) else None
-        meta = it.data(0, Qt.UserRole + 1) if it is not None else None
-        if isinstance(meta, dict):
-            chain = ", ".join(meta.get("chain") or []) or "(catena non registrata)"
-            self._lbl_variant_detail.setText(f"Catena: {chain}\n{d}")
-        else:
-            self._lbl_variant_detail.setText("—")
-
-    def _on_variants_context_menu(self, pos):
-        tree = getattr(self, "_tree_variants", None)
-        if not self._is_qt_alive(tree):
-            return
-        it = tree.itemAt(pos)
-        if it is None or not it.data(0, Qt.UserRole):
-            return
-        tree.setCurrentItem(it)
-        menu = QMenu(tree)
-        act_new = menu.addAction("Nuova variante da qui")
-        act_slice = menu.addAction("Genera time-slice")
-        act_open = menu.addAction("Apri cartella")
-        menu.addSeparator()
-        act_del = menu.addAction("Elimina variante…")
-        chosen = menu.exec_(tree.viewport().mapToGlobal(pos))
-        if chosen == act_new:
-            self._new_variant_from_selected()
-        elif chosen == act_slice:
-            self._slice_selected_variant()
-        elif chosen == act_open:
-            self._open_selected_variant_folder()
-        elif chosen == act_del:
-            self._delete_selected_variant()
-
-    def _new_variant_from_selected(self):
-        d = self._selected_variant_dir()
-        name = self._selected_variant_name()
-        if not d or not os.path.isdir(d):
-            return
-        man = read_variant_manifest(d) or {}
-        params = man.get("pipeline_params") if isinstance(man.get("pipeline_params"), dict) else {}
-        if not params:
-            QMessageBox.warning(self, "Nuova variante da qui",
-                                "La variante non registra i parametri della pipeline "
-                                "(variant.json privo di 'pipeline_params').")
-            return
-        chain = [s for s in (man.get("chain_order") or params.get("chain_order") or []) if s]
-        try:
-            self._apply_pipeline_params_dict(dict(params), chain_order=chain)
-        except Exception as exc:
-            QMessageBox.critical(self, "Nuova variante da qui",
-                                 f"Impossibile caricare la pipeline:\n{exc}")
-            return
-        self._variant_parent_ctx = str(name)
-        self._safe_set_text(
-            self._lbl_status,
-            f"Pipeline della variante '{name}' caricata. La prossima variante "
-            f"salvata sara' registrata come sua figlia.",
-        )
-
-    def _delete_selected_variant(self):
-        d = self._selected_variant_dir()
-        name = self._selected_variant_name()
-        if not d or not os.path.isdir(d):
-            return
-        ans = QMessageBox.question(
-            self, "Elimina variante",
-            f"Eliminare la cartella della variante '{name}'?\n{d}\n\n"
-            "I .npz e il manifesto verranno rimossi. Operazione non annullabile.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if ans != QMessageBox.Yes:
-            return
-        try:
-            shutil.rmtree(d)
-        except Exception as exc:
-            QMessageBox.critical(self, "Elimina variante", f"Rimozione fallita:\n{exc}")
-            return
-        try:
-            paths = self._gpr_processing_paths()
-            processed = paths.get("processed", "") if paths else ""
-            if processed:
-                from . import variant_provenance as vp
-                vp.remove_entry(processed, name)
-        except Exception:
-            pass
-        self._refresh_variants_list()
-
-    def _slice_selected_variant(self):
-        d = self._selected_variant_dir()
-        if d:
-            self._slice_from_variant_folder(d)
-
-    def _open_selected_variant_folder(self):
-        d = self._selected_variant_dir()
-        if not d:
-            return
-        try:
-            from qgis.PyQt.QtGui import QDesktopServices
-            from qgis.PyQt.QtCore import QUrl
-            QDesktopServices.openUrl(QUrl.fromLocalFile(d))
-        except Exception:
-            QMessageBox.information(self, "Varianti", d)
-
-    def _build_slices_from_variant(self):
-        """Genera time-slice a partire da una variante di radargrammi gia'
-        processati (.npz), senza riapplicare la pipeline. Sceglie la cartella
-        con un dialog; per la selezione dal pannello Varianti vedi
-        `_slice_from_variant_folder`."""
-        paths = self._gpr_processing_paths()
-        start = paths.get("processed", "") if paths else ""
-        if not start or not os.path.isdir(start):
-            start = (paths.get("base", "") if paths else "") or os.path.expanduser("~")
-        folder = QFileDialog.getExistingDirectory(
-            self, "Seleziona cartella variante processata (.npz)", start
-        )
-        if not folder:
-            return
-        self._slice_from_variant_folder(folder)
-
-    def _variant_names_for_picker(self) -> list[str]:
-        """Nomi delle varianti salvate (cartelle in processed/ con .npz)."""
-        paths = self._gpr_processing_paths()
-        processed = paths.get("processed", "") if paths else ""
-        if not processed or not os.path.isdir(processed):
-            return []
-        out = []
-        try:
-            for d in list_variants(processed):
-                man = read_variant_manifest(d) or {}
-                nm = str(man.get("name") or os.path.basename(os.path.normpath(d))).strip()
-                # solo varianti con radargrammi affettabili
-                if nm and glob.glob(os.path.join(d, "*.npz")):
-                    out.append(nm)
-        except Exception:
-            return []
-        return sorted(set(out))
-
-    def _refresh_slice_variant_choices(self) -> None:
-        panel = getattr(self, "_slice_spec_panel", None)
-        if panel is not None and self._is_qt_alive(panel) and hasattr(panel, "set_variant_choices"):
-            try:
-                panel.set_variant_choices(self._variant_names_for_picker())
-            except Exception:
-                pass
-
-    def _variant_dir_for_name(self, name: str) -> str:
-        name = str(name or "").strip()
-        if not name or name.lower() == "raw":
-            return ""
-        paths = self._gpr_processing_paths()
-        processed = paths.get("processed", "") if paths else ""
-        if not processed:
-            return ""
-        d = os.path.join(processed, name)
-        return d if os.path.isdir(d) and glob.glob(os.path.join(d, "*.npz")) else ""
-
-    def _profiles_for_slicing(self):
-        """(profiles, variant_name) da usare per la generazione time-slice.
-
-        Se il pannello ha una 'Variante sorgente' diversa da 'raw' e la cartella
-        esiste con .npz, ritorna i radargrammi gia' filtrati caricati da disco
-        (il chiamante deve disabilitare la pipeline). Altrimenti i profili
-        correnti e ``""``.
-        """
-        panel = getattr(self, "_slice_spec_panel", None)
-        name = ""
-        if panel is not None and self._is_qt_alive(panel):
-            try:
-                name = str(panel.get_spec().source_variant or "").strip()
-            except Exception:
-                name = ""
-        d = self._variant_dir_for_name(name)
-        if not d:
-            return list(self._profiles or []), ""
-        npzs = sorted(glob.glob(os.path.join(d, "*.npz")))
-        try:
-            profs = [load_processed_profile_npz(p) for p in npzs]
-        except Exception as exc:
-            QMessageBox.warning(
-                self, "Variante sorgente",
-                f"Impossibile leggere i .npz della variante '{name}':\n{exc}\n\n"
-                "Uso i profili correnti.",
-            )
-            return list(self._profiles or []), ""
-        return profs, name
-
-    def _slice_from_variant_folder(self, folder: str):
-        """Carica i .npz di una cartella-variante e lancia la generazione slice."""
-        paths = self._gpr_processing_paths()
-        folder = os.path.normpath(str(folder or ""))
-        if not folder or not os.path.isdir(folder):
-            QMessageBox.warning(self, "Time-slice da variante", "Cartella non valida.")
-            return
-        npzs = sorted(glob.glob(os.path.join(folder, "*.npz")))
-        if not npzs:
-            QMessageBox.warning(
-                self, "Time-slice da variante",
-                "Nessun file .npz nella cartella selezionata.",
-            )
-            return
-        try:
-            profiles = [load_processed_profile_npz(p) for p in npzs]
-        except Exception as e:
-            QMessageBox.critical(
-                self, "Time-slice da variante", f"Errore lettura .npz: {e}"
-            )
-            return
-        if self.plugin is None or not hasattr(self.plugin, "import_ogpr_as_slices"):
-            QMessageBox.information(
-                self, "Time-slice da variante",
-                "Funzione disponibile dal plugin principale.",
-            )
-            return
-        try:
-            dz = float(self._spin_slice_thickness.value())
-        except Exception:
-            dz = 0.10
-        slice_params = self.get_slice_params()
-        # I dati sono gia' filtrati su disco: nessun ri-processing pipeline.
-        slice_params["use_processing"] = False
-        slice_params["pipeline_params"] = {}
-        slice_params["pre_slice_bg_removal"] = False
-        slice_params["z_step_override"] = float(dz)
-        slice_params["thickness_m"] = float(dz)
-        variant_name = os.path.basename(os.path.normpath(folder)) or "variante"
-        if paths.get("timeslices"):
-            slice_params["output_dir"] = os.path.join(paths["timeslices"], variant_name)
-        try:
-            self.plugin.import_ogpr_as_slices(
-                profiles, slice_params=slice_params,
-                completion_callback=self._on_timeslice_build_finished,
-            )
-        except TypeError:
-            self.plugin.import_ogpr_as_slices(profiles, slice_params=slice_params)
-
-    def _slice_pipeline_enabled_map(self) -> dict:
-        enabled = dict(self._pipeline_enabled_map_from_controls() or {})
-        if self._is_qt_alive(self._filter_chain_widget):
-            try:
-                from_widget = dict(self._filter_chain_widget.get_enabled_map() or {})
-                for sid, on in from_widget.items():
-                    enabled[str(sid)] = bool(on)
-            except Exception:
-                pass
-        return enabled
-
-    def _sync_slice_source_mode(self) -> None:
-        if not self._is_qt_alive(getattr(self, "_cb_slice_pipeline_source", None)):
-            return
-        mode = str(self._cb_slice_pipeline_source.currentData() or "auto").strip().lower()
-        manual = (mode == "manual")
-        for w in (
-            getattr(self, "_cb_slice_extraction", None),
-            getattr(self, "_chk_slice_use_hilbert", None),
-            getattr(self, "_chk_slice_use_processing", None),
-        ):
-            if self._is_qt_alive(w):
-                try:
-                    w.setEnabled(manual)
-                except Exception:
-                    pass
-
-    def _resolve_slice_source(
-        self,
-        proc_params: dict,
-        extraction_mode_manual: str,
-        use_hilbert_manual: bool,
-        use_processing_manual: bool,
-    ) -> tuple[dict, bool, str, bool, str]:
-        params = dict(proc_params or {})
-        chain_order = [str(s) for s in list(params.get("chain_order") or self._current_chain_order() or DEFAULT_CHAIN_ORDER)]
-        enabled_map = self._slice_pipeline_enabled_map()
-
-        def _is_enabled(step_id: str) -> bool:
-            if step_id in enabled_map:
-                return bool(enabled_map.get(step_id))
-            return bool(params.get(step_id, False))
-
-        mode = "auto"
-        if self._is_qt_alive(getattr(self, "_cb_slice_pipeline_source", None)):
-            mode = str(self._cb_slice_pipeline_source.currentData() or "auto").strip().lower()
-        if mode == "manual":
-            return params, bool(use_processing_manual), str(extraction_mode_manual), bool(use_hilbert_manual), "manual"
-
-        # Auto mode: prefer Hilbert/envelope when active, otherwise use last active step.
-        if mode == "auto":
-            if ("envelope" in chain_order) and _is_enabled("envelope"):
-                target = "envelope"
-            else:
-                target = next((sid for sid in reversed(chain_order) if _is_enabled(sid)), "raw")
-        elif mode == "raw":
-            target = "raw"
-        else:
-            target = str(mode)
-            if (target not in chain_order) or (not _is_enabled(target)):
-                target = next((sid for sid in reversed(chain_order) if _is_enabled(sid)), "raw")
-
-        if target == "raw":
-            return params, False, "las_like", False, "raw"
-
-        if target in chain_order:
-            truncated = chain_order[: chain_order.index(target) + 1]
-        else:
-            truncated = [sid for sid in chain_order if _is_enabled(sid)]
-        if not truncated:
-            return params, False, "las_like", False, "raw"
-
-        resolved = dict(params)
-        for sid in DEFAULT_CHAIN_ORDER:
-            resolved[sid] = bool(_is_enabled(sid) and (sid in truncated))
-        resolved["chain_order"] = list(truncated)
-
-        if target == "envelope":
-            extraction_mode = "envelope"
-            use_hilbert = True
-        else:
-            extraction_mode = "las_like"
-            use_hilbert = False
-        return resolved, True, extraction_mode, use_hilbert, target
-
-    def _apply_selected_timeslice_preset(self):
-        key = str(self._cb_slice_preset.currentData() or "base").strip().lower()
-        self._apply_timeslice_preset(key)
-
-    def _apply_timeslice_preset(self, preset_key: str):
-        key = str(preset_key or "base").strip().lower()
-        if key not in {"base", "quality", "aggressive"}:
-            key = "base"
-
-        if key == "quality":
-            cfg = {
-                "extraction_mode": "envelope",
-                "use_hilbert": True,
-                "use_processing": True,
-                "pre_slice_bg_removal": True,
-                "pre_slice_bg_mode": "line_by_line",
-                "pre_slice_bg_auto": True,
-                "pre_slice_bg_window": 200,
-                "pre_slice_bg_sample_start": 10,
-                "pre_slice_bg_sample_end": 0,
-                "stack_n": 3,
-                "stack_kernel": "triangular",
-                "flip_traces_mode": "none",
-                "topographic_correction": False,
-                "topo_reference_mode": "median",
-                "topo_reference_elevation": 0.0,
-                "normalize_channels": False,
-                "amplitude_filter": True,
-                "amplitude_sigma": 3.0,
-                "idw_mode": "quality",
-                "slice_source": "auto",
-                "search_radius": 0.0,
-                "idw_power": 2,
-                "overlap_fraction": 0.5,
-                "blanking_distance": 0.30,
-                "use_anisotropic_idw": True,
-                "auto_radius": True,
-                "balance_profiles": True,
-                "depth_radius_factor": 0.8,
-                "min_points": 2,
-                "parallel_profiles": True,
-                "profile_workers": 0,
-                "fill_nodata": True,
-                "smooth": True,
-                "smooth_sigma": 1.0,
-            }
-            lbl = "Preset timeslice: Qualita' applicato."
-        elif key == "aggressive":
-            cfg = {
-                "extraction_mode": "envelope",
-                "use_hilbert": True,
-                "use_processing": True,
-                "pre_slice_bg_removal": True,
-                "pre_slice_bg_mode": "grid_by_grid",
-                "pre_slice_bg_auto": False,
-                "pre_slice_bg_window": 300,
-                "pre_slice_bg_sample_start": 10,
-                "pre_slice_bg_sample_end": 0,
-                "stack_n": 5,
-                "stack_kernel": "triangular",
-                "flip_traces_mode": "none",
-                "topographic_correction": False,
-                "topo_reference_mode": "median",
-                "topo_reference_elevation": 0.0,
-                "normalize_channels": False,
-                "amplitude_filter": True,
-                "amplitude_sigma": 2.5,
-                "idw_mode": "quality",
-                "slice_source": "auto",
-                "search_radius": 0.0,
-                "idw_power": 3,
-                "overlap_fraction": 0.5,
-                "blanking_distance": 0.30,
-                "use_anisotropic_idw": True,
-                "auto_radius": True,
-                "balance_profiles": True,
-                "depth_radius_factor": 1.0,
-                "min_points": 3,
-                "parallel_profiles": True,
-                "profile_workers": 0,
-                "fill_nodata": True,
-                "smooth": True,
-                "smooth_sigma": 1.5,
-            }
-            lbl = "Preset timeslice: Aggressivo applicato."
-        else:
-            cfg = {
-                "extraction_mode": "las_like",
-                "use_hilbert": True,
-                "use_processing": True,
-                "pre_slice_bg_removal": True,
-                "pre_slice_bg_mode": "line_by_line",
-                "pre_slice_bg_auto": True,
-                "pre_slice_bg_window": 200,
-                "pre_slice_bg_sample_start": 10,
-                "pre_slice_bg_sample_end": 0,
-                "stack_n": 1,
-                "stack_kernel": "boxcar",
-                "flip_traces_mode": "none",
-                "topographic_correction": False,
-                "topo_reference_mode": "median",
-                "topo_reference_elevation": 0.0,
-                "normalize_channels": False,
-                "amplitude_filter": False,
-                "amplitude_sigma": 3.0,
-                "idw_mode": "quality",
-                "slice_source": "auto",
-                "search_radius": 0.0,
-                "idw_power": 2,
-                "overlap_fraction": 0.5,
-                "blanking_distance": 0.30,
-                "use_anisotropic_idw": False,
-                "auto_radius": True,
-                "balance_profiles": True,
-                "depth_radius_factor": 0.6,
-                "min_points": 1,
-                "parallel_profiles": True,
-                "profile_workers": 0,
-                "fill_nodata": True,
-                "smooth": True,
-                "smooth_sigma": 0.8,
-            }
-            lbl = "Preset timeslice: Base applicato."
-
-        self._set_combo_to_data(self._cb_slice_extraction, cfg["extraction_mode"])
-        self._chk_slice_use_hilbert.setChecked(bool(cfg.get("use_hilbert", True)))
-        self._chk_slice_use_processing.setChecked(bool(cfg["use_processing"]))
-        self._chk_slice_bg.setChecked(bool(cfg["pre_slice_bg_removal"]))
-        self._set_combo_to_data(self._cb_slice_bg_mode, cfg["pre_slice_bg_mode"])
-        self._chk_slice_bg_auto.setChecked(bool(cfg["pre_slice_bg_auto"]))
-        self._spin_slice_bg_window.setValue(int(cfg["pre_slice_bg_window"]))
-        self._spin_slice_bg_sample_start.setValue(int(cfg["pre_slice_bg_sample_start"]))
-        self._spin_slice_bg_sample_end.setValue(int(cfg["pre_slice_bg_sample_end"]))
-        self._spin_slice_stack_n.setValue(int(cfg["stack_n"]))
-        self._set_combo_to_data(self._cb_slice_stack_kernel, cfg["stack_kernel"])
-        self._set_combo_to_data(self._cb_slice_flip_mode, cfg["flip_traces_mode"])
-        self._chk_slice_topographic.setChecked(bool(cfg["topographic_correction"]))
-        self._set_combo_to_data(self._cb_slice_topo_ref_mode, cfg["topo_reference_mode"])
-        self._spin_slice_topo_ref_custom.setValue(float(cfg["topo_reference_elevation"]))
-        self._chk_normalize_ch.setChecked(bool(cfg["normalize_channels"]))
-        self._chk_amplitude_filter.setChecked(bool(cfg["amplitude_filter"]))
-        self._spin_amplitude_sigma.setValue(float(cfg["amplitude_sigma"]))
-        self._set_combo_to_data(self._cb_slice_idw_mode, cfg["idw_mode"])
-        self._spin_slice_search_radius.setValue(float(cfg.get("search_radius", 0.0) or 0.0))
-        self._set_combo_to_data(self._cb_slice_pipeline_source, str(cfg.get("slice_source", "auto") or "auto"))
-        self._spin_slice_idw_power.setValue(int(cfg.get("idw_power", 2)))
-        self._spin_slice_overlap_pct.setValue(int(round(float(cfg.get("overlap_fraction", 0.5)) * 100.0)))
-        self._spin_slice_blanking_m.setValue(float(cfg.get("blanking_distance", 0.30)))
-        self._chk_anisotropic_idw.setChecked(bool(cfg["use_anisotropic_idw"]))
-        self._chk_auto_radius.setChecked(bool(cfg["auto_radius"]))
-        self._chk_slice_balance_profiles.setChecked(bool(cfg["balance_profiles"]))
-        self._spin_slice_depth_radius_factor.setValue(float(cfg["depth_radius_factor"]))
-        self._spin_slice_min_points.setValue(int(cfg["min_points"]))
-        self._chk_slice_parallel_profiles.setChecked(bool(cfg["parallel_profiles"]))
-        self._spin_slice_profile_workers.setValue(int(cfg["profile_workers"]))
-        self._chk_fill_nodata.setChecked(bool(cfg["fill_nodata"]))
-        self._chk_smooth.setChecked(bool(cfg["smooth"]))
-        self._spin_smooth_sigma.setValue(float(cfg["smooth_sigma"]))
-
-        # Sync dependent controls if state has not emitted toggles.
-        self._spin_slice_bg_window.setEnabled(
-            bool(self._chk_slice_bg.isChecked()) and (not bool(self._chk_slice_bg_auto.isChecked()))
-        )
-        self._cb_slice_bg_mode.setEnabled(bool(self._chk_slice_bg.isChecked()))
-        self._chk_slice_bg_auto.setEnabled(bool(self._chk_slice_bg.isChecked()))
-        self._spin_slice_bg_sample_start.setEnabled(bool(self._chk_slice_bg.isChecked()))
-        self._spin_slice_bg_sample_end.setEnabled(bool(self._chk_slice_bg.isChecked()))
-        topo_on = bool(self._chk_slice_topographic.isChecked())
-        self._cb_slice_topo_ref_mode.setEnabled(topo_on)
-        self._spin_slice_topo_ref_custom.setEnabled(
-            topo_on and (str(self._cb_slice_topo_ref_mode.currentData() or "") == "custom")
-        )
-        self._spin_amplitude_sigma.setEnabled(bool(self._chk_amplitude_filter.isChecked()))
-        self._spin_smooth_sigma.setEnabled(bool(self._chk_smooth.isChecked()))
-        self._spin_slice_profile_workers.setEnabled(bool(self._chk_slice_parallel_profiles.isChecked()))
-        self._sync_slice_source_mode()
-
-        # I preset "Qualita'"/"Aggressivo" impostano parametri della sezione
-        # Esperto: senza abilitarla esplicitamente quei valori verrebbero
-        # ignorati da get_slice_params(). "Base" li riporta ai default e
-        # ricollassa la sezione per tornare alla vista semplice.
-        if self._is_qt_alive(getattr(self, "_btn_slice_expert", None)):
-            self._btn_slice_expert.setChecked(key != "base")
-
-        self._safe_set_text(self._lbl_status, lbl)
-
-    def get_slice_params(self) -> dict:
-        # Fase D: quando il pannello SliceSpec e' attivo e' l'unica sorgente
-        # dei parametri di generazione. Il dict restituito ha la stessa forma
-        # legacy (piu' la chiave "_spec") cosi' il resto della pipeline non
-        # cambia; il ramo Esperto sotto resta solo come fallback.
-        panel = getattr(self, "_slice_spec_panel", None)
-        if panel is not None and self._is_qt_alive(panel):
-            try:
-                from .slice_params_compat import spec_to_legacy_params
-
-                spec = panel.get_spec()
-                if self._profiles:
-                    spec = spec.resolve(self._profiles)
-                elif spec.z_max_m is None:
-                    from dataclasses import replace as _replace
-                    spec = _replace(spec, z_max_m=5.0)  # placeholder finche' non ci sono profili
-                open_3d = bool(
-                    self._is_qt_alive(getattr(self, "_chk_slice_open_3d_on_complete", None))
-                    and self._chk_slice_open_3d_on_complete.isChecked()
-                )
-                out = spec_to_legacy_params(
-                    spec, channel=-1, combine_method="mean",
-                    open_3d_on_complete=open_3d,
-                )
-                return out
-            except Exception as exc:
-                print(f"[GPR viewer][WARN] get_slice_params via SliceSpec fallito: {exc}")
-
-        # "Esperto" e' un flag: finche' non e' esplicitamente abilitato, questi
-        # campi vengono ignorati e si usa il comportamento di default, anche
-        # se i widget (nascosti) contengono un valore diverso.
-        expert_on = bool(
-            self._is_qt_alive(getattr(self, "_btn_slice_expert", None))
-            and self._btn_slice_expert.isChecked()
-        )
-        slice_bg_auto = bool(self._chk_slice_bg_auto.isChecked()) if expert_on else True
-        topo_mode = str(self._cb_slice_topo_ref_mode.currentData() or "median") if expert_on else "median"
-        topo_on = bool(self._chk_slice_topographic.isChecked()) if expert_on else False
-        topo_custom = None
-        if expert_on and topo_mode == "custom":
-            topo_custom = float(self._spin_slice_topo_ref_custom.value())
-        proc_params = dict(self._current_processing_params() or {})
-        proc_params, use_processing, extraction_mode, use_hilbert, source_step = self._resolve_slice_source(
-            proc_params,
-            extraction_mode_manual=(
-                str(self._cb_slice_extraction.currentData() or "las_like") if expert_on else "las_like"
-            ),
-            use_hilbert_manual=(bool(self._chk_slice_use_hilbert.isChecked()) if expert_on else True),
-            use_processing_manual=(bool(self._chk_slice_use_processing.isChecked()) if expert_on else True),
-        )
-        # For timeslice pre-processing, avoid surface over-saturation with conservative defaults
-        # when the panel is still using broad generic values.
-        if bool(use_processing):
-            try:
-                if int(proc_params.get("bg_sample_start", 0) or 0) <= 0:
-                    proc_params["bg_sample_start"] = 10
-            except Exception:
-                proc_params["bg_sample_start"] = 10
-            try:
-                agc_on = bool(proc_params.get("agc", False))
-                agc_win = int(proc_params.get("agc_win", 0) or 0)
-                if agc_on and agc_win >= 96:
-                    proc_params["agc_win"] = 32
-            except Exception:
-                pass
-        try:
-            search_radius = float(self._spin_slice_search_radius.value())
-        except Exception:
-            search_radius = 0.0
-        radius_override = None
-        if np.isfinite(search_radius) and search_radius > 0.0:
-            radius_override = float(search_radius)
-        auto_radius = radius_override is None
-        return {
-            "normalize_channels":  (self._chk_normalize_ch.isChecked() if expert_on else False),
-            "slice_source":        str(source_step or "auto"),
-            "extraction_mode":     str(extraction_mode or "las_like"),
-            "use_hilbert":         bool(use_hilbert),
-            "use_processing":      bool(use_processing),
-            "pre_slice_bg_removal": self._chk_slice_bg.isChecked(),
-            "pre_slice_bg_mode": (
-                str(self._cb_slice_bg_mode.currentData() or "line_by_line") if expert_on else "line_by_line"
-            ),
-            "pre_slice_bg_window": (0 if slice_bg_auto else int(self._spin_slice_bg_window.value())),
-            "pre_slice_bg_sample_start": (int(self._spin_slice_bg_sample_start.value()) if expert_on else 0),
-            "pre_slice_bg_sample_end": (int(self._spin_slice_bg_sample_end.value()) if expert_on else 0),
-            "stack_n": (int(self._spin_slice_stack_n.value()) if expert_on else 1),
-            "stack_kernel": (str(self._cb_slice_stack_kernel.currentData() or "boxcar") if expert_on else "boxcar"),
-            "flip_traces_mode": (str(self._cb_slice_flip_mode.currentData() or "none") if expert_on else "none"),
-            "pipeline_params": proc_params,
-            "topographic_correction": topo_on,
-            "topo_reference_mode": topo_mode,
-            "topo_reference_elevation": topo_custom,
-            "amplitude_sigma":     (
-                float(self._spin_amplitude_sigma.value())
-                if (expert_on and self._chk_amplitude_filter.isChecked()) else None
-            ),
-            "idw_mode":            str(self._cb_slice_idw_mode.currentData() or "quality"),
-            "radius":              radius_override,
-            "search_radius":       radius_override,
-            "idw_power":           int(self._spin_slice_idw_power.value()),
-            "overlap_fraction":    float(self._spin_slice_overlap_pct.value()) / 100.0,
-            "blanking_distance":   float(self._spin_slice_blanking_m.value()),
-            "use_anisotropic_idw": (self._chk_anisotropic_idw.isChecked() if expert_on else False),
-            "auto_radius":         bool(auto_radius),
-            "balance_profiles":    self._chk_slice_balance_profiles.isChecked(),
-            "depth_radius_factor": (float(self._spin_slice_depth_radius_factor.value()) if expert_on else 0.6),
-            "min_points":          (int(self._spin_slice_min_points.value()) if expert_on else 1),
-            "parallel_profiles":   (self._chk_slice_parallel_profiles.isChecked() if expert_on else True),
-            "profile_workers":     (int(self._spin_slice_profile_workers.value()) if expert_on else 0),
-            "fill_nodata":         self._chk_fill_nodata.isChecked(),
-            "smooth_sigma":        (
-                float(self._spin_smooth_sigma.value())
-                if self._chk_smooth.isChecked() else 0.0
-            ),
-            "open_3d_on_complete": bool(
-                self._is_qt_alive(self._chk_slice_open_3d_on_complete)
-                and self._chk_slice_open_3d_on_complete.isChecked()
-            ),
-        }
-
-    def _open_slice_dialog(self):
-        if not self._profiles:
-            QMessageBox.information(self, "Nessun profilo",
-                                    "Importa almeno un file .ogpr prima.")
-            return
-        slice_params = self.get_slice_params()
-        slice_profiles, variant_src = self._profiles_for_slicing()
-        if not slice_profiles:
-            QMessageBox.warning(self, "Timeslice", "Nessun radargramma da affettare.")
-            return
-        if variant_src:
-            # dati gia' filtrati su disco: niente ri-processing della pipeline
-            slice_params["use_processing"] = False
-            slice_params["pipeline_params"] = {}
-            slice_params["pre_slice_bg_removal"] = False
-        panel = getattr(self, "_slice_spec_panel", None)
-        if panel is not None and self._is_qt_alive(panel):
-            try:
-                dz = float(panel.get_spec().thickness_m)
-            except Exception:
-                dz = float(slice_params.get("z_step", 0.10) or 0.10)
-        else:
-            try:
-                dz = float(self._spin_slice_thickness.value())
-            except Exception:
-                dz = 0.10
-        if (not np.isfinite(dz)) or dz <= 0.0:
-            QMessageBox.warning(self, "Timeslice", "Spessore slice non valido.")
-            return
-        slice_params["z_step_override"] = float(dz)
-        slice_params["thickness_m"] = float(dz)
-        outdir = str(getattr(self, "_le_slice_outdir", None).text() if hasattr(self, "_le_slice_outdir") else "").strip()
-        if not outdir and variant_src:
-            paths = self._gpr_processing_paths()
-            if paths.get("timeslices"):
-                outdir = os.path.join(paths["timeslices"], variant_src)
-        if outdir:
-            slice_params["output_dir"] = outdir
-        if self.plugin and hasattr(self.plugin, "import_ogpr_as_slices"):
-            try:
-                self.plugin.import_ogpr_as_slices(
-                    slice_profiles,
-                    slice_params=slice_params,
-                    completion_callback=self._on_timeslice_build_finished,
-                )
-            except TypeError:
-                self.plugin.import_ogpr_as_slices(slice_profiles, slice_params=slice_params)
-        else:
-            QMessageBox.information(
-                self, "Timeslice",
-                "Funzione disponibile dal plugin principale."
-            )
 
     def _open_3d_viewer(self):
         if not self._profiles:
@@ -9855,6 +5077,9 @@ class GprProfileViewer(QMainWindow):
         # Default UX: closing hides the window to preserve child widgets/docks.
         # This avoids stale Python refs to deleted Qt C++ objects on next reopen.
         if not bool(getattr(self, "_allow_close", False)):
+            if not self._confirm_save_before_close():
+                event.ignore()
+                return
             try:
                 self._save_gpr_processing_project_meta()
             except Exception:
@@ -9875,6 +5100,7 @@ class GprProfileViewer(QMainWindow):
             return
 
         # Real close path (plugin unload).
+        self._wait_processing_job(timeout_ms=15000)
         self._stop_preview_worker_blocking()
         try:
             self._save_gpr_processing_project_meta()

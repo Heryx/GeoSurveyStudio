@@ -65,6 +65,90 @@ class TestTimeZero(unittest.TestCase):
         self.assertLessEqual(trimmed, 44)
 
 
+class TestGroundSurface(unittest.TestCase):
+    def test_surface_tracking_with_trigger_artifact_and_dc(self):
+        from gpr_processing import track_ground_surface, diagnose_radargram
+        rng = np.random.default_rng(0)
+        n_s, n_t = 300, 40
+        d = rng.normal(0, 20, (n_s, n_t)) + 500.0
+        d[0, :] = -6000.0
+        d[60:66, :] += np.array([1, 5, 9, 5, -3, -6])[:, None] * 800
+        s = track_ground_surface(d)
+        self.assertTrue(np.all(np.abs(s - 61) <= 4))
+        rep = diagnose_radargram(d, 0.2)
+        self.assertTrue(rep.get("artifact_sample0"))
+
+
+class TestTimeZeroFixed(unittest.TestCase):
+    def test_fixed_mode_cuts_same_samples_for_all_traces(self):
+        d = np.random.default_rng(0).normal(size=(200, 12)).astype(np.float32)
+        out = time_zero_correction(d, method="surface", mode="fixed", fixed_sample=17)
+        self.assertEqual(out.shape, (183, 12))
+        self.assertTrue(np.allclose(out[0], d[17]))
+
+
+class TestTimeZeroCoppens(unittest.TestCase):
+    @staticmethod
+    def _synth(onset=60, n_s=512, n_t=40, jitter=0):
+        rng = np.random.default_rng(3)
+        d = rng.normal(0, 20, (n_s, n_t)).astype(np.float32)
+        k = np.arange(30)
+        wav = (np.sin(2 * np.pi * k / 14.0) * np.exp(-((k - 10) / 8.0) ** 2)).astype(np.float32)
+        for i in range(n_t):
+            o = onset + (int(rng.integers(-jitter, jitter + 1)) if jitter else 0)
+            d[o:o + 30, i] += 8000.0 * wav
+        return d
+
+    def test_first_break_close_to_onset(self):
+        from gpr_processing import first_break_coppens
+        fb = first_break_coppens(self._synth(60), edge_skip=3)
+        self.assertLess(abs(float(np.median(fb)) - 60), 8)
+
+    def test_line_by_line_uses_single_shift_and_moves_wave_to_top(self):
+        d = self._synth(60, jitter=2)
+        out = time_zero_correction(d, method="coppens", mode="line_by_line", backup_nsamp=0, edge_skip=3)
+        self.assertLess(out.shape[0], d.shape[0])
+        self.assertGreater(out.shape[0], d.shape[0] - 90)
+        peak = np.abs(out).mean(axis=1).argmax()
+        self.assertLess(peak, 25)
+
+
+class TestAgcHeadScale(unittest.TestCase):
+    def test_head_is_brought_to_agc_scale(self):
+        from gpr_processing import agc_gain
+        rng = np.random.default_rng(2)
+        d = rng.normal(0, 10, (300, 20)).astype(np.float32)
+        d[:15] += 5000.0 * np.sign(rng.normal(size=(15, 20)))
+        out = agc_gain(d, window=40, sample_start=15)
+        # senza il fix la testa restava a ~5000 e il resto a ~1
+        self.assertLess(float(np.abs(out).max()), 50.0)
+        self.assertGreater(float(np.abs(out[:15]).max()), 0.0)
+
+
+
+class TestAgcCorrectness(unittest.TestCase):
+    def test_flat_output_for_decaying_noise(self):
+        from gpr_processing import agc_gain
+        rng = np.random.default_rng(5)
+        t = np.arange(400)[:, None]
+        x = (rng.normal(size=(400, 30)) * np.exp(-t / 60)).astype(np.float32)
+        y = agc_gain(x, window=48)
+        blocks = [float(np.sqrt(np.mean(y[i * 50:(i + 1) * 50] ** 2))) for i in range(8)]
+        self.assertLess(max(blocks) / min(blocks), 1.2)
+
+    def test_lateral_mode_preserves_lateral_anomaly(self):
+        from gpr_processing import agc_gain
+        rng = np.random.default_rng(6)
+        x = rng.normal(size=(300, 80)).astype(np.float32)
+        x[100:200, 35:45] *= 5.0
+        per_trace = agc_gain(x, window=40)
+        lateral = agc_gain(x, window=40, lateral=31)
+        def ratio(y):
+            return float(np.sqrt(np.mean(y[100:200, 35:45] ** 2)) / np.sqrt(np.mean(y[100:200, 0:30] ** 2)))
+        self.assertLess(ratio(per_trace), 1.3)   # per traccia: anomalia cancellata
+        self.assertGreater(ratio(lateral), 1.6)  # laterale: anomalia conservata
+
+
 class TestGprProcessingAdvanced(unittest.TestCase):
 
     def test_stolt_migration_diffraction_focus(self):

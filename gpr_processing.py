@@ -189,7 +189,14 @@ def _detect_t0_single(
     backup_nsamp: int,
     search_end: int,
 ) -> int:
-    tr = np.asarray(trace, dtype=np.float64)
+    tr = np.array(trace, dtype=np.float64)
+    # Artefatto di trigger: il campione 0 di molti sistemi (es. .ogpr IDS) e'
+    # un outlier enorme rispetto al resto; farebbe da picco di riferimento e
+    # da first-break (t0 sempre 0). Lo escludo dal rilevamento.
+    if tr.size > 8:
+        ref = float(np.median(np.abs(tr[1:search_end]))) if search_end > 1 else 0.0
+        if ref > 0 and abs(tr[0]) > 5.0 * max(ref, float(np.max(np.abs(tr[1:9])))):
+            tr[0] = 0.0
     win = tr[:search_end]
     abs_win = np.abs(win)
     # Riferimento del picco: la parte INIZIALE della finestra (zona onda
@@ -197,6 +204,10 @@ def _detect_t0_single(
     # profondo molto forte (che puo' superare l'onda diretta di 10x) non
     # "cattura" il t0 alzando la soglia e spostando il first-break piu' giu'.
     pk_ref_end = max(8, min(len(abs_win), search_end // 3))
+    if method == "dominant":
+        # onda diretta = arrivo piu' forte nella finestra (dati con precursori deboli)
+        pk_ref_end = len(abs_win)
+        method = "peak"
     pk = float(np.max(abs_win[:pk_ref_end])) if abs_win.size else 0.0
     if pk < 1e-12:
         pk = float(np.max(abs_win)) if abs_win.size else 0.0
@@ -239,6 +250,215 @@ def _detect_t0_single(
     return max(0, t0 - backup_nsamp)
 
 
+def estimate_edge_skip(data: np.ndarray) -> int:
+    """Quanti campioni iniziali sono un transitorio dello strumento (assestamento DC).
+
+    Si guarda la traccia mediana GREZZA: se il livello iniziale e' molto diverso dal
+    livello a regime (gradino DC con assestamento) i campioni fino all'assestamento
+    non sono un arrivo e vanno esclusi dalla ricerca della superficie. Un'onda
+    diretta vera parte e torna vicino allo stesso livello: non e' un gradino."""
+    try:
+        arr = np.asarray(data, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[0] < 48:
+            return 2
+        n_s = arr.shape[0]
+        m = np.median(arr, axis=1)
+        hi = min(max(40, n_s // 6), n_s - 1)
+        plateau = float(np.median(m[20:hi]))
+        exc = float(np.max(np.abs(m[1:20] - plateau)))
+        if exc <= 1e-9:
+            return 2
+        step = abs(float(np.median(m[1:3])) - plateau)
+        if step < 0.5 * exc:
+            return 2
+        ok = np.abs(m[1:hi] - plateau) <= 0.2 * exc
+        # primo punto da cui il livello resta a regime per 4 campioni di fila
+        # (un arrivo successivo, come il burst, non deve spostare lo skip)
+        settle = None
+        for i in range(len(ok) - 4):
+            if ok[i:i + 4].all():
+                settle = i + 1
+                break
+        if settle is None:
+            return 2
+        return int(np.clip(settle + 2, 2, max(2, n_s // 4)))
+    except Exception:
+        return 2
+
+
+def track_ground_surface(
+    data: np.ndarray,
+    threshold: float = 0.33,
+    search_fraction: float = 0.6,
+    smooth_traces: int = 15,
+    edge_skip: int | None = None,
+) -> np.ndarray:
+    """Indice di campione della superficie del suolo (onda diretta) per traccia.
+
+    Per traccia: inviluppo |x - mediana|; picco dominante nella finestra di
+    ricerca, poi risale al primo campione che supera threshold*picco (onset).
+    Il profilo dei picchi viene levigato con una mediana lungo le tracce.
+    ``edge_skip``: campioni iniziali da ignorare (transitorio strumentale);
+    None = stimato dai dati (vedi estimate_edge_skip, meglio su dati grezzi)."""
+    arr = np.asarray(data, dtype=np.float64)
+    if arr.ndim != 2 or arr.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    n_s, n_t = arr.shape
+    skip = int(estimate_edge_skip(arr) if edge_skip is None else edge_skip)
+    end = max(8, int(n_s * search_fraction))
+    skip = int(np.clip(skip, 1, max(1, end - 2)))
+    w = arr[:end] - np.median(arr[:end], axis=0, keepdims=True)
+    env = np.abs(w)
+    env[:skip] = 0.0
+    k = np.ones(3) / 3.0
+    env = np.apply_along_axis(lambda c: np.convolve(c, k, mode="same"), 0, env)
+    peak_idx = env.argmax(axis=0)
+    peak_val = env[peak_idx, np.arange(n_t)]
+    # Picco sul bordo della zona esclusa = coda di un transitorio, non un arrivo.
+    reliable = (peak_idx > skip + 1) & (peak_val > 0)
+    onset = np.zeros(n_t, dtype=np.int64)
+    for i in range(n_t):
+        lo = max(0, peak_idx[i] - 30)
+        above = lo + np.flatnonzero(env[lo:peak_idx[i] + 1, i] >= threshold * peak_val[i])
+        onset[i] = int(above[0]) if above.size else int(peak_idx[i])
+    if reliable.any():
+        onset[~reliable] = int(np.median(onset[reliable]))
+    else:
+        onset[:] = 0
+    m = max(1, int(smooth_traces)) | 1
+    if n_t >= m:
+        pad = m // 2
+        padded = np.pad(onset, pad, mode="edge")
+        onset = np.array([np.median(padded[i:i + m]) for i in range(n_t)], dtype=np.int64)
+    return onset
+
+
+def first_break_coppens(
+    data: np.ndarray,
+    w: int | None = None,
+    ns: int | None = None,
+    bet: float | None = None,
+    edge_skip: int = 1,
+) -> np.ndarray:
+    """Primo arrivo (inizio dell'onda) per traccia, Coppens modificato
+    (Sabbione & Velis 2010), come ``firstBreak(method="coppens")`` di RGPR.
+
+    Er = E1 / (E2 + bet), con E1 = energia in una finestra di ``w`` campioni e
+    E2 = energia cumulata dall'inizio; Er sale di colpo all'ingresso del segnale.
+    Dopo uno smoothing che preserva i bordi (finestra ``ns``) il primo arrivo e'
+    il massimo *aumento* di Er (RGPR usa il massimo |diff|: qui solo la salita,
+    perche' la discesa iniziale di Er non e' un arrivo).
+    Ritorna l'indice (float, campioni) per ogni traccia."""
+    arr = np.asarray(data, dtype=np.float64)
+    if arr.ndim != 2 or arr.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    n_s, n_t = arr.shape
+    if w is None:
+        w = int(np.clip(n_s // 30, 7, 31))
+    w = max(3, int(w)) | 1
+    if ns is None:
+        ns = int(round(1.5 * w))
+    ns = max(3, int(ns)) | 1
+    skip = int(np.clip(edge_skip, 0, max(0, n_s // 2)))
+    out = np.zeros(n_t, dtype=np.float64)
+    for i in range(n_t):
+        tr = arr[:, i] - np.median(arr[:, i])
+        tr[:skip] = 0.0
+        x = tr * tr
+        mx = float(x.max())
+        if mx <= 0:
+            continue
+        nmax = int(min(int(np.argmax(x)) + 2 * w, n_s))
+        x = x[:nmax]
+        if nmax < w + ns + 2:
+            out[i] = float(np.argmax(x))
+            continue
+        b = 0.2 * np.sqrt(mx) if bet is None else float(bet)
+        cs = np.concatenate(([0.0], np.cumsum(x)))
+        e1 = np.zeros(nmax)
+        e1[: nmax - w + 1] = cs[w:] - cs[: nmax - w + 1]
+        er = e1 / (cs[1:] + b)
+        # smoothing edge-preserving: media della finestra (lunga ns, contenente
+        # il campione) con deviazione standard minima
+        win = np.lib.stride_tricks.sliding_window_view(er, ns)
+        m = win.mean(axis=1)
+        s = win.std(axis=1)
+        n_w = win.shape[0]
+        half = ns // 2
+        fil = np.empty(nmax)
+        for k in range(nmax):
+            lo = max(0, k - ns + 1)
+            hi = min(n_w - 1, k)
+            j = lo + int(np.argmin(s[lo:hi + 1]))
+            fil[k] = m[j]
+        fbi = int(np.argmax(np.diff(fil)))
+        # Lo smoothing anticipa l'arrivo di ~ns/2 campioni: si affina sul primo
+        # campione nettamente sopra il rumore che precede.
+        pre = tr[skip:fbi]
+        if pre.size >= 8:
+            sigma = float(pre.std())
+            hit = np.flatnonzero(np.abs(tr[fbi:nmax]) > 6.0 * sigma)
+            if sigma > 0 and hit.size:
+                fbi += int(hit[0])
+        out[i] = float(fbi)
+    return out
+
+
+def _shift_traces_subsample(data: np.ndarray, t0: np.ndarray) -> np.ndarray:
+    """Sposta ogni traccia di ``t0`` campioni (float) con interpolazione lineare,
+    senza zero-padding: l'uscita ha n_s - 1 - floor(max t0) campioni."""
+    n_s, n_t = data.shape
+    t0 = np.clip(np.asarray(t0, dtype=np.float64), 0.0, n_s - 3.0)
+    i0 = np.floor(t0).astype(np.int64)
+    f = (t0 - i0).astype(np.float32)[None, :]
+    n_out = n_s - 1 - int(i0.max())
+    idx = i0[None, :] + np.arange(n_out)[:, None]
+    cols = np.arange(n_t)[None, :]
+    return ((1.0 - f) * data[idx, cols] + f * data[idx + 1, cols]).astype(np.float32)
+
+
+def diagnose_radargram(data: np.ndarray, dt_ns: float = 0.117) -> dict:
+    """Diagnosi automatica dei problemi tipici all'inizio del radargramma."""
+    arr = np.asarray(data, dtype=np.float64)
+    out = {"notes": [], "params": {}}
+    if arr.ndim != 2 or arr.size == 0:
+        return out
+    n_s, n_t = arr.shape
+    if n_s > 16:
+        ref = float(np.median(np.abs(arr[1:9])))
+        if ref > 0 and float(np.median(np.abs(arr[0]))) > 5.0 * ref:
+            out["notes"].append("Artefatto di trigger al campione 0 (outlier netto).")
+            out["artifact_sample0"] = True
+    arr = suppress_trigger_sample0(arr.astype(np.float32)).astype(np.float64)
+    dc = float(np.median(np.abs(np.median(arr, axis=0))))
+    rng = float(np.percentile(np.abs(arr - np.median(arr, axis=0, keepdims=True)), 95))
+    if rng > 0 and dc > 0.5 * rng:
+        out["notes"].append("Forte offset DC: usare dewow/dcshift prima del time-zero.")
+    edge_skip_diag = estimate_edge_skip(arr)
+    surf = track_ground_surface(dewow(arr, window=27), edge_skip=edge_skip_diag)
+    t0 = int(np.median(surf)) if surf.size else 0
+    spread = float(np.percentile(surf, 90) - np.percentile(surf, 10)) if surf.size else 0.0
+    out["ground_sample"] = t0
+    out["ground_spread"] = spread
+    out["notes"].append(
+        f"Superficie/onda diretta a ~campione {t0} ({t0 * dt_ns:.1f} ns); "
+        f"variabilita' lungo il profilo {spread:.0f} campioni."
+    )
+    e = np.abs(arr - np.median(arr, axis=0, keepdims=True))
+    ring_end = min(n_s, t0 + 60)
+    if t0 > 0 and ring_end > t0 + 10:
+        a = float(np.median(e[max(0, t0 - 5):t0 + 10]))
+        b = float(np.median(e[t0 + 30:ring_end]))
+        if b > 0 and a > 8.0 * b:
+            out["notes"].append("Onda diretta molto piu' forte del segnale sotto: AGC 'Da campione' dopo il burst.")
+    out["params"] = {
+        "timezero": True, "tz_method": "surface", "tz_mode": "individual",
+        "tz_threshold": 0.33, "tz_backup_nsamp": 3,
+        "agc_sample_start": 25, "bg_mode": "line_by_line", "bg_method": "median",
+    }
+    return out
+
+
 def time_zero_correction(
     data: np.ndarray,
     method: str = "peak",
@@ -246,6 +466,8 @@ def time_zero_correction(
     threshold: float = 0.2,
     backup_nsamp: int = 4,
     search_fraction: float = 0.25,
+    fixed_sample: int = 0,
+    edge_skip: int | None = None,
 ) -> np.ndarray:
     if data is None:
         return np.zeros((0, 0), dtype=np.float32)
@@ -256,12 +478,35 @@ def time_zero_correction(
     n_s, n_t = data.shape
     if n_s <= 1 or n_t <= 0:
         return data.copy()
+    if method == "coppens" and mode != "fixed":
+        # RGPR: first break (Coppens) -> un solo t0 per profilo (mediana) salvo
+        # mode 'individual'/'scan_by_scan'; shift sub-campione, nessuna perdita.
+        skip = int(estimate_edge_skip(data) if edge_skip is None else edge_skip)
+        fb = first_break_coppens(data, edge_skip=max(1, skip))
+        t0f = np.maximum(0.0, fb - float(backup_nsamp))
+        if mode not in ("individual", "scan_by_scan"):
+            t0f[:] = float(np.median(t0f))
+        _log_gpr(
+            f"[GPR] time_zero: method=coppens mode={mode}  "
+            f"t0_med={np.median(t0f):.2f}  t0_min={t0f.min():.2f}  t0_max={t0f.max():.2f}"
+        )
+        if t0f.max() <= 0:
+            return data
+        return _shift_traces_subsample(data, t0f)
     search_end = max(4, int(n_s * search_fraction))
     t0_indices = np.zeros(n_t, dtype=np.int64)
-    for i in range(n_t):
-        t0_indices[i] = _detect_t0_single(
-            data[:, i], method, threshold, backup_nsamp, search_end
+    if mode == "fixed":
+        # t0 uniforme per tutto il rilievo (calcolato a livello di survey)
+        t0_indices[:] = int(max(0, min(int(fixed_sample), n_s - 2)))
+    elif method == "surface":
+        t0_indices[:] = np.maximum(
+            0, track_ground_surface(data, threshold=threshold, edge_skip=edge_skip) - int(backup_nsamp)
         )
+    else:
+        for i in range(n_t):
+            t0_indices[i] = _detect_t0_single(
+                data[:, i], method, threshold, backup_nsamp, search_end
+            )
     if mode == "line_by_line":
         t0_median = int(np.median(t0_indices))
         t0_indices[:] = t0_median
@@ -500,15 +745,19 @@ def agc_gain(
     sample_start: int = 0,
     max_gain_factor: float | None = None,
     noise_threshold: float | None = None,
+    lateral: int = 0,
 ) -> np.ndarray:
     """
     Automatic Gain Control vettorizzato con cumsum.
     O(n_s * n_t) senza loop Python.
 
-    sample_start: i campioni [0:sample_start] vengono copiati invariati
-                  (gain=1). L'AGC viene applicato solo da sample_start in poi.
-                  Utile per escludere il burst superficiale (coupling antenna)
-                  dalla normalizzazione AGC.
+    sample_start: l'AGC agisce solo da sample_start in poi; i campioni precedenti
+                  (burst) non entrano nel calcolo del guadagno e vengono portati
+                  alla scala AGC con un fattore unico (forma d'onda invariata).
+    lateral:      0 = guadagno per singola traccia (appiattisce le anomalie di
+                  ampiezza laterali); N>1 = l'energia locale e' mediata su N
+                  tracce vicine, cosi' il guadagno segue il decadimento in
+                  profondita' ma NON cancella le variazioni tra tracce.
     max_gain_factor: limita il guadagno massimo applicabile rispetto al livello medio.
     noise_threshold: soglia minima RMS per non amplificare il rumore di fondo profondo.
     """
@@ -539,7 +788,14 @@ def agc_gain(
     cs = np.vstack([np.zeros((1, n_t), dtype=np.float64), np.cumsum(sq_pad, axis=0)])
     s_idx = np.arange(n_sub, dtype=np.int64)
     sum_win = cs[s_idx + win, :] - cs[s_idx, :]
-    rms = np.sqrt(np.maximum(sum_win / float(win), 0.0))
+    energy = np.maximum(sum_win / float(win), 0.0)
+    lat = int(lateral or 0)
+    if lat > 1 and n_t > 2:
+        k = min(lat // 2, n_t - 1)
+        ep = np.pad(energy, ((0, 0), (k, k)), mode="reflect")
+        cst = np.concatenate([np.zeros((energy.shape[0], 1)), np.cumsum(ep, axis=1)], axis=1)
+        energy = np.maximum((cst[:, 2 * k + 1:2 * k + 1 + n_t] - cst[:, :n_t]) / float(2 * k + 1), 0.0)
+    rms = np.sqrt(energy)
     try:
         valid_rms = rms[rms > 1e-10]
         if valid_rms.size > 0:
@@ -561,6 +817,15 @@ def agc_gain(
         clip = float(np.percentile(np.abs(agc_sub), clip_percentile))
         if clip > 1e-12:
             agc_sub = np.clip(agc_sub, -clip, clip)
+    if s0 > 0:
+        # La testa (burst) resta in scala grezza (migliaia) mentre il resto e' in
+        # scala AGC (~1): mescolate falsano la normalizzazione di visualizzazione.
+        # Riporto la testa alla scala AGC con UN solo fattore (forma d'onda intatta).
+        head = arr[:s0, :].astype(np.float64)
+        h_rms = float(np.sqrt(np.mean(head ** 2)))
+        tgt = float(np.sqrt(np.mean(agc_sub.astype(np.float64) ** 2)))
+        if h_rms > 1e-12 and tgt > 0.0:
+            arr[:s0, :] = (head * (tgt / h_rms)).astype(np.float32)
     arr[s0:, :] = agc_sub
     return arr
 
@@ -1747,6 +2012,7 @@ DEFAULT_PIPELINE = {
     "agc_win":              128,
     "agc_sample_start":     0,            # 0 = dall'inizio; >0 = lascia invariati i primi N campioni
     "agc_max_gain":         0.0,          # 0 = unlimited
+    "agc_lateral":          0,            # 0 = per traccia; N = energia mediata su N tracce
     "envelope":             False,
     # --- Filtri Fase 1 (disattivi di default) -----------------------------
     "dcshift":              False,
@@ -1941,7 +2207,7 @@ def _step_fingerprint(
         return (
             "timezero", bool(p.get("timezero")), str(p.get("tz_method", "peak")),
             str(p.get("tz_mode", "line_by_line")), float(p.get("tz_threshold", 0.2)),
-            int(p.get("tz_backup_nsamp", 4)), input_shape
+            int(p.get("tz_backup_nsamp", 4)), int(p.get("tz_fixed_sample", 0) or 0), input_shape
         )
     elif step == "bg_removal":
         return (
@@ -1954,7 +2220,7 @@ def _step_fingerprint(
         return (
             "bandpass", bool(p.get("bandpass")), float(p.get("bp_low_mhz", 100.0)),
             float(p.get("bp_high_mhz", 1200.0)), float(p.get("bp_taper_frac", 0.12)),
-            int(p.get("agc_sample_start", 0)), dt_ns, input_shape
+            dt_ns, input_shape
         )
     elif step == "migration":
         return (
@@ -1969,7 +2235,8 @@ def _step_fingerprint(
     elif step == "agc":
         return (
             "agc", bool(p.get("agc")), int(p.get("agc_win", 128)),
-            int(p.get("agc_sample_start", 0)), float(p.get("agc_max_gain", 0.0)), input_shape
+            int(p.get("agc_sample_start", 0)), float(p.get("agc_max_gain", 0.0)),
+            int(p.get("agc_lateral", 0) or 0), input_shape
         )
     elif step == "envelope":
         return ("envelope", bool(p.get("envelope")), input_shape)
@@ -2107,6 +2374,20 @@ def _build_pre_agc_gain(n_samples: int, p: dict) -> np.ndarray:
     return g.reshape(-1, 1)
 
 
+def suppress_trigger_sample0(data: np.ndarray) -> np.ndarray:
+    """Sostituisce il campione 0 con il campione 1 se e' un artefatto di trigger
+    (quasi costante tra le tracce e molto piu' grande del resto)."""
+    if data.ndim != 2 or data.shape[0] <= 8 or data.shape[1] < 2:
+        return data
+    c0 = data[0].astype(np.float64)
+    m0 = float(np.median(c0))
+    ref = float(np.median(np.abs(data[1:min(40, data.shape[0])])))
+    if abs(m0) > 3.0 * max(ref, 1.0) and float(np.std(c0)) < 0.1 * abs(m0):
+        data = data.copy()
+        data[0] = data[1]
+    return data
+
+
 def apply_pre_bg_pipeline(
     data: np.ndarray,
     params: dict,
@@ -2125,7 +2406,8 @@ def apply_pre_bg_pipeline(
     out = np.asarray(data, dtype=np.float32)
     if out.ndim != 2 or out.size == 0:
         return out.copy()
-    out = np.nan_to_num(out, copy=True, nan=0.0, posinf=0.0, neginf=0.0)
+    out = suppress_trigger_sample0(np.nan_to_num(out, copy=True, nan=0.0, posinf=0.0, neginf=0.0))
+    _edge_skip_raw = estimate_edge_skip(out)
     p   = {**DEFAULT_PIPELINE, **params}
     if p["dewow"]:
         out = dewow(out, window=int(p["dewow_win"]))
@@ -2136,6 +2418,8 @@ def apply_pre_bg_pipeline(
             mode         = str(p.get("tz_mode",        "line_by_line")),
             threshold    = float(p.get("tz_threshold",  0.2)),
             backup_nsamp = int(p.get("tz_backup_nsamp", 4)),
+            fixed_sample = int(p.get("tz_fixed_sample", 0) or 0),
+            edge_skip = p.get("tz_edge_skip", _edge_skip_raw),
         )
     return out
 
@@ -2167,7 +2451,8 @@ def apply_pipeline(
     out = np.asarray(data, dtype=np.float32)
     if out.ndim != 2 or out.size == 0:
         return out.copy()
-    out = np.nan_to_num(out, copy=True, nan=0.0, posinf=0.0, neginf=0.0)
+    out = suppress_trigger_sample0(np.nan_to_num(out, copy=True, nan=0.0, posinf=0.0, neginf=0.0))
+    _edge_skip_raw = estimate_edge_skip(out)
 
     p = {**DEFAULT_PIPELINE, **params}
     order = _resolve_chain_order(chain_order, p)
@@ -2219,6 +2504,8 @@ def apply_pipeline(
                     mode=str(p.get("tz_mode", "line_by_line")),
                     threshold=float(p.get("tz_threshold", 0.2)),
                     backup_nsamp=int(p.get("tz_backup_nsamp", 4)),
+                    fixed_sample=int(p.get("tz_fixed_sample", 0) or 0),
+                    edge_skip=p.get("tz_edge_skip", _edge_skip_raw),
                 )
                 _log("timezero", out)
 
@@ -2244,10 +2531,6 @@ def apply_pipeline(
 
         elif step == "bandpass":
             if p["bandpass"]:
-                bp_s0 = int(p.get("agc_sample_start", 0))
-                if bp_s0 > 0 and out.shape[0] > bp_s0:
-                    out = out.copy()
-                    out[:bp_s0, :] = 0.0
                 out = bandpass_filter(
                     out,
                     dt_ns,
@@ -2289,6 +2572,7 @@ def apply_pipeline(
                     clip_percentile=99.5,
                     sample_start=agc_s0,
                     max_gain_factor=(agc_max if agc_max > 0 else None),
+                    lateral=int(p.get("agc_lateral", 0) or 0),
                 )
                 s0_lbl = f"s0={agc_s0}" if agc_s0 > 0 else ""
                 _log(f"agc(win={p['agc_win']}{(' ' + s0_lbl) if s0_lbl else ''})", out)

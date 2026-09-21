@@ -28,6 +28,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.PyQt.QtCore import Qt
 from qgis.core import QgsProject
+from . import gpr_debug_log as _dbg
 from .project_catalog import parse_depth_from_filename
 
 _DEPTH_PARSE_CONF_THRESHOLD = 0.8
@@ -480,23 +481,24 @@ class GprOgprVolumeMixin:
             if not os.path.isabs(out_override):
                 out_override = os.path.normpath(os.path.join(project_root, out_override))
             output_dir = out_override
-        epsg = QgsProject.instance().crs().postgisSrid() or None
-        if not epsg:
-            epsg_vals = []
-            for p in profiles:
-                try:
-                    v = int(getattr(p, "epsg", 0) or 0)
-                except Exception:
-                    v = 0
-                if v > 0:
-                    epsg_vals.append(v)
-            if epsg_vals:
-                epsg = int(Counter(epsg_vals).most_common(1)[0][0])
-                if hasattr(self, "_notify_info"):
-                    self._notify_info(
-                        f"CRS progetto non impostato: uso EPSG:{epsg} dai profili OGPR.",
-                        duration=8,
-                    )
+        # Le coordinate dei profili sono nel CRS del dato: quello va scritto nei
+        # raster. Il CRS del progetto QGIS (es. EPSG:4326) descrive solo la
+        # visualizzazione e marchierebbe come gradi delle coordinate in metri.
+        epsg = None
+        epsg_vals = []
+        if resolved_spec is not None and getattr(resolved_spec, "crs_epsg", None):
+            epsg_vals.append(int(resolved_spec.crs_epsg))
+        for p in profiles:
+            try:
+                v = int(getattr(p, "epsg", 0) or 0)
+            except Exception:
+                v = 0
+            if v > 0:
+                epsg_vals.append(v)
+        if epsg_vals:
+            epsg = int(Counter(epsg_vals).most_common(1)[0][0])
+        else:
+            epsg = QgsProject.instance().crs().postgisSrid() or None
 
         ch_label = (
             f"tutti ({params['combine_method']})"
@@ -678,6 +680,7 @@ class GprOgprVolumeMixin:
                                         ch0 = prof.channel(0)
                                     except Exception:
                                         continue
+                                    _dbg.log("VOLUME", f"estensione da {os.path.basename(str(getattr(prof, 'path', '?')))}: " + _dbg.describe_track(getattr(ch0, "easting", []), getattr(ch0, "northing", [])))
                                     for x in list(getattr(ch0, "easting", []) or []):
                                         try:
                                             xf = float(x)

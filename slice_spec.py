@@ -56,6 +56,9 @@ class SliceSpec:
     search_radius_m: float | None = None  # None -> auto from interline spacing
     blanking_radius_m: float = 0.0
     smooth_lowpass: int = 0               # 0 | 3 | 5 (low-pass kernel size)
+    bg_horizontal: bool = False           # rimuove bande orizzontali (media per riga)
+    bg_vertical: bool = False             # rimuove bande verticali (media per colonna)
+    bg_clip_pct: float = 95.0             # percentile: i target forti non entrano nel background
     # --- crs ------------------------------------------------------------
     crs_epsg: int | None = None
 
@@ -81,6 +84,8 @@ class SliceSpec:
             raise SliceSpecError("search_radius_m must be > 0 or None")
         if float(self.blanking_radius_m) < 0.0:
             raise SliceSpecError("blanking_radius_m must be >= 0")
+        if not (50.0 <= float(self.bg_clip_pct) <= 100.0):
+            raise SliceSpecError("bg_clip_pct must be in [50, 100]")
         if int(self.smooth_lowpass) not in SMOOTH_LOWPASS_VALUES:
             raise SliceSpecError(
                 f"smooth_lowpass {self.smooth_lowpass!r} not in {SMOOTH_LOWPASS_VALUES}"
@@ -98,6 +103,12 @@ class SliceSpec:
     def smooth_sigma(self) -> float:
         """Gaussian sigma equivalent of the low-pass kernel size."""
         return float(self.smooth_lowpass) / 3.0 if self.smooth_lowpass else 0.0
+
+    @property
+    def grid_bg_spec(self) -> str:
+        """Stringa per grid_filters.apply_grid_bg ('' = nessun background)."""
+        flags = ("h" if self.bg_horizontal else "") + ("v" if self.bg_vertical else "")
+        return f"{flags}@{float(self.bg_clip_pct):g}" if flags else ""
 
     def is_resolved(self) -> bool:
         return self.z_max_m is not None and (
@@ -171,6 +182,7 @@ class SliceSpec:
             "use_hilbert": use_hilbert,
             "blanking_distance": float(self.blanking_radius_m),
             "smooth_sigma": float(self.smooth_sigma),
+            "grid_bg": self.grid_bg_spec,
         }
         if self.z_max_m is not None:
             kwargs["z_max"] = float(self.z_max_m)

@@ -317,6 +317,17 @@ class OgprSliceBuildTask(CallbackTask):
         try:
             t0 = perf_counter()
             esp = self.extra_slice_params
+
+            import threading
+            cancel_ev = threading.Event()
+            self._cancel_event = cancel_ev
+
+            def _on_progress(done, total):
+                if self.isCanceled():
+                    cancel_ev.set()
+                if total:
+                    self.setProgress(5.0 + 65.0 * float(done) / float(total))
+
             if self.spec is not None:
                 # Fase D: the SliceSpec governs geometry, amplitude mode, radius,
                 # blanking and low-pass; channel/combine stay viewer choices.
@@ -325,6 +336,8 @@ class OgprSliceBuildTask(CallbackTask):
                     channel=self.params["channel"],
                     combine_method=self.params["combine_method"],
                     spec=self.spec,
+                    progress_callback=_on_progress,
+                    cancel_event=cancel_ev,
                 )
             else:
                 grids, meta = compute_ogpr_slice_grids(
@@ -366,6 +379,8 @@ class OgprSliceBuildTask(CallbackTask):
                     topo_reference_elevation=esp.get("topo_reference_elevation"),
                     parallel_profiles=bool(esp.get("parallel_profiles", True)),
                     profile_workers=int(esp.get("profile_workers", 0) or 0),
+                    progress_callback=_on_progress,
+                    cancel_event=cancel_ev,
                 )
             compute_s = max(0.0, perf_counter() - t0)
         except Exception as e:

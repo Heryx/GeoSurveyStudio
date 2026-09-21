@@ -39,6 +39,10 @@ from pathlib import Path
 import numpy as np
 
 from .gpr_ogpr_reader import OgprChannel, OgprProfile
+try:
+    from . import gpr_debug_log as _dbg
+except ImportError:  # esecuzione fuori pacchetto (test/script)
+    import gpr_debug_log as _dbg
 
 HEADER_BLOCK_SIZE = 1028
 DEFAULT_HEADER_BLOCKS = 10
@@ -590,6 +594,7 @@ def read_dtslice(path: str) -> OgprProfile:
         northing = np.zeros(n_traces, dtype=np.float64)
         altitude = np.zeros(n_traces, dtype=np.float64)
 
+    _dbg.log("READ-DT", f"{p.name}: {'marker GPS=' + str(len(markers)) if has_gps else 'NESSUN GPS -> coordinate sintetiche locali'} | " + _dbg.describe_track(easting, northing))
     d_east = np.diff(easting, prepend=easting[0])
     d_north = np.diff(northing, prepend=northing[0])
     heading = np.degrees(np.arctan2(d_east, d_north)) % 360.0

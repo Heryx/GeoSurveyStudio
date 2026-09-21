@@ -24,6 +24,7 @@ __all__ = [
     "laplacian",
     "gaussian_smooth",
     "line_background",
+    "apply_grid_bg",
     "fft2d_filter",
     "fft2d_directional_notch",
     "blank",
@@ -201,6 +202,34 @@ def line_background(
         res[~finite] = np.nan
         out[i, :] = res
     return np.moveaxis(out, 1, ax)
+
+
+def apply_grid_bg(grid, spec: str = "") -> np.ndarray:
+    """Background orizzontale/verticale su una time-slice.
+
+    ``spec`` = "" | "h" | "v" | "hv", opzionale "@<percentile>" (es. "hv@95").
+    ``h`` rimuove le bande orizzontali (sottrae la media di ogni riga),
+    ``v`` rimuove le bande verticali (sottrae la media di ogni colonna).
+    Il percentile esclude dal calcolo i valori piu' alti della linea, cosi' i
+    target forti non vengono spalmati.
+    """
+    a = _as2d(grid)
+    txt = str(spec or "").strip().lower()
+    if not txt:
+        return a
+    clip = 100.0
+    if "@" in txt:
+        txt, _, c = txt.partition("@")
+        try:
+            clip = float(c)
+        except ValueError:
+            clip = 100.0
+    out = a
+    if "h" in txt:
+        out = line_background(out, "x", 0, 0.0, clip)
+    if "v" in txt:
+        out = line_background(out, "y", 0, 0.0, clip)
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,11 @@ from typing import Any, Callable
 
 import numpy as np
 
+try:
+    from . import gpr_debug_log as _dbg
+except ImportError:  # esecuzione fuori pacchetto (test/script)
+    import gpr_debug_log as _dbg
+
 from qgis.PyQt.QtCore import Qt, pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
@@ -169,12 +174,15 @@ def compute_positions(
 def check_profiles_have_gps(profiles: list) -> bool:
     """Verifica se almeno un canale dei profili caricati possiede coordinate GPS reali plausibili."""
     if not profiles:
+        _dbg.log("GPSCHECK", "nessun profilo")
         return False
     for prof in profiles:
         channels = getattr(prof, "channels", []) or []
         for ch in channels:
             e = np.asarray(getattr(ch, "easting", []), dtype=np.float64)
             n = np.asarray(getattr(ch, "northing", []), dtype=np.float64)
+            _dbg.log("GPSCHECK", f"{os.path.basename(str(getattr(prof, 'path', '?')))} "
+                     f"ch{getattr(ch, 'channel_idx', '?')}: {_dbg.describe_track(e, n)}")
             if e.size > 1 and n.size > 1:
                 fe = e[np.isfinite(e)]
                 fn = n[np.isfinite(n)]
@@ -183,7 +191,9 @@ def check_profiles_have_gps(profiles: list) -> bool:
                     span_n = float(np.ptp(fn))
                     # Coordinate reali UTM/proiettate o con estensione metrica non nulla
                     if (span_e + span_n) > 0.05 and (float(np.nanmax(fe)) > 1000.0 or float(np.nanmax(fn)) > 1000.0):
+                        _dbg.log("GPSCHECK", "esito: GPS PRESENTE")
                         return True
+    _dbg.log("GPSCHECK", "esito: GPS ASSENTE (soglia: span>0.05 m e max(E|N)>1000)")
     return False
 
 
@@ -240,18 +250,87 @@ class GprManualPositioningDialog(QDialog):
                 "n_traces": n_slices,
                 "sampling_step": step,
                 "length": max(0.1, length),
+                "has_gps": bool(check_profiles_have_gps([prof])),
             })
+        self._infer_geometry_from_coords(items)
         return items
+
+    @staticmethod
+    def _profile_track(prof):
+        """(easting, northing) finiti del primo canale con coordinate plausibili, o None."""
+        for ch in getattr(prof, "channels", None) or []:
+            e = np.asarray(getattr(ch, "easting", []), dtype=np.float64)
+            n = np.asarray(getattr(ch, "northing", []), dtype=np.float64)
+            if e.size < 2 or e.size != n.size:
+                continue
+            ok = np.isfinite(e) & np.isfinite(n)
+            if ok.sum() < 2:
+                continue
+            e, n = e[ok], n[ok]
+            if float(np.ptp(e)) + float(np.ptp(n)) > 0.05:
+                return e, n
+        return None
+
+    def _infer_geometry_from_coords(self, items: list[dict]) -> None:
+        """Se i profili hanno coordinate reali, ricava asse, verso (zig-zag) e offset.
+
+        Il verso "avanti" e' quello del primo profilo di ciascun asse; i profili
+        percorsi in senso opposto risultano ``reversed``. Modifica ``items`` in place.
+        """
+        tracks = [self._profile_track(it["prof"]) for it in items]
+        info = []  # (idx, axis, sign, transverse_mean)
+        for i, tr in enumerate(tracks):
+            if tr is None:
+                continue
+            e, n = tr
+            de, dn = float(e[-1] - e[0]), float(n[-1] - n[0])
+            if abs(de) >= abs(dn):
+                info.append((i, "X", 1 if de >= 0 else -1, float(np.mean(n))))
+            else:
+                info.append((i, "Y", 1 if dn >= 0 else -1, float(np.mean(e))))
+        if not info:
+            return
+        ref_sign = {}
+        min_tr = {}
+        for _, axis, sign, tmean in info:
+            ref_sign.setdefault(axis, sign)
+            min_tr[axis] = min(min_tr.get(axis, tmean), tmean)
+        for i, axis, sign, tmean in info:
+            items[i]["axis"] = axis
+            items[i]["reversed"] = sign != ref_sign[axis]
+            items[i]["offset"] = float(tmean - min_tr[axis])
+            e_, n_ = tracks[i]
+            real_len = float(np.sum(np.hypot(np.diff(e_), np.diff(n_))))
+            if real_len > 0.1:
+                items[i]["length"] = real_len
+            _dbg.log("DIALOG-INIT", f"{items[i]['name']}: da coordinate reali -> asse={axis} "
+                     f"verso={'+' if sign > 0 else '-'} invertito={items[i]['reversed']} "
+                     f"offset={items[i]['offset']:.3f}m lunghezza_reale={items[i]['length']:.3f}m")
+        for i, tr in enumerate(tracks):
+            if tr is None:
+                _dbg.log("DIALOG-INIT", f"{items[i]['name']}: coordinate NON utilizzabili, "
+                         "restano i default (asse X, non invertito)")
 
     def _build_ui(self):
         root_layout = QVBoxLayout(self)
 
         # Info header
-        lbl_info = QLabel(
-            "<b>I profili caricati non contengono coordinate GPS/GEC.</b><br>"
-            "Imposta le dimensioni della griglia ($X_0-X_1$, $Y_0-Y_1$) e verifica "
-            "la direzione delle linee (zig-zag). Il plugin calcolerà automaticamente le coordinate di ciascuna traccia."
-        )
+        n_gps_hdr = sum(1 for it in self._profile_items if it.get("has_gps"))
+        n_all_hdr = len(self._profile_items)
+        if n_gps_hdr == 0:
+            info_html = (
+                "<b>I profili caricati non contengono coordinate GPS/GEC.</b><br>"
+                "Imposta le dimensioni della griglia ($X_0-X_1$, $Y_0-Y_1$) e verifica "
+                "la direzione delle linee (zig-zag). Il plugin calcolerà automaticamente le coordinate di ciascuna traccia."
+            )
+        else:
+            info_html = (
+                f"<b>{n_gps_hdr}/{n_all_hdr} profili hanno coordinate GPS reali.</b><br>"
+                "L'anteprima mostra le tracce vere (Est a destra, Nord in alto, verso di "
+                "percorrenza reale). Con «Mantieni le coordinate GPS originali» attivo, "
+                "«Applica» non le modifica; disattivalo per forzare la griglia locale."
+            )
+        lbl_info = QLabel(info_html)
         lbl_info.setWordWrap(True)
         root_layout.addWidget(lbl_info)
 
@@ -385,6 +464,20 @@ class GprManualPositioningDialog(QDialog):
         )
         self._chk_reverse_far.toggled.connect(self._on_nav_changed)
         nav_form.addRow(self._chk_reverse_far)
+
+        n_gps = sum(1 for it in self._profile_items if it.get("has_gps"))
+        self._chk_keep_gps = QCheckBox(
+            f"Mantieni le coordinate GPS originali ({n_gps}/{len(self._profile_items)} profili)"
+        )
+        self._chk_keep_gps.setChecked(n_gps > 0)
+        self._chk_keep_gps.setEnabled(n_gps > 0)
+        self._chk_keep_gps.setToolTip(
+            "Se attivo, 'Applica' NON sovrascrive easting/northing dei profili che\n"
+            "hanno gia' coordinate GPS reali (UTM): vengono applicati solo nome e\n"
+            "impostazioni. Disattiva per forzare la griglia locale su tutti i profili."
+        )
+        self._chk_keep_gps.toggled.connect(self._on_nav_changed)
+        nav_form.addRow(self._chk_keep_gps)
 
         # --- Modo posizionamento tracce (uniforme / marker + dead-reckoning) ---
         self._cb_pos_mode = QComboBox()
@@ -973,11 +1066,58 @@ class GprManualPositioningDialog(QDialog):
     # Disegno Anteprima 2D
     # ------------------------------------------------------------------
 
+    def _draw_real_gps_preview(self) -> bool:
+        """Con «Mantieni coordinate GPS» attivo mostra le tracce REALI dei profili
+        (Est a destra, Nord in alto, verso di percorrenza vero), non lo schema
+        sintetico. Ritorna True se ha disegnato."""
+        if not (getattr(self, "_chk_keep_gps", None) and self._chk_keep_gps.isChecked()):
+            return False
+        tracks = []
+        for idx, it in enumerate(self._profile_items):
+            if not it.get("has_gps"):
+                continue
+            tr = self._profile_track(it["prof"])
+            if tr is not None:
+                tracks.append((idx, it, tr[0], tr[1]))
+        if not tracks:
+            return False
+        e_min = min(float(np.min(t[2])) for t in tracks)
+        n_min = min(float(np.min(t[3])) for t in tracks)
+        for idx, it, e, n in tracks:
+            xs, ys = e - e_min, n - n_min
+            dx, dy = float(xs[-1] - xs[0]), float(ys[-1] - ys[0])
+            color = "#1f77b4" if abs(dx) >= abs(dy) else "#ff7f0e"
+            self._ax.plot(xs, ys, color=color, lw=2.0)
+            k = int(0.6 * (xs.size - 1))
+            k2 = min(xs.size - 1, k + max(1, xs.size // 12))
+            self._ax.annotate(
+                "", xy=(xs[k2], ys[k2]), xytext=(xs[k], ys[k]),
+                arrowprops=dict(arrowstyle="->", color=color, lw=1.8),
+            )
+            self._ax.text(
+                xs[0], ys[0], f"{idx + 1}", color="black", fontsize=8, fontweight="bold",
+                ha="center", va="center",
+                bbox=dict(boxstyle="circle,pad=0.2", fc="white", ec=color, lw=1.0),
+            )
+        _dbg.log_once(("dlg-real-preview", len(tracks)), "DIALOG-PREVIEW",
+                      f"anteprima da coordinate REALI: {len(tracks)} profili, origine E={e_min:.3f} N={n_min:.3f}")
+        self._ax.set_aspect("equal", "datalim")
+        self._ax.grid(True, linestyle=":", alpha=0.5)
+        self._ax.set_xlabel("Est relativo (m)")
+        self._ax.set_ylabel("Nord relativo (m)")
+        self._ax.set_title("Coordinate GPS reali dei profili")
+        self._fig.tight_layout()
+        self._canvas_mpl.draw()
+        return True
+
     def _draw_preview(self):
         if not HAS_MPL or not self._ax:
             return
 
         self._ax.clear()
+
+        if self._draw_real_gps_preview():
+            return
 
         x0 = float(self._spin_x0.value())
         x1 = float(self._spin_x1.value())
@@ -1145,7 +1285,13 @@ class GprManualPositioningDialog(QDialog):
             channels = getattr(prof, "channels", []) or []
             n_t = it["n_traces"]
 
-            if n_t > 0:
+            keep_gps = bool(
+                getattr(self, "_chk_keep_gps", None) and self._chk_keep_gps.isChecked()
+                and it.get("has_gps")
+            )
+            if keep_gps:
+                _dbg.log("DIALOG-APPLY", f"{custom_name}: coordinate GPS originali MANTENUTE (non sovrascritte)")
+            if n_t > 0 and not keep_gps:
                 grid_span = (x1 - x0) if axis == "X" else (y1 - y0)
                 markers, _leftover = self._markers_for_item(it)
                 final_e, final_n, final_dist, final_elev = compute_positions(
@@ -1161,7 +1307,19 @@ class GprManualPositioningDialog(QDialog):
                     markers=markers or None,
                     reverse_anchor=reverse_anchor,
                 )
+                _dbg.log("DIALOG-APPLY", f"{custom_name}: SOVRASCRIVO coordinate canali "
+                         f"(asse={axis} inv={is_rev} georef_GIS={geo_on}) "
+                         f"prima: {_dbg.describe_track(getattr(channels[0], 'easting', []), getattr(channels[0], 'northing', [])) if channels else '-'} "
+                         f"| dopo: {_dbg.describe_track(final_e, final_n)}")
                 for ch in channels:
+                    if not hasattr(ch, "_geo_orig"):
+                        try:
+                            ch._geo_orig = (
+                                np.array(ch.easting, copy=True), np.array(ch.northing, copy=True),
+                                np.array(ch.distances, copy=True), np.array(ch.altitude, copy=True),
+                            )
+                        except Exception:
+                            pass
                     ch.easting = final_e.copy()
                     ch.northing = final_n.copy()
                     ch.distances = final_dist.copy()

@@ -7,6 +7,7 @@ import importlib
 import os
 import sys
 import numpy as np
+from . import gpr_debug_log as _dbg
 
 from qgis.PyQt.QtCore import Qt, pyqtSignal
 from qgis.PyQt.QtWidgets import (
@@ -36,6 +37,36 @@ except Exception:  # pragma: no cover - optional dependency
     FigureCanvasQTAgg = None
     Figure = None
     _HAS_MPL = False
+
+try:
+    from . import gpr_palettes as _gpr_palettes
+except Exception:  # pragma: no cover
+    _gpr_palettes = None
+
+
+def _cmap_choices(builtin):
+    """builtin + palette esterne registrate, senza duplicati."""
+    extra = []
+    if _gpr_palettes is not None:
+        try:
+            extra = _gpr_palettes.register_all()
+        except Exception:
+            extra = []
+    return list(builtin) + [c for c in extra if c not in builtin]
+
+
+def _fill_cmap_combo(cb, names, current):
+    cb.clear()
+    for name in names:
+        icon = None
+        if _gpr_palettes is not None:
+            try:
+                icon = _gpr_palettes.make_cmap_icon(name, 64, 14)
+            except Exception:
+                icon = None
+        cb.addItem(icon, name) if icon is not None else cb.addItem(name)
+    cb.setCurrentText(current)
+
 
 pv = None
 QtInteractor = None
@@ -300,38 +331,20 @@ class Gpr3dViewerDialog(QDialog):
         self._chk_follow_profile_depth.toggled.connect(self._on_follow_profile_toggled)
         form.addRow("Depth sync:", self._chk_follow_profile_depth)
 
-        self._cmap_combo = QComboBox()
-        self._cmap_combo.addItems(
-            [
-                "RdBu_r",
-                "seismic",
-                "gray",
-                "viridis",
-                "plasma",
-                "magma",
-                "turbo",
-                "Spectral_r",
-            ]
+        _slice_choices = _cmap_choices(
+            ["RdBu_r", "seismic", "gray", "viridis", "plasma", "magma", "turbo", "Spectral_r"]
         )
-        self._cmap_combo.setCurrentText(self._section_cmap)
+        _radar_choices = _cmap_choices(
+            ["gray", "Greys_r", "seismic", "RdBu_r", "viridis", "plasma", "magma", "turbo", "Spectral_r"]
+        )
+
+        self._cmap_combo = QComboBox()
+        _fill_cmap_combo(self._cmap_combo, _slice_choices, self._section_cmap)
         self._cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
         form.addRow("Timeslice cmap:", self._cmap_combo)
 
         self._radargram_cmap_combo = QComboBox()
-        self._radargram_cmap_combo.addItems(
-            [
-                "gray",
-                "Greys_r",
-                "seismic",
-                "RdBu_r",
-                "viridis",
-                "plasma",
-                "magma",
-                "turbo",
-                "Spectral_r",
-            ]
-        )
-        self._radargram_cmap_combo.setCurrentText(self._radargram_cmap)
+        _fill_cmap_combo(self._radargram_cmap_combo, _radar_choices, self._radargram_cmap)
         self._radargram_cmap_combo.currentTextChanged.connect(self._on_radargram_cmap_changed)
         form.addRow("Radargram cmap:", self._radargram_cmap_combo)
 
@@ -1028,6 +1041,50 @@ class Gpr3dViewerDialog(QDialog):
         except Exception:
             pass
 
+    def _setup_bounds_grid(self):
+        """(Re)build the bounding-box grid.
+
+        Must run *after* the volume is loaded and the Z scale applied, so the
+        vtkCubeAxesActor is created against valid bounds and an initialised
+        camera. ``use_2d=True`` replaces the camera-facing vtkFollower tick
+        labels with a 2D overlay: on the QGIS-bundled VTK on Windows the 3D
+        followers combined with a non-uniform set_scale() trigger a native
+        access violation inside vtkFollower::Render.
+        """
+        if self._plotter is None:
+            return
+        try:
+            n_x = int(self._spatial.get("n_x", 0))
+            n_y = int(self._spatial.get("n_y", 0))
+            n_z = int(self._spatial.get("n_z", 0))
+        except Exception:
+            n_x = n_y = n_z = 0
+        # Degenerate / empty volume: no axes rather than a crash-prone actor.
+        if min(n_x, n_y, n_z) < 2 or int(getattr(self, "_finite_voxels", 0)) <= 0:
+            try:
+                self._plotter.remove_bounds_axes()
+            except Exception:
+                pass
+            return
+        try:
+            self._plotter.remove_bounds_axes()
+        except Exception:
+            pass
+        try:
+            self._plotter.reset_camera()
+        except Exception:
+            pass
+        try:
+            self._plotter.show_grid(use_2d=True)
+        except TypeError:
+            # Older pyvista without the use_2d kwarg.
+            try:
+                self._plotter.show_grid()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _render_now(self):
         if bool(getattr(self, "_render_in_progress", False)):
             return
@@ -1299,7 +1356,6 @@ class Gpr3dViewerDialog(QDialog):
         except Exception:
             pass
         self._plotter.add_axes()
-        self._plotter.show_grid()
 
         self._load_volume_grid(self._volume, self._meta)
         self._apply_z_scale()
@@ -1320,6 +1376,7 @@ class Gpr3dViewerDialog(QDialog):
         else:
             self._apply_projection_mode()
             self._apply_z_scale()
+        self._setup_bounds_grid()
         self._render_now()
         self._status.setText(
             f"Volume: {int(self._spatial.get('n_x', 0))}x{int(self._spatial.get('n_y', 0))}x{int(self._spatial.get('n_z', 0))}  "
@@ -1532,6 +1589,7 @@ class Gpr3dViewerDialog(QDialog):
 
         e = self._resample_profile_vec(getattr(ch, "easting", []), n_t)
         n = self._resample_profile_vec(getattr(ch, "northing", []), n_t)
+        _dbg.log_once(("3d-a", id(ch), n_t), "VIEWER3D", "traccia profilo: " + _dbg.describe_track(e, n))
         finite = np.isfinite(e) & np.isfinite(n)
         if int(np.count_nonzero(finite)) < 2:
             return None
@@ -1674,6 +1732,7 @@ class Gpr3dViewerDialog(QDialog):
 
     def _on_z_scale_changed(self, _value: float):
         self._apply_z_scale()
+        self._setup_bounds_grid()
         self._render_now()
 
     def _on_show_volume_toggled(self, _checked: bool):
@@ -1911,6 +1970,7 @@ class Gpr3dViewerDialog(QDialog):
 
             e = self._resample_profile_vec(getattr(ch, "easting", []), n_t)
             n = self._resample_profile_vec(getattr(ch, "northing", []), n_t)
+            _dbg.log_once(("3d-b", id(ch), n_t), "VIEWER3D", "traccia profilo: " + _dbg.describe_track(e, n))
             finite = np.isfinite(e) & np.isfinite(n)
             if int(np.count_nonzero(finite)) < 2:
                 continue

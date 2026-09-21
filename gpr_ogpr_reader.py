@@ -29,6 +29,11 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    from . import gpr_debug_log as _dbg
+except ImportError:  # esecuzione fuori pacchetto (test/script)
+    import gpr_debug_log as _dbg
+
 GEO_DOUBLES_PER_CHANNEL = 8   # east, north, alt, heading, pitch, roll, spare x2
 _UTM_MIN = 1_000.0            # soglia minima plausibile per coordinate proiettate (m)
 _MAX_PLAUSIBILITY_SAMPLE = 250_000
@@ -713,11 +718,29 @@ def read_ogpr(path: str, verify_md5: bool = False) -> OgprProfile:
                 dps=dps,
             )
             parse_warnings.extend(geo_warnings)
+            _dbg.log(
+                "READ",
+                f"{Path(str(path)).name}: geo_bytesize={g_bytesize} slices={n_slices} "
+                f"canali={n_channels} extra_doubles={extra_doubles} dtype={geo_raw_dtype} "
+                f"score={_geo_data_score(geo_ch):.2f} epsg={epsg}"
+                + (f" warning={geo_warnings}" if geo_warnings else ""),
+            )
 
             # Costruisci canali
             channels = []
             for ch_i in range(n_channels):
                 data_ch = radar_3d[:, ch_i, :].T.copy()   # (n_samples, n_slices)
+                # Il campione 0 e' un artefatto di trigger (outlier ~10x): dewow e
+                # bandpass lo spargono sui campioni vicini e falsano time-zero.
+                if data_ch.shape[0] > 8:
+                    # Artefatto = campione 0 quasi costante tra le tracce e molto piu'
+                    # grande del resto (vale anche se l'onda diretta parte subito).
+                    _c0 = data_ch[0].astype(np.float64)
+                    _m0 = float(np.median(_c0))
+                    _ref = float(np.median(np.abs(data_ch[1:min(40, data_ch.shape[0])])))
+                    if (abs(_m0) > 3.0 * max(_ref, 1.0)
+                            and float(np.std(_c0)) < 0.1 * abs(_m0)):
+                        data_ch[0] = data_ch[1]
                 east_ch = geo_ch[:, ch_i, 0].copy()
                 north_ch = geo_ch[:, ch_i, 1].copy()
                 alt_ch = geo_ch[:, ch_i, 2].copy()
@@ -746,6 +769,12 @@ def read_ogpr(path: str, verify_md5: bool = False) -> OgprProfile:
                 if (not np.isfinite(dist).all()) or (dist[-1] < 1e-3):
                     dist = np.arange(n_slices, dtype=np.float64) * sampling_step
 
+                _dbg.log(
+                    "READ",
+                    f"{Path(str(path)).name} ch{ch_i}: {_dbg.describe_track(east_ch, north_ch)} "
+                    f"dist_tot={float(dist[-1]):.3f}m "
+                    f"({'da coordinate' if dist[-1] >= 1e-3 and np.isfinite(dist).all() else 'FALLBACK sampling_step'})",
+                )
                 channels.append(OgprChannel(
                     channel_idx = ch_i,
                     data        = data_ch,
@@ -810,8 +839,17 @@ def read_ogpr_cached(path: str, verify_md5: bool = False) -> OgprProfile:
     st = p.stat()
     mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
     size = int(st.st_size)
-    return _read_ogpr_cached_impl(str(p), mtime_ns, size, bool(verify_md5))
+    _before = _read_ogpr_cached_impl.cache_info().hits
+    prof = _read_ogpr_cached_impl(str(p), mtime_ns, size, bool(verify_md5))
+    if _read_ogpr_cached_impl.cache_info().hits > _before:
+        _dbg.log(
+            "READ",
+            f"{p.name}: CACHE HIT (oggetto riusato, comprese eventuali coordinate "
+            "gia' sovrascritte dal posizionamento manuale). Usa 'Pulisci cache' per rileggere dal file.",
+        )
+    return prof
 
 
 def clear_ogpr_cache() -> None:
     _read_ogpr_cached_impl.cache_clear()
+    _dbg.log("CACHE", "cache OGPR svuotata")
