@@ -19,13 +19,19 @@ import json
 
 FORMAT = "rasterlinker_slicespec_v1"
 
-AMPLITUDE_MODES = ("abs_mean", "rms", "env_peak", "signed_mean", "max_abs")
+AMPLITUDE_MODES = ("abs_mean", "rms", "env_peak", "env_mean", "signed_mean", "max_abs")
 # "bin"  = every channel at its own position + binned/normalised-convolution
 #          gridding (slice_engine, the default; no IDW bull's-eyes, fast);
 # "idw"  = the legacy profile-centre-line IDW path (compute_ogpr_slice_grids);
 # "kriging" is reserved and not implemented.
 INTERP_METHODS = ("bin", "idw", "kriging")
-SMOOTH_LOWPASS_VALUES = (0, 3, 5)
+SMOOTH_LOWPASS_VALUES = (0, 3, 5, 7, 9, 11, 15)
+# Amplitude tools (all default to "off": an untouched spec gives the same slices
+# as before they existed). See ``slicing`` for the numerics and ``slice_engine``
+# for the order they are applied in.
+AMPLITUDE_SCALES = ("linear", "sqrt", "db")
+NORMALIZE_MODES = ("none", "median")
+DESPECKLE_SIZES = (0, 3, 5)
 # Level equalisation applied before gridding: "channel" removes the per-channel
 # gain differences of array radars (stripes along the tracks), "profile" only
 # equalises whole swaths, "none" leaves the amplitudes untouched.
@@ -39,6 +45,7 @@ _AMPLITUDE_MAP = {
     "abs_mean": ("las_like", False),
     "rms": ("las_like", False),
     "env_peak": ("envelope", True),
+    "env_mean": ("envelope", True),
     "signed_mean": ("signed", False),
     "max_abs": ("las_like", False),
 }
@@ -65,10 +72,16 @@ class SliceSpec:
     interp: str = "bin"
     search_radius_m: float | None = None  # None -> auto from interline spacing
     blanking_radius_m: float = 0.0
-    smooth_lowpass: int = 3               # 0 | 3 | 5 (low-pass kernel size)
+    smooth_lowpass: int = 3               # 0 | 3 | 5 | 7 | 9 | 11 | 15 (low-pass kernel size)
     bg_horizontal: bool = False           # rimuove bande orizzontali (media per riga)
     bg_vertical: bool = False             # rimuove bande verticali (media per colonna)
     bg_clip_pct: float = 95.0             # percentile: i target forti non entrano nel background
+    # --- amplitude tools (defaults = off) -----------------------------------
+    despike_pct: float = 100.0            # cap trace amplitudes above this percentile (100 = off)
+    normalize: str = "none"               # "none" | "median" (divide the slice by its median)
+    amp_scale: str = "linear"             # "linear" | "sqrt" | "db" (positive modes only)
+    despeckle: int = 0                    # 0 | 3 | 5 (median filter on the finished slice)
+    highpass_m: float = 0.0               # Gaussian sigma (m) of the local background to subtract (0 = off)
     # --- crs ------------------------------------------------------------
     crs_epsg: int | None = None
 
@@ -104,6 +117,16 @@ class SliceSpec:
             raise SliceSpecError(
                 f"smooth_lowpass {self.smooth_lowpass!r} not in {SMOOTH_LOWPASS_VALUES}"
             )
+        if not (50.0 <= float(self.despike_pct) <= 100.0):
+            raise SliceSpecError("despike_pct must be in [50, 100] (100 = off)")
+        if self.normalize not in NORMALIZE_MODES:
+            raise SliceSpecError(f"normalize {self.normalize!r} not in {NORMALIZE_MODES}")
+        if self.amp_scale not in AMPLITUDE_SCALES:
+            raise SliceSpecError(f"amp_scale {self.amp_scale!r} not in {AMPLITUDE_SCALES}")
+        if int(self.despeckle) not in DESPECKLE_SIZES:
+            raise SliceSpecError(f"despeckle {self.despeckle!r} not in {DESPECKLE_SIZES}")
+        if float(self.highpass_m) < 0.0:
+            raise SliceSpecError("highpass_m must be >= 0 (0 = off)")
 
     # ------------------------------------------------------------------
     # derived geometry
@@ -117,6 +140,15 @@ class SliceSpec:
     def smooth_sigma(self) -> float:
         """Gaussian sigma equivalent of the low-pass kernel size."""
         return float(self.smooth_lowpass) / 3.0 if self.smooth_lowpass else 0.0
+
+    @property
+    def tools_active(self) -> bool:
+        """True when any amplitude tool departs from its "off" default."""
+        return bool(
+            float(self.despike_pct) < 100.0 or self.normalize != "none"
+            or self.amp_scale != "linear" or int(self.despeckle) > 0
+            or float(self.highpass_m) > 0.0
+        )
 
     @property
     def grid_bg_spec(self) -> str:

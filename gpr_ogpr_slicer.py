@@ -32,6 +32,7 @@ except ImportError:
 # Shared numeric core and raster I/O (Fase A extraction). These names keep
 # their historical spelling so the rest of this module is unchanged.
 from .raster_io import (  # noqa: F401
+    embed_tif_metadata as _embed_tif_metadata,
     write_qml_singleband as _write_qml_singleband,
     write_tif_singleband as _write_tif_singleband,
 )
@@ -1589,6 +1590,7 @@ def compute_slice(
             progress_callback=extra.get("progress_callback"),
             cancel_event=extra.get("cancel_event"),
             emit_diagnostics=bool(extra.get("emit_diagnostics", True)),
+            points_cache=extra.get("points_cache"),
         )
 
     if single_window is not None:
@@ -2303,6 +2305,20 @@ def _validate_grid_georef_meta(meta: dict, grid: np.ndarray | None = None) -> No
             )
 
 
+def _embed_slice_provenance(tif_path: str, meta: dict, item: dict) -> None:
+    """Record inside the GeoTIFF how its values were made (depth window and the
+    full ``SliceSpec``, amplitude tools included). ``sliceset.json`` and the
+    ``.qml`` sit next to the file and get lost when it is copied elsewhere."""
+    items = {"GPR_Z_FROM": item.get("z_from"), "GPR_Z_TO": item.get("z_to")}
+    spec = (meta or {}).get("slice_spec")
+    if spec:
+        try:
+            items["GPR_SLICE_SPEC"] = json.dumps(spec, sort_keys=True, ensure_ascii=True, default=str)
+        except (TypeError, ValueError):
+            pass
+    _embed_tif_metadata(tif_path, items)
+
+
 def write_grids_to_tifs(
     grids: list[dict],
     meta: dict,
@@ -2334,6 +2350,7 @@ def write_grids_to_tifs(
 
         _write_tif_singleband(grid, tif_path, x_min, y_min, y_max, res, epsg)
         _write_qml_singleband(tif_path, grid, style)
+        _embed_slice_provenance(tif_path, meta, item)
 
         results.append({
             "path": tif_path,

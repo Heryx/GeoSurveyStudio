@@ -18,6 +18,7 @@ from qgis.PyQt.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -26,8 +27,11 @@ from qgis.PyQt.QtWidgets import (
 
 from .slice_spec import (
     AMPLITUDE_MODES,
+    AMPLITUDE_SCALES,
     BALANCE_MODES,
+    DESPECKLE_SIZES,
     INTERP_METHODS,
+    NORMALIZE_MODES,
     SMOOTH_LOWPASS_VALUES,
     SliceSpec,
     SliceSpecError,
@@ -37,6 +41,7 @@ _AMPLITUDE_LABELS = {
     "abs_mean": "Media |ampiezza| (abs_mean)",
     "rms": "RMS (rms)",
     "env_peak": "Picco inviluppo (env_peak)",
+    "env_mean": "Media inviluppo (env_mean)",
     "signed_mean": "Media con segno (signed_mean)",
     "max_abs": "Max |ampiezza| (max_abs)",
 }
@@ -44,6 +49,15 @@ _INTERP_LABELS = {
     "bin": "Binning + gaussiana (consigliata)",
     "idw": "IDW (classico, lascia puntini)",
     "kriging": "Kriging (non implementato)",
+}
+_NORMALIZE_LABELS = {
+    "none": "Nessuna",
+    "median": "÷ mediana (1 = fondo)",
+}
+_SCALE_LABELS = {
+    "linear": "Lineare",
+    "sqrt": "Radice quadrata (√)",
+    "db": "Decibel (20·log10)",
 }
 _BALANCE_LABELS = {
     "channel": "Per canale (toglie le strisce)",
@@ -87,6 +101,16 @@ class SliceSpecPanel(QWidget):
         self.cb_amplitude = QComboBox()
         for m in AMPLITUDE_MODES:
             self.cb_amplitude.addItem(_AMPLITUDE_LABELS.get(m, m), m)
+        self.cb_amplitude.setToolTip(
+            "Come si riassume l'onda dentro lo spessore della slice, per ogni traccia:\n"
+            " • Media / Picco inviluppo: inviluppo di Hilbert, non dipende dalla fase\n"
+            "   dell'onda. La media è più stabile con campioni isolati anomali, il\n"
+            "   picco mette in risalto i bersagli puntuali.\n"
+            " • Media |ampiezza| / RMS: dipendono un po' dalla fase dell'onda.\n"
+            " • Media con segno: mantiene il segno (polarità del riflettore).\n"
+            "Sul rumore di fondo la differenza tra i modi è piccola: per pulire\n"
+            "l'immagine contano soprattutto la lisciatura e la scala colore."
+        )
         form.addRow("Ampiezza:", self.cb_amplitude)
 
         self.cb_source_variant = QComboBox()
@@ -153,6 +177,54 @@ class SliceSpecPanel(QWidget):
         self.sp_blanking.setToolTip("0 = nessun blanking; celle oltre questa distanza dai dati -> NoData")
         form.addRow("Raggio blanking:", self.sp_blanking)
 
+        # --- amplitude tools: the value conditioning, in the order it is applied ---
+        self.grp_tools = QGroupBox("Rifinitura ampiezze")
+        self.grp_tools.setToolTip(
+            "Le voci sono elencate nell'ordine in cui vengono applicate:\n"
+            "taglia picchi (sulle tracce, prima dell'interpolazione), poi sulla slice:\n"
+            "normalizzazione, scala, despeckle, background, low-pass, sfondo locale."
+        )
+        tl = QFormLayout(self.grp_tools)
+        tl.setContentsMargins(6, 6, 6, 6)
+        tl.setSpacing(4)
+
+        self.sp_despike = self._dspin(99.5, 90.0, 99.99, 0.1, " %")
+        self.sp_despike.setToolTip(
+            "Prima dell'interpolazione: le tracce con ampiezza sopra questo percentile\n"
+            "della slice vengono riportate al valore del percentile. Toglie i punti\n"
+            "isolati (una traccia rumorosa) che altrimenti diventano macchie luminose."
+        )
+        self.chk_despike = QCheckBox("attivo")
+        tl.addRow("Taglia picchi:", self._with_auto(self.sp_despike, self.chk_despike))
+
+        self.cb_normalize = QComboBox()
+        for m in NORMALIZE_MODES:
+            self.cb_normalize.addItem(_NORMALIZE_LABELS.get(m, m), m)
+        self.cb_normalize.setToolTip(
+            "Divide ogni slice per la propria mediana: 1 = ampiezza tipica del fondo,\n"
+            "2 = doppia. L'ampiezza cala con la profondità; così tutte le slice sono\n"
+            "confrontabili e si può usare un'unica scala colore fissa per l'intero set."
+        )
+        tl.addRow("Normalizza slice:", self.cb_normalize)
+
+        self.cb_scale = QComboBox()
+        for m in AMPLITUDE_SCALES:
+            self.cb_scale.addItem(_SCALE_LABELS.get(m, m), m)
+        self.cb_scale.setToolTip(
+            "Scala non lineare dei valori (solo ampiezze positive): comprime i valori\n"
+            "alti e fa emergere i segnali deboli. In dB, 6 dB = ampiezza doppia."
+        )
+        tl.addRow("Scala valori:", self.cb_scale)
+
+        self.cb_despeckle = QComboBox()
+        for v in DESPECKLE_SIZES:
+            self.cb_despeckle.addItem("nessuno" if v == 0 else f"{v}×{v}", v)
+        self.cb_despeckle.setToolTip(
+            "Filtro mediano sulla slice finita: elimina i pixel isolati senza sfocare\n"
+            "i bordi come farebbe una gaussiana."
+        )
+        tl.addRow("Despeckle:", self.cb_despeckle)
+
         self.chk_bg_h = QCheckBox("orizzontale")
         self.chk_bg_h.setToolTip("Toglie le bande orizzontali (sottrae la media di ogni riga della slice)")
         self.chk_bg_v = QCheckBox("verticale")
@@ -164,18 +236,29 @@ class SliceSpecPanel(QWidget):
         _bgl.setContentsMargins(0, 0, 0, 0)
         for _w in (self.chk_bg_h, self.chk_bg_v, QLabel("clip"), self.sp_bg_clip):
             _bgl.addWidget(_w)
-        form.addRow("Background slice:", _bgw)
+        tl.addRow("Background slice:", _bgw)
 
         self.cb_smooth = QComboBox()
         for v in SMOOTH_LOWPASS_VALUES:
             self.cb_smooth.addItem("nessuno" if v == 0 else f"{v}×{v}", v)
         self.cb_smooth.setCurrentIndex(max(0, self.cb_smooth.findData(SliceSpec().smooth_lowpass)))
         self.cb_smooth.setToolTip(
-            "Ulteriore lisciatura gaussiana della slice finita. Con la risoluzione\n"
-            "piena dell'array (4 cm) il rumore incoerente si vede: 3×3 è un buon\n"
-            "compromesso, 5×5 lo riduce ancora."
+            "Lisciatura gaussiana della slice finita (sigma = lato/3 celle). Con la\n"
+            "risoluzione piena dell'array (4 cm) il rumore incoerente si vede: 3×3 è\n"
+            "un buon compromesso; 7×7 – 11×11 danno un aspetto più liscio."
         )
-        form.addRow("Low-pass finale:", self.cb_smooth)
+        tl.addRow("Low-pass finale:", self.cb_smooth)
+
+        self.sp_highpass = self._dspin(0.0, 0.0, 50.0, 0.1, " m")
+        self.sp_highpass.setSpecialValueText("off")
+        self.sp_highpass.setToolTip(
+            "Sottrae lo sfondo che varia lentamente (gaussiana di questo sigma, in metri)\n"
+            "e lascia le anomalie locali: utile contro gradienti di umidità/terreno.\n"
+            "Valori tipici 0.5–2 m; più piccolo del bersaglio che cerchi non va usato."
+        )
+        tl.addRow("Sfondo locale:", self.sp_highpass)
+
+        form.addRow(self.grp_tools)
 
         # --- crs ------------------------------------------------------------
         self.le_crs_epsg = QLineEdit("")
@@ -214,12 +297,13 @@ class SliceSpecPanel(QWidget):
     def _wire_signals(self):
         for sp in (self.sp_z_min, self.sp_z_max, self.sp_thickness, self.sp_overlap,
                    self.sp_velocity, self.sp_resolution, self.sp_search_radius,
-                   self.sp_blanking, self.sp_bg_clip):
+                   self.sp_blanking, self.sp_bg_clip, self.sp_despike, self.sp_highpass):
             sp.valueChanged.connect(self._on_changed)
-        for cb in (self.cb_amplitude, self.cb_interp, self.cb_smooth, self.cb_balance):
+        for cb in (self.cb_amplitude, self.cb_interp, self.cb_smooth, self.cb_balance,
+                   self.cb_normalize, self.cb_scale, self.cb_despeckle):
             cb.currentIndexChanged.connect(self._on_changed)
         for chk in (self.chk_z_max_auto, self.chk_radius_auto, self.chk_velocity_auto,
-                    self.chk_bg_h, self.chk_bg_v):
+                    self.chk_bg_h, self.chk_bg_v, self.chk_despike):
             chk.toggled.connect(self._on_changed)
         self.cb_source_variant.currentTextChanged.connect(self._on_changed)
         self.le_crs_epsg.textChanged.connect(self._on_changed)
@@ -252,6 +336,23 @@ class SliceSpecPanel(QWidget):
         self.sp_z_max.setEnabled(not self.chk_z_max_auto.isChecked())
         self.sp_search_radius.setEnabled(not self.chk_radius_auto.isChecked())
         self.sp_velocity.setEnabled(not self.chk_velocity_auto.isChecked())
+        # The amplitude tools live in the "bin" engine; the legacy IDW path has
+        # its own (older) chain and ignores them, so do not offer what would lie.
+        binned = str(self.cb_interp.currentData() or "bin") == "bin"
+        # dB / sqrt / ratio need non-negative amplitudes.
+        positive = str(self.cb_amplitude.currentData() or "") != "signed_mean"
+        self.chk_despike.setEnabled(binned)
+        self.sp_despike.setEnabled(binned and self.chk_despike.isChecked())
+        self.cb_despeckle.setEnabled(binned)
+        self.sp_highpass.setEnabled(binned)
+        self.cb_normalize.setEnabled(binned and positive)
+        self.cb_scale.setEnabled(binned and positive)
+        note = "" if binned else "Disponibile solo con l'interpolazione «Binning + gaussiana»."
+        for w in (self.chk_despike, self.sp_despike, self.cb_despeckle, self.sp_highpass):
+            w.setStatusTip(note)
+        pos_note = "" if positive else "Non applicabile alla media con segno (valori negativi)."
+        self.cb_normalize.setStatusTip(pos_note)
+        self.cb_scale.setStatusTip(pos_note)
 
     def _on_changed(self, *_):
         self._sync_enabled()
@@ -288,6 +389,11 @@ class SliceSpecPanel(QWidget):
             bg_horizontal=self.chk_bg_h.isChecked(),
             bg_vertical=self.chk_bg_v.isChecked(),
             bg_clip_pct=float(self.sp_bg_clip.value()),
+            despike_pct=(float(self.sp_despike.value()) if self.chk_despike.isChecked() else 100.0),
+            normalize=str(self.cb_normalize.currentData() or "none"),
+            amp_scale=str(self.cb_scale.currentData() or "linear"),
+            despeckle=int(self.cb_despeckle.currentData() or 0),
+            highpass_m=float(self.sp_highpass.value()),
             crs_epsg=crs_epsg,
         )
         spec.validate()
@@ -321,6 +427,13 @@ class SliceSpecPanel(QWidget):
             self.chk_bg_h.setChecked(bool(spec.bg_horizontal))
             self.chk_bg_v.setChecked(bool(spec.bg_vertical))
             self.sp_bg_clip.setValue(float(spec.bg_clip_pct))
+            self.chk_despike.setChecked(float(spec.despike_pct) < 100.0)
+            if float(spec.despike_pct) < 100.0:
+                self.sp_despike.setValue(float(spec.despike_pct))
+            self._set_combo(self.cb_normalize, spec.normalize)
+            self._set_combo(self.cb_scale, spec.amp_scale)
+            self._set_combo(self.cb_despeckle, int(spec.despeckle))
+            self.sp_highpass.setValue(float(spec.highpass_m))
             self.le_crs_epsg.setText("" if spec.crs_epsg is None else str(int(spec.crs_epsg)))
             self._sync_enabled()
         finally:

@@ -122,6 +122,39 @@ def _parse_svg(path: str) -> List[Tuple[float, Tuple[float, float, float]]]:
         if col is None:
             continue
         stops.append((_clamp01(off), col))
+    if not stops:
+        stops = _stops_from_embedded_image(txt)
+    return stops
+
+
+_RE_DATA_IMG = re.compile(r"data:image/(?:png|jpe?g);base64,([A-Za-z0-9+/=\s]+)", re.I)
+
+
+def _stops_from_embedded_image(txt: str, n: int = 128) -> List[Tuple[float, Tuple[float, float, float]]]:
+    """SVG "colorbar" raster (<image> con PNG base64): campiona la barra al centro."""
+    m = _RE_DATA_IMG.search(txt)
+    if not m:
+        return []
+    try:
+        import base64
+        from qgis.PyQt.QtGui import QImage
+        img = QImage()
+        if not img.loadFromData(base64.b64decode(re.sub(r"\s+", "", m.group(1)))):
+            return []
+    except Exception:
+        return []
+    w, h = img.width(), img.height()
+    if w < 2 or h < 1:
+        return []
+    horizontal = w >= h
+    length = w if horizontal else h
+    n = max(2, min(n, length))
+    stops = []
+    for i in range(n):
+        t = i / (n - 1)
+        k = int(round(t * (length - 1)))
+        c = img.pixelColor(k, h // 2) if horizontal else img.pixelColor(w // 2, length - 1 - k)
+        stops.append((t, (c.redF(), c.greenF(), c.blueF())))
     return stops
 
 

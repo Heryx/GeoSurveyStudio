@@ -111,6 +111,7 @@ GPR_BUILTIN_CMAPS = [
     "cividis",
     "turbo",
     "Spectral_r",
+    "jet",
 ]
 DEFAULT_CMAP = "RdBu_r"
 
@@ -589,8 +590,9 @@ class _PreviewSliceWorker(QObject):
     finished = pyqtSignal(int, object, object, str, object)
 
     def __init__(self, request_id: int, profiles, z_from, z_to, resolution, chain_order, kwargs,
-                 spec=None, loader=None):
+                 spec=None, loader=None, points_cache=None):
         super().__init__()
+        self._points_cache = points_cache
         self._request_id = int(request_id)
         self._profiles = profiles
         self._loader = loader
@@ -624,6 +626,7 @@ class _PreviewSliceWorker(QObject):
                     idw_mode="fast",
                     fill_nodata=False,
                     emit_diagnostics=False,
+                    points_cache=self._points_cache,
                 )
             else:
                 from .gpr_ogpr_slicer import compute_timeslice_preview

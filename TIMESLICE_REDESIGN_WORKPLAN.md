@@ -352,6 +352,54 @@ Non fatto / da valutare:
 - Denoise fisico oltre la gaussiana (es. filtro lungo-traccia, kriging).
 - I nomi file `slice_NNNN_zX_XXXX.tif` (centro della finestra) non sono cambiati.
 
+## 3quater. Fase H — strumenti sui valori d'ampiezza (2026-09-21)
+
+Segnalazione dell'utente: sul rilievo SUASA (variante `v4`) la slice esce "piu'
+sporca" di quella che si vede in IQMaps; chiesti innanzitutto strumenti per
+lavorare sui valori. Diagnosi con i dati veri (attribuzione parametro per
+parametro sulla configurazione dello screenshot, rugosita' = std del laplaciano
+normalizzato):
+
+- **Low-pass finale "nessuno"** (lo spec del progetto era stato salvato prima del
+  default 3x3): 0.90 -> 0.66 con 3x3, 0.57 con 5x5, 0.52 con 9x9. E' il fattore
+  che pesa di piu' sul rumore.
+- **Scala colore**: ogni slice e' stirata sul proprio 2-98 %, quindi anche una
+  slice di solo fondo usa tutta la scala e la trama risulta molto contrastata.
+  IQMaps usa una scala comune e il fondo resta sui colori bassi.
+- **Modo d'ampiezza**: `env_peak` / `env_mean` / `abs_mean` / `rms` hanno
+  rugosita' quasi uguale (0.61-0.72 a 3 profondita'): NON e' li' il problema.
+- Background orizzontale/verticale: effetto trascurabile sulla rugosita'.
+- Cio' che non si puo' replicare: IQMaps migra in 3D (il Kirchhoff del plugin e'
+  2D per profilo e non si tocca, vedi memoria "no result changing optimizations").
+
+Fatto (tutto nello stesso `SliceSpec`, quindi anteprima = file salvati; con i
+valori predefiniti il risultato e' identico a prima, verificato con `array_equal`):
+
+- `slicing.py`: modo `env_mean`; `clip_outliers`, `scale_amplitude` (sqrt/dB),
+  `normalize_grid` (mediana), `median_despeckle`, `highpass_background`.
+- `slice_spec.py`: `despike_pct`, `normalize`, `amp_scale`, `despeckle`,
+  `highpass_m`; low-pass fino a 15x15.
+- `slice_engine.finish_grid`: catena in ordine (normalizza -> scala -> despeckle ->
+  background -> low-pass -> alto-passa). Il taglio picchi agisce sulle tracce
+  prima della griglia. Solo motore "bin"; con IDW i controlli sono disabilitati.
+- `slice_spec_panel.py`: gruppo "Rifinitura ampiezze".
+- `amplitude_stats.py` + `amplitude_histogram.py`: istogramma della slice visibile
+  con barra colore e limiti trascinabili, statistiche, valore sotto il cursore.
+- Scala colore: "Percentili della slice" (come prima) oppure "Valori fissi" (una
+  scala per tutto il set; finisce anche in `.qml` e GeoTIFF: `style["vmin"/"vmax"]`).
+  Con "Normalizza slice" le slice di profondita' diverse sono confrontabili.
+- Colormap `jet` aggiunta all'elenco.
+- Il GeoTIFF porta dentro `GPR_SLICE_SPEC` (spec completo), `GPR_Z_FROM/TO` oltre
+  allo stile: i valori (dB, rapporto alla mediana...) restano interpretabili.
+- Prestazioni a risultato identico: cache dell'estrazione nella preview (cambiare
+  strumenti alla stessa profondita' non rifa' l'Hilbert: ~1.9 s -> ~0.15 s) e
+  estrazione dei canali in thread per i modi a inviluppo (1.5 s -> 0.43 s).
+- Test: `test/test_amplitude_tools.py` (51), piu' i nuovi in
+  `test/test_viewer_timeslice.py`.
+
+Non fatto: scala comune calcolata sull'intero volume (oggi la si sceglie a mano
+dall'istogramma), strumenti sui set di slice gia' salvate, preset "stile IQMaps".
+
 ## 4. Ordine consigliato e rischio
 - A, B, C (core): ✅ fatte. Rischio basso, testate headless.
 - D: medio-alto (pannello grande `gpr_profile_viewer.py`), isolabile in

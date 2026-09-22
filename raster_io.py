@@ -287,6 +287,23 @@ def slice_stretch(grid: np.ndarray, clip_lo: float = 2.0, clip_hi: float = 98.0)
     return vmin, vmax
 
 
+def _fixed_limits(style: dict):
+    """``(vmin, vmax)`` when the style carries finite fixed limits, else None."""
+    try:
+        lo = style.get("vmin")
+        hi = style.get("vmax")
+        if lo is None or hi is None:
+            return None
+        lo, hi = float(lo), float(hi)
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        return None
+    if not hi > lo:
+        hi = lo + 1e-6
+    return lo, hi
+
+
 def write_qml_singleband(tif_path: str, grid: np.ndarray, style: dict | None = None) -> None:
     """Write the .qml sidecar of a slice GeoTIFF.
 
@@ -295,11 +312,18 @@ def write_qml_singleband(tif_path: str, grid: np.ndarray, style: dict | None = N
     when ``cmap`` resolves, the raster is rendered with that colour ramp so QGIS
     shows the slice the way it looked in the viewer. Without a usable ``cmap`` the
     classic grayscale style is written.
+
+    ``style["vmin"]`` / ``style["vmax"]`` (both, finite) fix the limits in data
+    units instead: every slice of a set then shares one colour scale.
     """
     style = dict(style or {})
-    vmin, vmax = slice_stretch(
-        grid, float(style.get("clip_lo", 2.0)), float(style.get("clip_hi", 98.0))
-    )
+    fixed = _fixed_limits(style)
+    if fixed is not None:
+        vmin, vmax = fixed
+    else:
+        vmin, vmax = slice_stretch(
+            grid, float(style.get("clip_lo", 2.0)), float(style.get("clip_hi", 98.0))
+        )
     stops = colormap_hex_stops(style["cmap"]) if style.get("cmap") else None
     if stops:
         n = len(stops)
@@ -334,6 +358,24 @@ def embed_style_in_tif(tif_path: str, vmin: float, vmax: float, colors=None) -> 
         ds.SetMetadataItem("GPR_STYLE_VMIN", repr(float(vmin)))
         ds.SetMetadataItem("GPR_STYLE_VMAX", repr(float(vmax)))
         ds.SetMetadataItem("GPR_STYLE_COLORS", ",".join(colors) if colors else "")
+        ds.FlushCache()
+        ds = None
+        return True
+    except Exception:
+        return False
+
+
+def embed_tif_metadata(tif_path: str, items: dict) -> bool:
+    """Write string metadata items (``None`` values skipped) into the GeoTIFF
+    itself, so what produced the values travels with the file."""
+    try:
+        from osgeo import gdal
+        ds = gdal.Open(str(tif_path), gdal.GA_Update)
+        if ds is None:
+            return False
+        for key, value in (items or {}).items():
+            if value is not None:
+                ds.SetMetadataItem(str(key), str(value))
         ds.FlushCache()
         ds = None
         return True

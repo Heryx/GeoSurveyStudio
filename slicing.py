@@ -209,7 +209,7 @@ def _blanking_mask_from_distance(
 # are filled from a wider Gaussian, blended in smoothly. No KD-tree, no Python
 # loop over cells: a 90k-cell slice takes ~0.1 s.
 
-AMPLITUDE_WINDOW_MODES = ("abs_mean", "rms", "env_peak", "signed_mean", "max_abs")
+AMPLITUDE_WINDOW_MODES = ("abs_mean", "rms", "env_peak", "env_mean", "signed_mean", "max_abs")
 _HILBERT_PAD = 48  # samples of context around the window for the envelope
 
 
@@ -256,9 +256,12 @@ def window_amplitude(data: np.ndarray, s_lo: int, s_hi: int, mode: str) -> np.nd
 
     ``data`` is a ``(n_samples, n_traces)`` radargram. Modes:
     ``abs_mean`` mean(|a|), ``rms`` sqrt(mean(a^2)), ``max_abs`` max(|a|),
-    ``signed_mean`` mean(a), ``env_peak`` max of the Hilbert envelope (computed
-    on the window plus a few samples of context, so it is not distorted at the
-    window edges and never touches the rest of the trace).
+    ``signed_mean`` mean(a), ``env_peak`` max of the Hilbert envelope and
+    ``env_mean`` its mean over the window (the envelope is computed on the window
+    plus a few samples of context, so it is not distorted at the window edges and
+    never touches the rest of the trace). ``env_mean`` is phase-independent like
+    ``env_peak`` but averages instead of picking one sample, so it is far less
+    sensitive to isolated spikes.
     """
     if mode not in AMPLITUDE_WINDOW_MODES:
         raise ValueError(f"amplitude mode {mode!r} not in {AMPLITUDE_WINDOW_MODES}")
@@ -267,11 +270,13 @@ def window_amplitude(data: np.ndarray, s_lo: int, s_hi: int, mode: str) -> np.nd
     s_hi = min(n_s, int(s_hi))
     if s_hi <= s_lo:
         return np.full(int(data.shape[1]), np.nan, dtype=np.float64)
-    if mode == "env_peak":
+    if mode in ("env_peak", "env_mean"):
         a = max(0, s_lo - _HILBERT_PAD)
         b = min(n_s, s_hi + _HILBERT_PAD)
-        env = _envelope(data[a:b])
-        return env[s_lo - a:s_hi - a].max(axis=0).astype(np.float64)
+        env = _envelope(data[a:b])[s_lo - a:s_hi - a]
+        if mode == "env_mean":
+            return env.mean(axis=0, dtype=np.float64)
+        return env.max(axis=0).astype(np.float64)
     seg = data[s_lo:s_hi]
     if mode == "abs_mean":
         return np.abs(seg).mean(axis=0, dtype=np.float64)
@@ -280,6 +285,121 @@ def window_amplitude(data: np.ndarray, s_lo: int, s_hi: int, mode: str) -> np.nd
     if mode == "max_abs":
         return np.abs(seg).max(axis=0).astype(np.float64)
     return seg.mean(axis=0, dtype=np.float64)  # signed_mean
+
+
+# ---------------------------------------------------------------------------
+# Amplitude tools: conditioning of the values before / after gridding
+# ---------------------------------------------------------------------------
+#
+# Every function is pure NumPy/SciPy, NaN-aware and returns a new array; the
+# ``slice_engine`` chains them according to the ``SliceSpec`` (so the live
+# preview and the saved GeoTIFFs go through exactly the same steps).
+
+AMPLITUDE_SCALES = ("linear", "sqrt", "db")
+NORMALIZE_MODES = ("none", "median")
+DESPECKLE_SIZES = (0, 3, 5)
+_DB_FLOOR_REL = 1e-6      # dB floor: 1e-6 of the slice maximum (-120 dB), never log(0)
+_MAX_SAFE_CELLS = 5_000_000
+
+
+def clip_outliers(values, upper_pct: float, symmetric: bool = False) -> np.ndarray:
+    """Cap the extreme values at the ``upper_pct`` percentile of ``values``.
+
+    Tames isolated spikes (a single noisy trace) before gridding, so they do not
+    turn into a bright blob after the smoothing. ``upper_pct >= 100`` is a no-op.
+    With ``symmetric`` (zero-centred amplitudes such as ``signed_mean``) the low
+    tail is capped at the ``100 - upper_pct`` percentile as well. NaN are ignored.
+    """
+    v = np.asarray(values, dtype=np.float64)
+    p = float(upper_pct)
+    if not (p < 100.0):
+        return v
+    fin = np.isfinite(v)
+    if not fin.any():
+        return v
+    p = max(p, 50.0)
+    hi = float(np.percentile(v[fin], p))
+    lo = float(np.percentile(v[fin], 100.0 - p)) if symmetric else -np.inf
+    return np.clip(v, lo, hi)
+
+
+def scale_amplitude(grid, scale: str) -> np.ndarray:
+    """Non-linear scale of a *positive* amplitude grid.
+
+    ``sqrt`` compresses the dynamic range gently; ``db`` is ``20*log10`` (values
+    are floored at 1e-6 of the slice maximum so zeros never give -inf). ``linear``
+    (or anything else) returns the grid unchanged. NaN stay NaN.
+    """
+    g = np.asarray(grid, dtype=np.float64)
+    if scale == "sqrt":
+        return np.sqrt(np.maximum(g, 0.0))
+    if scale == "db":
+        fin = g[np.isfinite(g)]
+        peak = float(fin.max()) if fin.size else 0.0
+        floor = max(peak * _DB_FLOOR_REL, 1e-12)
+        return 20.0 * np.log10(np.maximum(g, floor))
+    return g
+
+
+def normalize_grid(grid, mode: str) -> np.ndarray:
+    """``median``: divide by the slice median so 1.0 is the typical background.
+
+    Puts slices of different depths on one comparable scale (amplitude falls
+    with depth) - the basis for a single fixed colour range across the whole set.
+    A non-positive median leaves the grid untouched.
+    """
+    g = np.asarray(grid, dtype=np.float64)
+    if mode != "median":
+        return g
+    fin = g[np.isfinite(g)]
+    if fin.size == 0:
+        return g
+    med = float(np.median(fin))
+    if not med > 1e-12:
+        return g
+    return g / med
+
+
+def _nearest_fill(grid: np.ndarray):
+    """``(filled, nan_mask)``: NaN cells take the value of the nearest finite cell,
+    so an order filter does not see the survey outline as data."""
+    nan = ~np.isfinite(grid)
+    if not nan.any() or nan.all():
+        return grid, nan
+    if grid.size > _MAX_SAFE_CELLS:
+        return np.where(nan, float(np.nanmedian(grid)), grid), nan
+    from scipy.ndimage import distance_transform_edt
+
+    idx = distance_transform_edt(nan, return_distances=False, return_indices=True)
+    return grid[idx[0], idx[1]], nan
+
+
+def median_despeckle(grid, size: int) -> np.ndarray:
+    """``size`` x ``size`` (odd) median filter that respects the NaN outline.
+
+    Removes isolated bright/dark cells without blurring edges the way a Gaussian
+    does. ``size < 3`` is a no-op.
+    """
+    g = np.asarray(grid, dtype=np.float64)
+    size = int(size)
+    if size < 3 or not np.isfinite(g).any():
+        return g
+    from scipy.ndimage import median_filter
+
+    filled, nan = _nearest_fill(g)
+    out = median_filter(filled, size=size | 1, mode="nearest")
+    out[nan] = np.nan
+    return out
+
+
+def highpass_background(grid, sigma_cells: float) -> np.ndarray:
+    """``grid`` minus its NaN-aware Gaussian of ``sigma_cells``: drops the slow
+    trend (geology, soil moisture) and leaves the small local anomalies."""
+    g = np.asarray(grid, dtype=np.float64)
+    s = float(sigma_cells)
+    if not s > 0.0 or not np.isfinite(g).any():
+        return g
+    return g - _smooth_grid_gaussian(g, sigma=s).astype(np.float64)
 
 
 def _splat_bilinear(x, y, v, x_min, y_min, n_x, n_y, resolution):

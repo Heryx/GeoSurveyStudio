@@ -5,6 +5,7 @@ Estratto da gpr_profile_viewer.py senza modifiche ai metodi."""
 
 from __future__ import annotations
 
+from .amplitude_stats import finite_values, format_stats, value_stats
 from .gpr_viewer_common import (
     DEFAULT_CHAIN_ORDER,
     DEFAULT_CMAP,
@@ -356,7 +357,178 @@ class TimesliceViewMixin:
             sp = getattr(self, attr, None)
             if sp is not None and self._is_qt_alive(sp):
                 style[key] = float(sp.value())
+        if self._slice_scale_mode() == "fixed":
+            # one scale for every slice: also written into the .qml / GeoTIFF
+            lo, hi = self._fixed_slice_limits()
+            style["vmin"], style["vmax"] = lo, hi
         return style
+
+    # ------------------------------------------------------------------
+    # Scala colore: percentili per slice oppure limiti fissi + istogramma
+    # ------------------------------------------------------------------
+    def _slice_scale_mode(self) -> str:
+        cb = getattr(self, "_cb_slice_scale_mode", None)
+        if cb is None or not self._is_qt_alive(cb):
+            return "percentile"
+        return "fixed" if str(cb.currentData() or "") == "fixed" else "percentile"
+
+    def _fixed_slice_limits(self) -> tuple[float, float]:
+        lo = float(self._spin_slice_vmin_abs.value())
+        hi = float(self._spin_slice_vmax_abs.value())
+        if not hi > lo:
+            hi = lo + 1e-6
+        return lo, hi
+
+    def _sync_slice_scale_widgets(self) -> None:
+        """Percentile spins and fixed-value spins are mutually exclusive."""
+        fixed = self._slice_scale_mode() == "fixed"
+        for attr, on in (("_spin_slice_vmin_pct", not fixed), ("_spin_slice_vmax_pct", not fixed),
+                         ("_spin_slice_vmin_abs", fixed), ("_spin_slice_vmax_abs", fixed)):
+            w = getattr(self, attr, None)
+            if w is not None and self._is_qt_alive(w):
+                w.setEnabled(on)
+
+    def _set_slice_fixed_spins(self, lo: float, hi: float) -> None:
+        for sp, val in ((self._spin_slice_vmin_abs, lo), (self._spin_slice_vmax_abs, hi)):
+            sp.blockSignals(True)
+            try:
+                sp.setValue(float(val))
+            finally:
+                sp.blockSignals(False)
+
+    def _set_slice_scale_mode(self, mode: str) -> None:
+        cb = self._cb_slice_scale_mode
+        idx = cb.findData(mode)
+        if idx >= 0 and idx != cb.currentIndex():
+            cb.blockSignals(True)
+            try:
+                cb.setCurrentIndex(idx)
+            finally:
+                cb.blockSignals(False)
+        self._sync_slice_scale_widgets()
+
+    def _on_slice_scale_mode_changed(self, *_):
+        self._sync_slice_scale_widgets()
+        if self._slice_scale_mode() == "fixed":
+            # start from what is on screen, so switching does not change the picture
+            im = getattr(self, "_slice_im", None)
+            if im is not None:
+                try:
+                    lo, hi = (float(v) for v in im.get_clim())
+                    self._set_slice_fixed_spins(lo, hi)
+                except Exception:
+                    pass
+        self._redraw_slice_view(force=True)
+
+    def _on_slice_fixed_limits_changed(self, *_):
+        if self._slice_scale_mode() != "fixed":
+            return
+        self._apply_slice_clim(*self._fixed_slice_limits())
+
+    def _on_slice_hist_limits(self, vmin: float, vmax: float) -> None:
+        """A histogram marker was dragged: from now on the limits are fixed."""
+        self._set_slice_scale_mode("fixed")
+        self._set_slice_fixed_spins(vmin, vmax)
+        self._apply_slice_clim(vmin, vmax)
+
+    def _apply_slice_clim(self, vmin: float, vmax: float) -> None:
+        """Change the colour limits of the picture on screen without rebuilding it."""
+        im = getattr(self, "_slice_im", None)
+        if im is None:
+            self._redraw_slice_view(force=True)
+            return
+        try:
+            im.set_clim(float(vmin), float(vmax))
+        except Exception:
+            self._redraw_slice_view(force=True)
+            return
+        hist = getattr(self, "_hist_slice", None)
+        if hist is not None and self._is_qt_alive(hist):
+            hist.set_limits(vmin, vmax)
+        self._safe_draw_idle(self._canvas_slice)
+
+    def _slice_color_limits(self, arr) -> tuple[float, float]:
+        """``(vmin, vmax)`` of the colour scale for ``arr``: the fixed values, or
+        the ``Contrasto`` percentile range of this very slice."""
+        if self._slice_scale_mode() == "fixed":
+            return self._fixed_slice_limits()
+        finite = arr[np.isfinite(arr)]
+        p_lo = 2.0
+        p_hi = 98.0
+        if hasattr(self, "_spin_slice_vmin_pct") and self._spin_slice_vmin_pct is not None:
+            try:
+                p_lo = float(self._spin_slice_vmin_pct.value())
+            except Exception:
+                p_lo = 2.0
+        if hasattr(self, "_spin_slice_vmax_pct") and self._spin_slice_vmax_pct is not None:
+            try:
+                p_hi = float(self._spin_slice_vmax_pct.value())
+            except Exception:
+                p_hi = 98.0
+        if p_hi <= p_lo + 0.1:
+            p_hi = min(100.0, p_lo + 0.1)
+        if finite.size > 0:
+            vmin = float(np.nanpercentile(finite, p_lo))
+            vmax = float(np.nanpercentile(finite, p_hi))
+            if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmax <= vmin):
+                vmin = float(np.nanmin(finite))
+                vmax = float(np.nanmax(finite))
+        else:
+            vmin, vmax = 0.0, 1.0
+        if not np.isfinite(vmin):
+            vmin = 0.0
+        if not np.isfinite(vmax) or vmax <= vmin:
+            vmax = vmin + 1e-6
+        return vmin, vmax
+
+    def _refresh_slice_histogram(self, arr, vmin: float, vmax: float) -> None:
+        """Feed the histogram + statistics with the slice now on screen."""
+        hist = getattr(self, "_hist_slice", None)
+        if hist is None or not self._is_qt_alive(hist):
+            return
+        try:
+            vals = finite_values(arr)
+            hist.set_data(vals, vmin, vmax)
+            self._safe_set_text(getattr(self, "_lbl_slice_stats", None), format_stats(value_stats(vals)))
+        except Exception:
+            pass
+
+    def _refresh_slice_hist_colors(self, *_):
+        hist = getattr(self, "_hist_slice", None)
+        cb = getattr(self, "_cb_slice_cmap", None)
+        if hist is None or cb is None or not (self._is_qt_alive(hist) and self._is_qt_alive(cb)):
+            return
+        try:
+            from .raster_io import colormap_hex_stops
+
+            hist.set_colors(colormap_hex_stops(str(cb.currentText()), 32) or [])
+        except Exception:
+            hist.set_colors([])
+
+    def _slice_value_at(self, x: float, y: float):
+        """Amplitude under the map position ``(x, y)`` in the picture on screen, or None."""
+        im = getattr(self, "_slice_im", None)
+        if im is None:
+            return None
+        try:
+            arr = im.get_array()
+            if arr is None or arr.ndim != 2:
+                return None
+            x0, x1, y0, y1 = (float(v) for v in im.get_extent())
+            if x1 == x0 or y1 == y0:
+                return None
+            n_r, n_c = arr.shape
+            col = int(np.floor((float(x) - x0) / (x1 - x0) * n_c))
+            if str(getattr(im, "origin", "upper")) == "lower":
+                row = int(np.floor((float(y) - y0) / (y1 - y0) * n_r))
+            else:
+                row = int(np.floor((y1 - float(y)) / (y1 - y0) * n_r))
+            if not (0 <= row < n_r and 0 <= col < n_c):
+                return None
+            v = float(np.ma.filled(arr[row, col], np.nan))
+            return v if np.isfinite(v) else None
+        except Exception:
+            return None
 
     def _sync_thickness_from_panel(self, *_):
         """Lo spessore vive nel pannello parametri: il vecchio spinbox nascosto
@@ -718,6 +890,8 @@ class TimesliceViewMixin:
         worker = _PreviewSliceWorker(
             request_id, prev_profiles, float(z_from), float(z_to), float(res), chain_order, kwargs,
             spec=preview_spec, loader=prev_loader,
+            points_cache=(self._preview_points_cache_for(prev_variant, prev_key)
+                          if preview_spec is not None else None),
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -728,6 +902,26 @@ class TimesliceViewMixin:
         self._preview_thread = thread
         self._preview_worker = worker
         thread.start()
+
+    def _preview_points_cache_for(self, prev_variant, prev_key) -> dict:
+        """Cache of the extracted amplitudes for the live preview.
+
+        Moving the amplitude tools / smoothing / colour limits at a fixed depth
+        must not repeat the expensive extraction (a Hilbert transform per channel
+        for the envelope modes): the engine keeps it here, keyed by window and
+        extraction settings. It is dropped as soon as the data behind it can have
+        changed (another variant / file mtime, other profiles, new geometry)."""
+        rev = int(getattr(self, "_geometry_rev", 0))
+        if prev_variant:
+            sig, pin = ("variant", str(prev_variant), prev_key, rev), None
+        else:
+            pin = list(self._profiles or [])      # keeps the ids below from being reused
+            sig = ("raw", tuple(id(p) for p in pin), rev)
+        holder = getattr(self, "_preview_points_holder", None)
+        if holder is None or holder["sig"] != sig:
+            holder = {"sig": sig, "pin": pin, "cache": {}}
+            self._preview_points_holder = holder
+        return holder["cache"]
 
     def _on_preview_worker_finished(self, request_id: int, grid, extent, error: str,
                                     load_result=None):
@@ -787,33 +981,8 @@ class TimesliceViewMixin:
                 self._safe_draw_idle(self._canvas_slice)
                 return
 
-            finite = arr[np.isfinite(arr)]
-            p_lo = 2.0
-            p_hi = 98.0
-            if hasattr(self, "_spin_slice_vmin_pct") and self._spin_slice_vmin_pct is not None:
-                try:
-                    p_lo = float(self._spin_slice_vmin_pct.value())
-                except Exception:
-                    p_lo = 2.0
-            if hasattr(self, "_spin_slice_vmax_pct") and self._spin_slice_vmax_pct is not None:
-                try:
-                    p_hi = float(self._spin_slice_vmax_pct.value())
-                except Exception:
-                    p_hi = 98.0
-            if p_hi <= p_lo + 0.1:
-                p_hi = min(100.0, p_lo + 0.1)
-            if finite.size > 0:
-                vmin = float(np.nanpercentile(finite, p_lo))
-                vmax = float(np.nanpercentile(finite, p_hi))
-                if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmax <= vmin):
-                    vmin = float(np.nanmin(finite))
-                    vmax = float(np.nanmax(finite))
-            else:
-                vmin, vmax = 0.0, 1.0
-            if not np.isfinite(vmin):
-                vmin = 0.0
-            if not np.isfinite(vmax) or vmax <= vmin:
-                vmax = vmin + 1e-6
+            vmin, vmax = self._slice_color_limits(arr)
+            self._refresh_slice_histogram(arr, vmin, vmax)
 
             cmap = (
                 self._cb_slice_cmap.currentText()
@@ -962,33 +1131,8 @@ class TimesliceViewMixin:
                 self._safe_draw_idle(self._canvas_slice)
                 return
 
-            finite = arr[np.isfinite(arr)]
-            p_lo = 2.0
-            p_hi = 98.0
-            if hasattr(self, "_spin_slice_vmin_pct") and self._spin_slice_vmin_pct is not None:
-                try:
-                    p_lo = float(self._spin_slice_vmin_pct.value())
-                except Exception:
-                    p_lo = 2.0
-            if hasattr(self, "_spin_slice_vmax_pct") and self._spin_slice_vmax_pct is not None:
-                try:
-                    p_hi = float(self._spin_slice_vmax_pct.value())
-                except Exception:
-                    p_hi = 98.0
-            if p_hi <= p_lo + 0.1:
-                p_hi = min(100.0, p_lo + 0.1)
-            if finite.size > 0:
-                vmin = float(np.nanpercentile(finite, p_lo))
-                vmax = float(np.nanpercentile(finite, p_hi))
-                if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmax <= vmin):
-                    vmin = float(np.nanmin(finite))
-                    vmax = float(np.nanmax(finite))
-            else:
-                vmin, vmax = 0.0, 1.0
-            if not np.isfinite(vmin):
-                vmin = 0.0
-            if not np.isfinite(vmax) or vmax <= vmin:
-                vmax = vmin + 1e-6
+            vmin, vmax = self._slice_color_limits(arr)
+            self._refresh_slice_histogram(arr, vmin, vmax)
 
             self._ax_slice.clear()
             self._slice_vline = None
@@ -1134,10 +1278,11 @@ class TimesliceViewMixin:
                 pass
             return
         try:
-            self._safe_set_text(
-                self._lbl_status,
-                f"Slice cursor: x {float(event.xdata):.1f}  y {float(event.ydata):.1f}"
-            )
+            txt = f"Slice cursor: x {float(event.xdata):.1f}  y {float(event.ydata):.1f}"
+            val = self._slice_value_at(float(event.xdata), float(event.ydata))
+            if val is not None:
+                txt += f"  |  valore {val:.4g}"
+            self._safe_set_text(self._lbl_status, txt)
         except Exception:
             pass
 

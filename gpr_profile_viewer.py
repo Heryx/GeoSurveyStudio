@@ -2821,6 +2821,69 @@ class GprProfileViewer(
         fl_slice.insertRow(_disp_row, "Colormap:", self._cb_slice_cmap)
         fl_slice.insertRow(_disp_row + 1, "", self._lbl_slice_cmap_preview)
         fl_slice.insertRow(_disp_row + 2, "Contrasto:", _clip_row)
+
+        # Limiti colore: percentili di ogni slice oppure valori fissi (una sola
+        # scala per tutto il set), con l'istogramma dei valori e i marcatori.
+        from qgis.PyQt.QtWidgets import QAbstractSpinBox
+        from .amplitude_histogram import AmplitudeHistogram
+
+        self._cb_slice_scale_mode = QComboBox()
+        self._cb_slice_scale_mode.addItem("Percentili della slice", "percentile")
+        self._cb_slice_scale_mode.addItem("Valori fissi (stessa scala)", "fixed")
+        self._cb_slice_scale_mode.setToolTip(
+            "Percentili: ogni slice usa il proprio intervallo (come sempre): ogni slice\n"
+            "e' stirata sull'intera scala colore, anche quando contiene solo fondo, e\n"
+            "il rumore appare molto contrastato.\n"
+            "Valori fissi: stessi limiti per tutte le slice (anche nel .qml e nel\n"
+            "GeoTIFF salvati); il fondo resta sui colori bassi e emergono solo i\n"
+            "bersagli. Con «Normalizza slice» le slice sono confrontabili."
+        )
+
+        def _limit_spin():
+            sp = QDoubleSpinBox()
+            sp.setRange(-1.0e9, 1.0e9)
+            sp.setDecimals(5)
+            sp.setKeyboardTracking(False)
+            try:
+                sp.setStepType(QAbstractSpinBox.AdaptiveDecimalStepType)
+            except Exception:
+                pass
+            return sp
+
+        self._spin_slice_vmin_abs = _limit_spin()
+        self._spin_slice_vmax_abs = _limit_spin()
+        self._spin_slice_vmax_abs.setValue(1.0)   # neutral start; switching mode copies the shown limits
+        self._spin_slice_vmin_abs.setToolTip("Valore che va al primo colore della scala.")
+        self._spin_slice_vmax_abs.setToolTip("Valore che va all'ultimo colore della scala.")
+        _fixed_row = QWidget()
+        _fixed_lay = QHBoxLayout(_fixed_row)
+        _fixed_lay.setContentsMargins(0, 0, 0, 0)
+        _fixed_lay.setSpacing(4)
+        _fixed_lay.addWidget(self._spin_slice_vmin_abs, 1)
+        _fixed_lay.addWidget(QLabel("–"), 0)
+        _fixed_lay.addWidget(self._spin_slice_vmax_abs, 1)
+        self._row_slice_fixed_limits = _fixed_row
+
+        self._hist_slice = AmplitudeHistogram()
+        self._lbl_slice_stats = QLabel("")
+        self._lbl_slice_stats.setWordWrap(True)
+        self._lbl_slice_stats.setStyleSheet("font-size: 8pt;")
+        self._lbl_slice_stats.setToolTip(
+            "Statistiche dei valori della slice visibile (dopo la rifinitura): numero di\n"
+            "celle, minimo, 2° percentile, mediana, 98° percentile, massimo, deviazione std."
+        )
+        fl_slice.insertRow(_disp_row + 3, "Limiti colore:", self._cb_slice_scale_mode)
+        fl_slice.insertRow(_disp_row + 4, "Valori:", _fixed_row)
+        fl_slice.insertRow(_disp_row + 5, self._hist_slice)
+        fl_slice.insertRow(_disp_row + 6, self._lbl_slice_stats)
+
+        self._cb_slice_scale_mode.currentIndexChanged.connect(self._on_slice_scale_mode_changed)
+        self._spin_slice_vmin_abs.valueChanged.connect(self._on_slice_fixed_limits_changed)
+        self._spin_slice_vmax_abs.valueChanged.connect(self._on_slice_fixed_limits_changed)
+        self._hist_slice.limits_changed.connect(self._on_slice_hist_limits)
+        self._cb_slice_cmap.currentTextChanged.connect(self._refresh_slice_hist_colors)
+        self._sync_slice_scale_widgets()
+        self._refresh_slice_hist_colors()
         self._sync_thickness_from_panel()
 
         proc_content = QWidget()

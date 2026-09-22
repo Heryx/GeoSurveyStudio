@@ -29,7 +29,9 @@ in (single geometry source); nothing is read from disk here.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import os
 from time import perf_counter
 
 import numpy as np
@@ -37,8 +39,13 @@ import numpy as np
 from .slicing import (
     AMPLITUDE_WINDOW_MODES,
     _smooth_grid_gaussian,
+    clip_outliers,
     depth_per_sample_m,
     grid_binned,
+    highpass_background,
+    median_despeckle,
+    normalize_grid,
+    scale_amplitude,
     window_amplitude,
     window_sample_range,
 )
@@ -250,11 +257,39 @@ def _balance_factors(records, mode: str, amplitude_mode: str):
     return scale, offset
 
 
-def window_points(profiles, geoms, spec, z_from, z_to):
-    """``(x, y, v)`` of every trace of every selected channel for one window."""
+_ENVELOPE_MODES = ("env_peak", "env_mean")
+_PARALLEL_MIN_JOBS = 16     # fewer channels than this: the pool costs more than it saves
+_MAX_WORKERS = 8
+
+
+def _extract_amplitudes(jobs, mode: str) -> list:
+    """``window_amplitude`` of every ``(data, lo, hi)`` job, in order.
+
+    The envelope modes run one Hilbert transform per channel: FFTs that release
+    the GIL, so a small thread pool scales. Each job is independent and the order
+    is preserved, so the result is identical to the plain sequential loop."""
+    def one(job):
+        return window_amplitude(job[0], job[1], job[2], mode)
+
+    workers = min(_MAX_WORKERS, os.cpu_count() or 1)
+    if mode not in _ENVELOPE_MODES or len(jobs) < _PARALLEL_MIN_JOBS or workers < 2:
+        return [one(j) for j in jobs]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(one, jobs))
+
+
+def window_points_raw(profiles, geoms, spec, z_from, z_to):
+    """``(x, y, v)`` of every trace of every selected channel for one window:
+    amplitude extraction + channel balancing, before any value conditioning.
+
+    This is the expensive step (a Hilbert transform per channel for the envelope
+    modes) and it only depends on the window, ``amplitude_mode``, ``velocity_m_s``
+    and ``balance`` - which is what lets the live preview reuse it while the user
+    tweaks the amplitude tools (see ``compute_grids(points_cache=...)``).
+    """
     mode = str(spec.amplitude_mode)
-    records = []  # (prof_idx, ch_idx, x, v)
     dz_cache: dict[int, float] = {}
+    jobs, jobs_geom = [], []
     for g in geoms:
         prof = profiles[g.prof_idx]
         dz = dz_cache.get(g.prof_idx)
@@ -267,7 +302,10 @@ def window_points(profiles, geoms, spec, z_from, z_to):
         lo, hi = window_sample_range(z_from, z_to, dz, int(data.shape[0]))
         if hi <= lo:
             continue
-        v = window_amplitude(data, lo, hi, mode)
+        jobs.append((data, lo, hi))
+        jobs_geom.append(g)
+    records = []  # (prof_idx, ch_idx, x, v)
+    for g, v in zip(jobs_geom, _extract_amplitudes(jobs, mode)):
         if v.shape[0] != g.x.shape[0]:
             continue
         records.append((g.prof_idx, g.ch_idx, g, v))
@@ -278,6 +316,87 @@ def window_points(profiles, geoms, spec, z_from, z_to):
     ys = np.concatenate([r[2].y for r in records])
     vs = np.concatenate([r[3] * s + o for r, s, o in zip(records, scale, offset)])
     return xs, ys, vs
+
+
+def despike_points(pts, spec):
+    """Cap isolated spikes (one noisy trace) before they are smeared into a blob
+    by the gridding. A no-op at ``despike_pct == 100``; never mutates ``pts``."""
+    despike = float(getattr(spec, "despike_pct", 100.0) or 100.0)
+    if pts is None or despike >= 100.0:
+        return pts
+    xs, ys, vs = pts
+    return xs, ys, clip_outliers(vs, despike, symmetric=(str(spec.amplitude_mode) == "signed_mean"))
+
+
+def window_points(profiles, geoms, spec, z_from, z_to):
+    """``(x, y, v)`` of one window as the gridding wants it (spikes capped)."""
+    return despike_points(window_points_raw(profiles, geoms, spec, z_from, z_to), spec)
+
+
+_POINTS_CACHE_MAX = 3   # windows kept: a few depths' worth of ~300k points each
+
+
+def _cached_points(cache, profiles, geoms, spec, z_from, z_to, channel):
+    """``window_points_raw`` through the caller's cache (``None`` = no caching).
+
+    The caller owns the cache and guarantees it only ever sees the same
+    ``profiles`` / geometry; the key here adds everything else the extraction
+    depends on. Cached tuples are never modified, only replaced."""
+    if cache is None:
+        return window_points_raw(profiles, geoms, spec, z_from, z_to)
+    vel = None if spec.velocity_m_s is None else float(spec.velocity_m_s)
+    key = (round(float(z_from), 6), round(float(z_to), 6), str(spec.amplitude_mode), vel,
+           str(spec.balance), int(channel))
+    pts = cache.get(key)
+    if pts is None:
+        pts = window_points_raw(profiles, geoms, spec, z_from, z_to)
+        if pts is not None:
+            cache[key] = pts
+            while len(cache) > _POINTS_CACHE_MAX:
+                cache.pop(next(iter(cache)))
+    return pts
+
+
+# ---------------------------------------------------------------------------
+# value conditioning of a gridded slice
+# ---------------------------------------------------------------------------
+
+
+def finish_grid(grid: np.ndarray, spec, resolution: float) -> np.ndarray:
+    """Turn a freshly binned grid into the finished slice.
+
+    The steps run in the order the form lists them and every one is a no-op at
+    its default, so an untouched spec gives exactly the pre-"amplitude tools"
+    slice:
+
+    1. ``normalize``  - divide by the slice median (positive amplitudes only);
+    2. ``amp_scale``  - sqrt / dB (positive amplitudes only);
+    3. ``despeckle``  - median filter;
+    4. background     - row / column mean removal (``grid_bg_spec``);
+    5. low-pass       - Gaussian (``smooth_sigma``);
+    6. ``highpass_m`` - subtract the slow local background.
+
+    The NaN outline of the input is restored at the end (filters may bleed a few
+    cells past the data).
+    """
+    keep = np.isfinite(grid)
+    if str(spec.amplitude_mode) != "signed_mean":
+        # dB / sqrt / ratio only make sense on non-negative amplitudes
+        if spec.normalize != "none":
+            grid = normalize_grid(grid, spec.normalize)
+        if spec.amp_scale != "linear":
+            grid = scale_amplitude(grid, spec.amp_scale)
+    if int(spec.despeckle) >= 3:
+        grid = median_despeckle(grid, int(spec.despeckle))
+    if spec.grid_bg_spec:
+        from .grid_filters import apply_grid_bg
+        grid = apply_grid_bg(grid, spec.grid_bg_spec).astype(np.float32, copy=False)
+    sigma = float(spec.smooth_sigma)
+    if sigma > 0.0:
+        grid = _smooth_grid_gaussian(grid, sigma=sigma)
+    if float(spec.highpass_m) > 0.0:
+        grid = highpass_background(grid, float(spec.highpass_m) / float(resolution))
+    return np.where(keep, grid, np.nan).astype(np.float32, copy=False)
 
 
 # ---------------------------------------------------------------------------
@@ -306,11 +425,15 @@ def compute_grids(
     progress_callback=None,
     cancel_event=None,
     emit_diagnostics: bool = True,
+    points_cache: dict | None = None,
 ) -> tuple[list[dict], dict]:
     """Compute the slice grids for a ``SliceSpec`` (``interp == "bin"``).
 
     ``single_window=(z0, z1)`` yields exactly one slice on that window (the live
     preview); ``resolution_override`` forces the cell size (coarser preview).
+    ``points_cache`` (a plain dict owned by the caller, only ever used with the
+    same ``profiles``) lets repeated calls skip the amplitude extraction when only
+    the gridding / amplitude tools changed; results are identical with or without.
     Returns ``(grids, meta)`` shaped like ``compute_ogpr_slice_grids``.
     """
     from .slice_spec import SliceSpec
@@ -348,7 +471,6 @@ def compute_grids(
     y_max = y_min + (n_y - 1) * res
     reach = float(rspec.search_radius_m or (res * 5.0))
     sigma_cells = 1.0
-    smooth_sigma = float(rspec.smooth_sigma)
 
     grids: list[dict] = []
     t_grid = 0.0
@@ -356,7 +478,9 @@ def compute_grids(
     for iz, (z_from, z_to) in enumerate(windows):
         if cancel_event is not None and cancel_event.is_set():
             break
-        pts = window_points(profiles, geoms, rspec, z_from, z_to)
+        pts = despike_points(
+            _cached_points(points_cache, profiles, geoms, rspec, z_from, z_to, channel), rspec
+        )
         if pts is None:
             if progress_callback is not None:
                 progress_callback(iz + 1, total)
@@ -369,12 +493,7 @@ def compute_grids(
             blanking_m=float(rspec.blanking_radius_m),
         )
         keep = np.isfinite(grid)
-        if rspec.grid_bg_spec:
-            from .grid_filters import apply_grid_bg
-            grid = apply_grid_bg(grid, rspec.grid_bg_spec).astype(np.float32, copy=False)
-        if smooth_sigma > 0.0:
-            grid = _smooth_grid_gaussian(grid, sigma=smooth_sigma)
-        grid = np.where(keep, grid, np.nan).astype(np.float32, copy=False)
+        grid = finish_grid(grid, rspec, res)
         t_grid += perf_counter() - t0
 
         n_valid = int(np.count_nonzero(keep))
@@ -446,4 +565,4 @@ def compute_grids(
 
 
 __all__ = ["compute_grids", "build_windows", "collect_geometry", "window_points",
-           "AMPLITUDE_WINDOW_MODES"]
+           "window_points_raw", "despike_points", "finish_grid", "AMPLITUDE_WINDOW_MODES"]

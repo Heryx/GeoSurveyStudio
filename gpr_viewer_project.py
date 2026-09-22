@@ -522,6 +522,13 @@ class ProjectPersistenceMixin:
                     sp = getattr(self, attr, None)
                     if key in style and self._is_qt_alive(sp):
                         sp.setValue(float(style[key]))
+                if hasattr(self, "_cb_slice_scale_mode"):
+                    if style.get("vmin") is not None and style.get("vmax") is not None:
+                        self._set_slice_fixed_spins(float(style["vmin"]), float(style["vmax"]))
+                        self._set_slice_scale_mode("fixed")
+                    else:
+                        self._set_slice_scale_mode("percentile")
+                    self._redraw_slice_view(force=True)
         except Exception as exc:
             print(f"[GPR viewer][WARN] ripristino stile timeslice fallito: {exc}")
 
