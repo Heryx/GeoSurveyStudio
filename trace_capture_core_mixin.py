@@ -17,6 +17,7 @@ from qgis.PyQt.QtWidgets import (
     QPlainTextEdit,
 )
 from qgis.core import (
+    QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsEditorWidgetSetup,
     QgsField,
@@ -28,15 +29,49 @@ from qgis.core import (
     QgsProject,
     QgsRasterLayer,
     QgsRaster,
+    QgsVectorFileWriter,
     QgsVectorLayer,
     QgsWkbTypes,
     QgsFeature,
     QgsGeometry,
     QgsPolygon,
+    QgsMarkerSymbol,
+    QgsLineSymbol,
+    QgsFillSymbol,
+    QgsSingleSymbolRenderer,
+    QgsPalLayerSettings,
+    QgsVectorLayerSimpleLabeling,
+    QgsTextFormat,
 )
 from PyQt5.QtWidgets import QCheckBox
 
-from .project_catalog import load_catalog, utc_now_iso
+from .project_catalog import (
+    ensure_project_structure,
+    load_catalog,
+    register_vector_layer,
+    sanitize_filename,
+    utc_now_iso,
+)
+
+# Nome del file GeoPackage che ospita le geometrie disegnate sul radargramma
+# (vedi capture_radargram_feature): un solo file con tre layer dentro, mai layer
+# di memoria - l'utente vuole che sopravvivano alla chiusura del progetto QGIS.
+_RADARGRAM_TRACE_GPKG_NAME = "radargram_traces.gpkg"
+
+# Layer delle geometrie disegnate direttamente sul radargramma (vedi
+# capture_radargram_feature): stesso schema di campi della linea in pianta
+# "Line Traces", ma un layer per tipo di geometria perche' QGIS non ammette
+# geometrie miste in un solo layer.
+_RADARGRAM_TRACE_LAYER_NAMES = {
+    "point": "Radargram Points",
+    "line": "Radargram Lines",
+    "polygon": "Radargram Polygons",
+}
+_RADARGRAM_TRACE_GEOM_TOKENS = {
+    "point": "Point",
+    "line": "LineString",
+    "polygon": "Polygon",
+}
 
 
 class TraceCaptureCoreMixin:
@@ -61,6 +96,11 @@ class TraceCaptureCoreMixin:
         self.trace_pending_vertex_clicks = []
         self.trace_canvas_wheel_modifier = "alt"
         self.trace_discard_outside_raster = False
+        # A differenza del flusso di digitalizzazione in pianta (centinaia di
+        # tracce automatiche, dialogo opt-in via trace_prompt_interpretation_popup),
+        # il disegno sul radargramma e' un'azione deliberata e poco frequente:
+        # qui il dialogo per codice anomalia/note e' attivo di default.
+        self.trace_radargram_prompt_after_draw = True
 
     def _cleanup_trace_capture(self):
         """Teardown trace capture runtime state. Called by plugin unload()."""
@@ -119,6 +159,17 @@ class TraceCaptureCoreMixin:
             and layer.geometryType() == QgsWkbTypes.LineGeometry
         )
 
+    def _is_trace_geom_layer(self, layer):
+        """Come `_is_line_layer`, ma accetta anche Point e Polygon (layer delle
+        geometrie disegnate sul radargramma, vedi capture_radargram_feature)."""
+        return (
+            isinstance(layer, QgsVectorLayer)
+            and layer.isValid()
+            and layer.geometryType() in (
+                QgsWkbTypes.PointGeometry, QgsWkbTypes.LineGeometry, QgsWkbTypes.PolygonGeometry,
+            )
+        )
+
     def _is_trace_layer(self, layer):
         if not self._is_line_layer(layer):
             return False
@@ -126,7 +177,15 @@ class TraceCaptureCoreMixin:
         required = {"trace_id", "ts_id", "z_mode", "z_value"}
         return required.issubset(field_names)
 
-    def _trace_layer_uri(self, crs_authid):
+    def _is_trace_layer_any_geom(self, layer):
+        """Come `_is_trace_layer`, ma per qualunque tipo di geometria del layer."""
+        if not self._is_trace_geom_layer(layer):
+            return False
+        field_names = {f.name() for f in layer.fields()}
+        required = {"trace_id", "ts_id", "z_mode", "z_value"}
+        return required.issubset(field_names)
+
+    def _trace_layer_uri(self, crs_authid, geom_type="LineString"):
         fields = [
             "field=trace_id:string(64)",
             "field=ts_id:string(512)",
@@ -145,11 +204,19 @@ class TraceCaptureCoreMixin:
             "field=notes:string(512)",
             "field=interpretation:string(512)",
             "field=comment:string(512)",
+            "field=profile_stem:string(256)",
+            "field=channel:int",
+            "field=amplitude:double",
+            "field=velocity_m_ns:double",
+            "field=rdp:double",
+            "field=source:string(32)",
+            "field=anomaly_id:string(128)",
         ]
-        return f"LineString?crs={crs_authid}&" + "&".join(fields)
+        token = str(geom_type or "LineString").strip() or "LineString"
+        return f"{token}?crs={crs_authid}&" + "&".join(fields)
 
     def _ensure_trace_layer_schema_and_form(self, layer):
-        if not self._is_line_layer(layer):
+        if not self._is_trace_geom_layer(layer):
             return
 
         # Backward-compatible schema enrichment for older projects/layers.
@@ -171,6 +238,13 @@ class TraceCaptureCoreMixin:
             ("interpretation", QVariant.String, 512),
             ("comment", QVariant.String, 512),
             ("notes", QVariant.String, 512),
+            ("profile_stem", QVariant.String, 256),
+            ("channel", QVariant.Int, 0),
+            ("amplitude", QVariant.Double, 0),
+            ("velocity_m_ns", QVariant.Double, 0),
+            ("rdp", QVariant.Double, 0),
+            ("source", QVariant.String, 32),
+            ("anomaly_id", QVariant.String, 128),
         )
         provider = layer.dataProvider()
         if provider is not None:
@@ -217,6 +291,12 @@ class TraceCaptureCoreMixin:
                 "z_value",
                 "created_at",
                 "vertex_depths",
+                "profile_stem",
+                "channel",
+                "amplitude",
+                "velocity_m_ns",
+                "rdp",
+                "source",
             }
             for field_name in readonly_fields:
                 idx = layer.fields().indexOf(field_name)
@@ -230,7 +310,7 @@ class TraceCaptureCoreMixin:
             pass
 
     def _backfill_trace_id_values(self, layer):
-        if layer is None or not self._is_line_layer(layer):
+        if layer is None or not self._is_trace_geom_layer(layer):
             return
         idx = layer.fields().indexOf("trace_id")
         if idx < 0:
@@ -883,4 +963,396 @@ class TraceCaptureCoreMixin:
             rows.append(self._capture_vertex_context_snapshot())
         store[key] = rows
         return rows
+
+    # ------------------------------------------------------------------
+    # Geometrie disegnate sul radargramma (RadargramDock)
+    #
+    # A differenza del disegno in pianta (che campiona la time-slice attiva
+    # per stimare la profondita'), qui la profondita' di ogni vertice e' gia'
+    # nota per costruzione: e' quella cliccata sul radargramma stesso. Niente
+    # raster-hit-test: si scrivono direttamente gli attributi vertex_depths
+    # riusando solo la serializzazione condivisa (_serialize_vertex_depths).
+    # ------------------------------------------------------------------
+
+    def _radargram_gpkg_path(self, project_root):
+        out_dir = None
+        try:
+            paths = ensure_project_structure(project_root)
+            out_dir = paths.get("vector_layers")
+        except Exception:
+            out_dir = None
+        if not out_dir:
+            out_dir = os.path.join(project_root, "vector_layers")
+            os.makedirs(out_dir, exist_ok=True)
+        return os.path.join(out_dir, _RADARGRAM_TRACE_GPKG_NAME)
+
+    def _open_radargram_gpkg_layer(self, gpkg_path, layer_name):
+        """Riapre un layer gia' presente in un .gpkg esistente (append), None se non c'e'."""
+        if not os.path.isfile(gpkg_path):
+            return None
+        layer = QgsVectorLayer(f"{gpkg_path}|layername={layer_name}", layer_name, "ogr")
+        return layer if layer.isValid() else None
+
+    def _create_radargram_gpkg_layer(self, gpkg_path, layer_name, geom_token, crs_authid):
+        """Crea il layer dentro il .gpkg: CreateOrOverwriteFile se il file non esiste
+        ancora, CreateOrOverwriteLayer se esiste gia' ma manca questo layer (per non
+        cancellare gli altri layer gia' scritti nello stesso file)."""
+        scratch = QgsVectorLayer(self._trace_layer_uri(crs_authid, geom_type=geom_token), layer_name, "memory")
+        if not scratch.isValid():
+            return None
+        opts = QgsVectorFileWriter.SaveVectorOptions()
+        opts.driverName = "GPKG"
+        opts.fileEncoding = "UTF-8"
+        opts.layerName = layer_name
+        opts.actionOnExistingFile = (
+            QgsVectorFileWriter.CreateOrOverwriteLayer
+            if os.path.isfile(gpkg_path)
+            else QgsVectorFileWriter.CreateOrOverwriteFile
+        )
+        transform_context = QgsProject.instance().transformContext()
+        result = QgsVectorFileWriter.writeAsVectorFormatV3(scratch, gpkg_path, transform_context, opts)
+        err_code = result[0] if isinstance(result, tuple) else result
+        if err_code != QgsVectorFileWriter.NoError:
+            return None
+        layer = self._open_radargram_gpkg_layer(gpkg_path, layer_name)
+        if layer is not None:
+            # Stile distinto per tipo di geometria, "alla QGIS": senza, le tre
+            # layer (Points/Lines/Polygons) prendono il colore di default di QGIS
+            # e sono difficili da distinguere in Layer panel. Impostato una sola
+            # volta alla creazione e salvato nel .gpkg stesso, cosi' sopravvive
+            # alla riapertura del progetto senza doverlo rifare ogni volta.
+            self._style_radargram_layer(layer)
+        return layer
+
+    # Colori distinti per le tre layer del radargramma: stessa famiglia cromatica
+    # dell'overlay "gia' salvato" disegnato sul canvas del RadargramDock (ciano),
+    # cosi' lo stesso concetto si riconosce sia sul radargramma che in QGIS.
+    _RADARGRAM_STYLE = {
+        QgsWkbTypes.PointGeometry: {"color": "#ff9800", "outline": "#3e2723"},
+        QgsWkbTypes.LineGeometry: {"color": "#00bcd4", "width": 0.6},
+        QgsWkbTypes.PolygonGeometry: {"color": "#e91e63", "alpha": 70, "outline": "#880e4f"},
+    }
+
+    def _style_radargram_layer(self, layer):
+        try:
+            geom_type = layer.geometryType()
+            style = self._RADARGRAM_STYLE.get(geom_type)
+            if style is None:
+                return
+            if geom_type == QgsWkbTypes.PointGeometry:
+                symbol = QgsMarkerSymbol.createSimple({
+                    "name": "circle", "color": style["color"], "outline_color": style["outline"],
+                    "size": "3.2", "outline_width": "0.5",
+                })
+            elif geom_type == QgsWkbTypes.LineGeometry:
+                symbol = QgsLineSymbol.createSimple({
+                    "line_color": style["color"], "line_width": str(style["width"]),
+                })
+            else:
+                symbol = QgsFillSymbol.createSimple({
+                    "color": style["color"], "outline_color": style["outline"], "outline_width": "0.5",
+                })
+                symbol.setOpacity(style["alpha"] / 255.0)
+            layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+
+            if layer.fields().indexOf("anomaly_id") >= 0:
+                # QGIS non disegna un'etichetta per un testo vuoto: nessun filtro
+                # esplicito serve per "solo se anomaly_id non e' vuoto".
+                label_settings = QgsPalLayerSettings()
+                label_settings.fieldName = "anomaly_id"
+                label_settings.isExpression = False
+                text_format = QgsTextFormat()
+                text_format.setSize(8)
+                label_settings.setFormat(text_format)
+                labeling = QgsVectorLayerSimpleLabeling(label_settings)
+                layer.setLabeling(labeling)
+                layer.setLabelsEnabled(True)
+
+            err_msg = ""
+            layer.saveStyleToDatabase("default", "", True, err_msg)
+            layer.triggerRepaint()
+        except Exception:
+            pass    # lo stile e' un abbellimento, non deve mai bloccare il disegno
+
+    def _register_radargram_gpkg_layer(self, project_root, layer, gpkg_path):
+        geom_map = {
+            QgsWkbTypes.PointGeometry: "point",
+            QgsWkbTypes.LineGeometry: "line",
+            QgsWkbTypes.PolygonGeometry: "polygon",
+        }
+        try:
+            geom_type = geom_map.get(layer.geometryType(), "unknown")
+            crs_authid = layer.crs().authid() if layer.crs().isValid() else None
+            vector_id = f"vector_{sanitize_filename(layer.name())}"
+            register_vector_layer(
+                project_root,
+                {
+                    "id": vector_id,
+                    "name": layer.name(),
+                    "layer_name": layer.name(),
+                    "project_path": gpkg_path,
+                    "source_path": "",
+                    "geometry_type": geom_type,
+                    "is_3d": False,
+                    "crs": crs_authid,
+                    "storage_mode": "gpkg",
+                    "source_kind": "radargram_pick",
+                },
+            )
+        except Exception:
+            pass    # il catalogo e' un indice best-effort, non deve bloccare il disegno
+
+    def _ensure_radargram_trace_layer(self, geom_kind):
+        geom_kind = str(geom_kind or "").strip().lower()
+        geom_token = _RADARGRAM_TRACE_GEOM_TOKENS.get(geom_kind)
+        if geom_token is None:
+            return None
+        layer_name = _RADARGRAM_TRACE_LAYER_NAMES[geom_kind]
+        for lyr in QgsProject.instance().mapLayers().values():
+            if isinstance(lyr, QgsVectorLayer) and lyr.isValid() and lyr.name() == layer_name:
+                self._ensure_trace_layer_schema_and_form(lyr)
+                return lyr
+
+        project_root = self._require_project_root(notify=True) if hasattr(self, "_require_project_root") else None
+        if not project_root:
+            return None
+        gpkg_path = self._radargram_gpkg_path(project_root)
+
+        project_crs = QgsProject.instance().crs()
+        crs_authid = project_crs.authid() if project_crs is not None and project_crs.isValid() else "EPSG:4326"
+
+        layer = self._open_radargram_gpkg_layer(gpkg_path, layer_name)
+        newly_created = layer is None
+        if layer is None:
+            layer = self._create_radargram_gpkg_layer(gpkg_path, layer_name, geom_token, crs_authid)
+        if layer is None:
+            return None
+
+        QgsProject.instance().addMapLayer(layer, False)
+        self._add_layer_to_trace_group_top(layer)
+        self._ensure_trace_layer_schema_and_form(layer)
+        if newly_created:
+            self._register_radargram_gpkg_layer(project_root, layer, gpkg_path)
+        return layer
+
+    def _radargram_points_to_layer_crs(self, vertices, epsg, layer):
+        src_crs = None
+        try:
+            epsg_i = int(epsg or 0)
+        except (TypeError, ValueError):
+            epsg_i = 0
+        if epsg_i > 0:
+            candidate = QgsCoordinateReferenceSystem.fromEpsgId(epsg_i)
+            if candidate.isValid():
+                src_crs = candidate
+        dst_crs = layer.crs()
+        transform = None
+        if src_crs is not None and dst_crs.isValid() and src_crs != dst_crs:
+            transform = QgsCoordinateTransform(src_crs, dst_crs, QgsProject.instance())
+        points = []
+        for v in vertices:
+            pt = QgsPointXY(float(v["east"]), float(v["north"]))
+            if transform is not None:
+                try:
+                    pt = transform.transform(pt)
+                except Exception:
+                    pass
+            points.append(pt)
+        return points
+
+    @staticmethod
+    def _radargram_geometry_from_points(geom_kind, points):
+        if geom_kind == "point":
+            return QgsGeometry.fromPointXY(points[0])
+        if geom_kind == "line":
+            return QgsGeometry.fromPolylineXY(points)
+        if geom_kind == "polygon":
+            ring = list(points)
+            if ring and ring[0] != ring[-1]:
+                ring = ring + [ring[0]]
+            return QgsGeometry.fromPolygonXY([ring])
+        return None
+
+    def capture_radargram_feature(self, kind, variant_name, profile_stem, channel, epsg, vertices,
+                                   velocity_m_ns=None, rdp=None):
+        """Crea una feature (punto/linea/poligono) disegnata sul radargramma.
+
+        Chiamata dal `feature_sink` passato a `RadargramDock`: i vertici arrivano
+        gia' in coordinate reali (est, nord, profondita' in m, opzionalmente
+        ampiezza campionata al clic), calcolate dal dock a partire dal clic sul
+        radargramma (vedi `_add_draw_vertex` in gpr_radargram_dock.py). Qui si
+        costruisce solo la geometria/gli attributi e si scrive nel layer, riusando
+        lo stesso schema della linea in pianta. `velocity_m_ns`/`rdp` sono la
+        velocita' di riferimento preimpostata per il profilo al momento del clic
+        (vedi gpr_velocity_store.py) - registrata sulla feature per tracciabilita',
+        non ricalcolata qui.
+        """
+        geom_kind = str(kind or "").strip().lower()
+        if geom_kind not in ("point", "line", "polygon"):
+            raise ValueError(f"Tipo di geometria non valido: {kind!r}")
+        verts = list(vertices or [])
+        min_needed = {"point": 1, "line": 2, "polygon": 3}[geom_kind]
+        if len(verts) < min_needed:
+            raise ValueError(f"Servono almeno {min_needed} vertici per una geometria '{geom_kind}'.")
+
+        layer = self._ensure_radargram_trace_layer(geom_kind)
+        if layer is None:
+            raise RuntimeError("Impossibile creare/aprire il layer per le geometrie del radargramma.")
+
+        points = self._radargram_points_to_layer_crs(verts, epsg, layer)
+        geometry = self._radargram_geometry_from_points(geom_kind, points)
+        if geometry is None or geometry.isEmpty():
+            raise RuntimeError("Geometria non valida (vertici insufficienti o coincidenti).")
+
+        depths = [float(v.get("depth_m")) for v in verts]
+        amps = [float(v["amp"]) for v in verts if v.get("amp") is not None]
+        vertex_rows = []
+        for i, v in enumerate(verts):
+            row = {"i": i + 1, "d": depths[i], "dmin": depths[i], "dmax": depths[i], "u": "m", "s": "hit"}
+            if v.get("amp") is not None:
+                row["amp"] = float(v["amp"])
+            vertex_rows.append(row)
+        depth_from, depth_to = min(depths), max(depths)
+        z_value = self._depth_value_from_pair(depth_from, depth_to)
+        amplitude = (sum(amps) / len(amps)) if amps else None
+
+        feat = QgsFeature(layer.fields())
+        feat.setGeometry(geometry)
+        trace_id = f"tr_{utc_now_iso()}".replace(":", "").replace("+", "_")
+        values = {
+            "trace_id": trace_id,
+            "ts_id": "",
+            "ts_name": "",
+            "group_name": str(variant_name or ""),
+            "depth_list": self._format_depth_pair(depth_from, depth_to, "m"),
+            "depth_from": depth_from,
+            "depth_to": depth_to,
+            "depth_unit": "m",
+            "z_source": "radargram",
+            "z_grid_path": "",
+            "z_mode": "profile_pick",
+            "z_value": z_value,
+            "created_at": utc_now_iso(),
+            "vertex_depths": self._serialize_vertex_depths(vertex_rows),
+            "profile_stem": str(profile_stem or ""),
+            "channel": int(channel) if channel is not None else None,
+            "amplitude": amplitude,
+            "velocity_m_ns": float(velocity_m_ns) if velocity_m_ns is not None else None,
+            "rdp": float(rdp) if rdp is not None else None,
+            "source": "radargramma",
+            "anomaly_id": "",
+        }
+        for name, value in values.items():
+            idx = layer.fields().indexOf(name)
+            if idx >= 0:
+                feat.setAttribute(idx, value)
+
+        ok, added = layer.dataProvider().addFeatures([feat])
+        if not ok:
+            raise RuntimeError("Il layer ha rifiutato la nuova geometria.")
+        layer.updateExtents()
+        layer.triggerRepaint()
+        if hasattr(self, "refresh_trace_info_table"):
+            try:
+                self.refresh_trace_info_table()
+            except Exception:
+                pass
+        # Comportamento "alla QGIS": dopo aver digitalizzato una geometria sul
+        # radargramma, apri il dialogo per il codice anomalia/note - qui a
+        # differenza del flusso in pianta (opt-in via
+        # trace_prompt_interpretation_popup) e' sempre attivo: il disegno sul
+        # radargramma e' un'azione deliberata e poco frequente, non centinaia di
+        # tracce automatiche.
+        try:
+            new_fid = added[0].id() if added else None
+            if (new_fid is not None
+                    and getattr(self, "trace_radargram_prompt_after_draw", False)
+                    and hasattr(self, "_prompt_trace_interpretation_fields")):
+                self._prompt_trace_interpretation_fields(layer, new_fid)
+        except Exception:
+            pass
+        return feat
+
+    @staticmethod
+    def _radargram_feature_vertex_points(geom_kind, geometry):
+        if geom_kind == "point":
+            return [geometry.asPoint()]
+        if geom_kind == "line":
+            pts = geometry.asPolyline()
+            if not pts and geometry.isMultipart():
+                parts = geometry.asMultiPolyline()
+                pts = parts[0] if parts else []
+            return list(pts)
+        if geom_kind == "polygon":
+            rings = geometry.asPolygon()
+            if not rings and geometry.isMultipart():
+                parts = geometry.asMultiPolygon()
+                rings = parts[0] if parts else []
+            pts = list(rings[0]) if rings else []
+            # l'anello e' chiuso (primo punto ripetuto in coda): scartarlo, il
+            # disegno originale sul radargramma non lo duplicava.
+            if len(pts) >= 2 and pts[0] == pts[-1]:
+                pts = pts[:-1]
+            return pts
+        return []
+
+    def query_radargram_features(self, variant_name, profile_stem, channel):
+        """Feature gia' disegnate sul radargramma per (variante, profilo, canale).
+
+        Usata da RadargramDock (via `feature_query`) per ridisegnarle come overlay
+        persistente quando si torna su un profilo/canale gia' digitalizzato -
+        vedi `_load_current`/`_redraw` in gpr_radargram_dock.py. Ritorna
+        `[{"kind": "point"|"line"|"polygon", "vertices": [{"east","north","depth_m"}]}]`.
+        """
+        try:
+            channel_i = int(channel) if channel is not None else None
+        except (TypeError, ValueError):
+            channel_i = None
+        stem = str(profile_stem or "")
+        variant = str(variant_name or "")
+
+        out = []
+        for geom_kind, layer_name in _RADARGRAM_TRACE_LAYER_NAMES.items():
+            for lyr in QgsProject.instance().mapLayers().values():
+                if not (isinstance(lyr, QgsVectorLayer) and lyr.isValid() and lyr.name() == layer_name):
+                    continue
+                idx_stem = lyr.fields().indexOf("profile_stem")
+                idx_ch = lyr.fields().indexOf("channel")
+                idx_group = lyr.fields().indexOf("group_name")
+                idx_vd = lyr.fields().indexOf("vertex_depths")
+                if idx_stem < 0:
+                    continue
+                for feat in lyr.getFeatures():
+                    if str(feat.attribute(idx_stem) or "") != stem:
+                        continue
+                    if channel_i is not None and idx_ch >= 0:
+                        try:
+                            if int(feat.attribute(idx_ch)) != channel_i:
+                                continue
+                        except (TypeError, ValueError):
+                            continue
+                    if idx_group >= 0 and variant and str(feat.attribute(idx_group) or "") != variant:
+                        continue
+                    geometry = feat.geometry()
+                    if geometry is None or geometry.isEmpty():
+                        continue
+                    pts = self._radargram_feature_vertex_points(geom_kind, geometry)
+                    depths = []
+                    if idx_vd >= 0:
+                        try:
+                            rows = json.loads(str(feat.attribute(idx_vd) or "[]"))
+                            depths = [float(r.get("d")) for r in rows if isinstance(r, dict) and r.get("d") is not None]
+                        except Exception:
+                            depths = []
+                    if len(depths) != len(pts):
+                        continue    # dato incoerente: meglio non disegnare che disegnare male
+                    out.append({
+                        "kind": geom_kind,
+                        "vertices": [
+                            {"east": float(p.x()), "north": float(p.y()), "depth_m": d}
+                            for p, d in zip(pts, depths)
+                        ],
+                    })
+                break   # un solo layer per nome nel progetto
+        return out
 

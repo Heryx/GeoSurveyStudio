@@ -85,6 +85,9 @@ from .gpr_viewer_timeslice import TimesliceViewMixin
 from .gpr_viewer_variants import VariantsMixin
 from .gpr_viewer_project import ProjectPersistenceMixin
 from .gpr_viewer_presets import PresetsMixin
+from .gpr_velocity_store import write_velocity_override
+from .gpr_hyperbola_math import velocity_from_two_points
+from .gpr_material_presets import MATERIAL_PRESETS, material_preset
 
 
 class GprProfileViewer(
@@ -130,6 +133,7 @@ class GprProfileViewer(
         self._range_gain_breakpoints = np.asarray([(0.0, 1.0), (1.0, 6.0)], dtype=np.float64)
         self._hyper_apex_x: Optional[float] = None
         self._hyper_apex_depth: Optional[float] = None
+        self._syncing_hyperbola_vel = False
         self._trim_start_traces = 0
         self._trim_end_traces = 0
         self._trace_source_indices: Optional[np.ndarray] = None
@@ -1658,6 +1662,202 @@ class GprProfileViewer(
     def _on_filter_chain_source_toggled(self, _value=None):
         self._sync_filter_chain_from_controls()
 
+    # ------------------------------------------------------------------
+    # Scheda "Stima velocità" (round 3): i widget dell'iperbole sono creati in
+    # _build_processing_panel (riuso dei signal/slot esistenti), ma la scheda
+    # stessa vive qui, separata dalla pipeline di elaborazione - vedi anche
+    # _set_hyperbola_two_point, _add_current_hyperbola_pick,
+    # _recompute_hyperbola_aggregate.
+    # ------------------------------------------------------------------
+
+    def _build_velocity_estimation_panel(self) -> QGroupBox:
+        from qgis.PyQt.QtWidgets import QTableWidget, QTableWidgetItem, QAbstractItemView
+
+        self._hyperbola_last_method = "Manuale"
+        self._hyper_picks: list = []
+
+        grp = QGroupBox("Stima velocità (iperbole)")
+        fl = QFormLayout(grp)
+
+        fl.addRow("Overlay iperbole:", self._chk_hyperbola)
+        fl.addRow("  RDP (εr):", self._spin_hyperbola_rdp)
+        fl.addRow("  velocity (m/ns):", self._spin_hyperbola_vel_mns)
+        fl.addRow("  offset Tx-Rx:", self._spin_hyperbola_txrx)
+        fl.addRow("  velocity:", self._lbl_hyperbola_vel)
+        fl.addRow("  depth target:", self._lbl_hyperbola_depth)
+        fl.addRow("  apex:", self._btn_set_hyper_apex)
+
+        self._cb_vel_material = QComboBox()
+        self._cb_vel_material.addItem("Materiale...", "")
+        for _preset in MATERIAL_PRESETS:
+            self._cb_vel_material.addItem(_preset["label"], _preset["key"])
+        self._cb_vel_material.setToolTip(
+            "Valori tipici di velocità per materiale/condizione (letteratura GPR):\n"
+            "un punto di partenza comodo per il campo RDP/velocità qui sopra, resta\n"
+            "poi modificabile a mano o con un fit sull'iperbole."
+        )
+        self._cb_vel_material.currentIndexChanged.connect(self._on_velocity_material_chosen)
+        fl.addRow("  materiale:", self._cb_vel_material)
+
+        self._btn_hyper_two_point = QPushButton("Aggiungi punto sul fianco")
+        self._btn_hyper_two_point.setEnabled(False)
+        self._btn_hyper_two_point.setToolTip(
+            "Metodo 'due punti': con l'apice già impostato, posiziona il cursore su\n"
+            "un punto dell'ala dell'iperbole e premi questo pulsante - stessa formula\n"
+            "analitica già usata dal Radargram Dock, alternativa alla ricerca\n"
+            "automatica o alla regolazione manuale."
+        )
+        self._btn_hyper_two_point.clicked.connect(self._set_hyperbola_two_point)
+        fl.addRow("  metodo due punti:", self._btn_hyper_two_point)
+        fl.addRow("  auto-fit:", self._btn_hyper_auto_fit)
+        fl.addRow("  clear apex:", self._btn_clear_hyper)
+
+        def _toggle_two_point(checked):
+            self._btn_hyper_two_point.setEnabled(checked)
+        self._chk_hyperbola.toggled.connect(_toggle_two_point)
+
+        # Più iperboli/profondità, ognuna col proprio metodo: si aggregano poi
+        # (media o mediana) in un unico valore da salvare nella variante -
+        # l'utente ha chiesto esplicitamente "diversi metodi" e "una media".
+        self._tbl_hyper_picks = QTableWidget(0, 5)
+        self._tbl_hyper_picks.setHorizontalHeaderLabels(
+            ["Includi", "Profondità", "Metodo", "v (m/ns)", "εr"])
+        self._tbl_hyper_picks.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._tbl_hyper_picks.setMaximumHeight(150)
+        self._tbl_hyper_picks.setToolTip(
+            "Stime salvate a profondità/con metodi diversi: la casella 'Includi'\n"
+            "decide se contano nell'aggregato qui sotto.")
+        self._tbl_hyper_picks.itemChanged.connect(self._recompute_hyperbola_aggregate)
+        fl.addRow(self._tbl_hyper_picks)
+
+        btn_add_pick = QPushButton("+ Aggiungi stima corrente")
+        btn_add_pick.setToolTip(
+            "Accoda la stima mostrata sopra (apice + RDP correnti) alla lista,\n"
+            "così si può fissare un nuovo apice ad un'altra profondità/anomalia.")
+        btn_add_pick.clicked.connect(self._add_current_hyperbola_pick)
+        btn_remove_pick = QPushButton("Rimuovi selezionata")
+        btn_remove_pick.clicked.connect(self._remove_selected_hyperbola_pick)
+        pick_btns = QWidget()
+        pick_btns_lay = QHBoxLayout(pick_btns)
+        pick_btns_lay.setContentsMargins(0, 0, 0, 0)
+        pick_btns_lay.addWidget(btn_add_pick)
+        pick_btns_lay.addWidget(btn_remove_pick)
+        fl.addRow(pick_btns)
+
+        self._cb_hyper_aggregate = QComboBox()
+        self._cb_hyper_aggregate.addItem("Media", "mean")
+        self._cb_hyper_aggregate.addItem("Mediana", "median")
+        self._cb_hyper_aggregate.currentIndexChanged.connect(self._recompute_hyperbola_aggregate)
+        self._lbl_hyper_aggregate = QLabel("aggregato: n/d")
+        fl.addRow("Aggrega:", self._cb_hyper_aggregate)
+        fl.addRow("", self._lbl_hyper_aggregate)
+
+        fl.addRow(self._btn_save_hyper_velocity)
+        return grp
+
+    def _on_velocity_material_chosen(self, index: int) -> None:
+        key = self._cb_vel_material.itemData(index)
+        if not key:
+            return
+        preset = material_preset(key)
+        if preset is None:
+            return
+        self._hyperbola_last_method = f"Materiale: {preset['label']}"
+        # setValue rilancia _on_hyperbola_vel_mns_changed -> sincronizza RDP,
+        # aggiorna il readout e ridisegna l'overlay se attivo: stesso percorso
+        # gia' usato per la modifica manuale dei due spinner.
+        self._spin_hyperbola_vel_mns.setValue(float(preset["velocity_m_ns"]))
+
+    def _set_hyperbola_two_point(self) -> None:
+        if self._hyper_apex_x is None or self._hyper_apex_depth is None:
+            QMessageBox.information(self, "Hyperbola Fit", "Imposta prima l'apice (Set apex from cursor).")
+            return
+        if self._cursor_x is None or self._cursor_z is None:
+            QMessageBox.information(
+                self, "Hyperbola Fit", "Muovi il cursore su un punto dell'ala dell'iperbole e riprova.")
+            return
+        if not self._profiles:
+            return
+        prof = self._profiles[self._prof_idx]
+        v_ref = self._profile_reference_velocity(prof)
+        s = self._hyperbola_txrx_offset()
+        result = velocity_from_two_points(
+            float(self._hyper_apex_x), float(self._hyper_apex_depth),
+            float(self._cursor_x), float(self._cursor_z), v_ref, s=s)
+        if result is None:
+            QMessageBox.information(
+                self, "Hyperbola Fit", "Punto non valido per il fit (troppo vicino o sopra l'apice).")
+            return
+        v_fit, rdp = result
+        self._hyperbola_last_method = "Due punti"
+        self._spin_hyperbola_rdp.setValue(float(rdp))
+        self._safe_set_text(
+            self._lbl_status, f"Due punti: RDP={rdp:.2f}  v={v_fit * 1e-9:.4f} m/ns")
+
+    def _add_current_hyperbola_pick(self) -> None:
+        if self._hyper_apex_depth is None:
+            QMessageBox.information(self, "Stima velocità", "Fissa prima l'apice (Set apex from cursor).")
+            return
+        rdp = float(self._spin_hyperbola_rdp.value())
+        v_mns = self._rdp_to_velocity_m_s(rdp) * 1e-9
+        self._hyper_picks.append({
+            "depth": float(self._hyper_apex_depth),
+            "method": str(getattr(self, "_hyperbola_last_method", "Manuale")),
+            "v_mns": v_mns,
+            "rdp": rdp,
+            "included": True,
+        })
+        self._refresh_hyper_picks_table()
+
+    def _remove_selected_hyperbola_pick(self) -> None:
+        rows = sorted({idx.row() for idx in self._tbl_hyper_picks.selectedIndexes()}, reverse=True)
+        for row in rows:
+            if 0 <= row < len(self._hyper_picks):
+                del self._hyper_picks[row]
+        self._refresh_hyper_picks_table()
+
+    def _refresh_hyper_picks_table(self) -> None:
+        tbl = self._tbl_hyper_picks
+        tbl.blockSignals(True)
+        try:
+            tbl.setRowCount(len(self._hyper_picks))
+            for row, pick in enumerate(self._hyper_picks):
+                chk = QTableWidgetItem()
+                chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                chk.setCheckState(Qt.Checked if pick.get("included", True) else Qt.Unchecked)
+                tbl.setItem(row, 0, chk)
+                tbl.setItem(row, 1, QTableWidgetItem(f"{pick['depth']:.3f} m"))
+                tbl.setItem(row, 2, QTableWidgetItem(str(pick["method"])))
+                tbl.setItem(row, 3, QTableWidgetItem(f"{pick['v_mns']:.4f}"))
+                tbl.setItem(row, 4, QTableWidgetItem(f"{pick['rdp']:.2f}"))
+                for col in (1, 2, 3, 4):
+                    item = tbl.item(row, col)
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        finally:
+            tbl.blockSignals(False)
+        self._recompute_hyperbola_aggregate()
+
+    def _recompute_hyperbola_aggregate(self, *_args) -> None:
+        tbl = getattr(self, "_tbl_hyper_picks", None)
+        lbl = getattr(self, "_lbl_hyper_aggregate", None)
+        if tbl is None or lbl is None:
+            return
+        included_v = []
+        for row, pick in enumerate(self._hyper_picks):
+            item = tbl.item(row, 0)
+            included = item is not None and item.checkState() == Qt.Checked
+            pick["included"] = included
+            if included:
+                included_v.append(pick["v_mns"])
+        if not included_v:
+            lbl.setText("aggregato: n/d")
+            return
+        mode = self._cb_hyper_aggregate.currentData() or "mean"
+        agg_v = float(np.median(included_v)) if mode == "median" else float(np.mean(included_v))
+        agg_rdp = self._velocity_to_rdp(agg_v * 1e9)
+        label = "mediana" if mode == "median" else "media"
+        lbl.setText(f"aggregato ({label}, {len(included_v)} stime): v={agg_v:.4f} m/ns  εr={agg_rdp:.2f}")
+
     def _build_processing_panel(self):
         grp = QGroupBox("Processing")
         fl  = QFormLayout(grp)
@@ -2134,6 +2334,17 @@ class GprProfileViewer(
         self._spin_hyperbola_rdp.setSingleStep(0.1)
         self._spin_hyperbola_rdp.setValue(9.0)
         self._spin_hyperbola_rdp.setEnabled(False)
+        self._spin_hyperbola_vel_mns = QDoubleSpinBox()
+        self._spin_hyperbola_vel_mns.setRange(0.04, 0.30)
+        self._spin_hyperbola_vel_mns.setSingleStep(0.005)
+        self._spin_hyperbola_vel_mns.setDecimals(4)
+        self._spin_hyperbola_vel_mns.setSuffix(" m/ns")
+        self._spin_hyperbola_vel_mns.setValue(self._rdp_to_velocity_m_s(9.0) * 1e-9)
+        self._spin_hyperbola_vel_mns.setEnabled(False)
+        self._spin_hyperbola_vel_mns.setToolTip(
+            "Stessa velocità del campo RDP qui sopra, espressa in m/ns\n"
+            "(unità più comune nel rilievo GPR): modificando l'uno si aggiorna l'altro."
+        )
         self._spin_hyperbola_txrx = QDoubleSpinBox()
         self._spin_hyperbola_txrx.setRange(0.0, 3.0)
         self._spin_hyperbola_txrx.setSingleStep(0.02)
@@ -2158,6 +2369,7 @@ class GprProfileViewer(
 
         def _toggle_hyperbola_controls(checked):
             self._spin_hyperbola_rdp.setEnabled(checked)
+            self._spin_hyperbola_vel_mns.setEnabled(checked)
             self._spin_hyperbola_txrx.setEnabled(checked)
             self._btn_set_hyper_apex.setEnabled(checked)
             self._btn_hyper_auto_fit.setEnabled(checked)
@@ -2166,11 +2378,28 @@ class GprProfileViewer(
 
         self._chk_hyperbola.toggled.connect(_toggle_hyperbola_controls)
         self._spin_hyperbola_rdp.valueChanged.connect(self._on_hyperbola_rdp_changed)
+        self._spin_hyperbola_vel_mns.valueChanged.connect(self._on_hyperbola_vel_mns_changed)
         self._spin_hyperbola_txrx.valueChanged.connect(self._on_hyperbola_rdp_changed)
         self._btn_set_hyper_apex.clicked.connect(self._set_hyperbola_apex_from_cursor)
         self._btn_hyper_auto_fit.clicked.connect(self._auto_fit_hyperbola_rdp)
         self._btn_clear_hyper.clicked.connect(self._clear_hyperbola_apex)
+        self._btn_save_hyper_velocity = QPushButton("Salva velocità nella variante")
+        self._btn_save_hyper_velocity.setToolTip(
+            "Salva la velocità/RDP di questo campo come valore preimpostato del profilo\n"
+            "corrente, così resta disponibile (Radargram Dock, riapertura del progetto)\n"
+            "anche dopo la chiusura del Profile Viewer. Richiede che la variante sia\n"
+            "già stata salvata almeno una volta in questa sessione."
+        )
+        self._btn_save_hyper_velocity.clicked.connect(self._save_hyperbola_velocity_to_variant)
         self._on_hyperbola_rdp_changed(self._spin_hyperbola_rdp.value())
+
+        # Scheda "Stima velocità" separata (round 3): l'iperbole non fa parte
+        # della pipeline di elaborazione (non tocca mai i dati, e' un overlay
+        # diagnostico) - ora ha anche una UI a parte, non piu' mescolata coi
+        # controlli di filtri/gain, e non viene piu' salvata/ripristinata come
+        # parte del preset Gain/Hyperbola (vedi _collect_gain_hyper_preset).
+        self._velocity_group_box = self._build_velocity_estimation_panel()
+
         self._btn_save_gain_preset = QPushButton("Save Gain/Hyper Preset")
         self._btn_load_gain_preset = QPushButton("Load Gain/Hyper Preset")
         self._btn_save_gain_preset.clicked.connect(self._save_gain_hyper_preset)
@@ -2226,14 +2455,8 @@ class GprProfileViewer(
         # TVG controls are exposed directly inside the pipeline step "Range gain (TVG)".
         # Do not duplicate those widgets here, otherwise Qt reparents them and the
         # controls disappear from the pipeline block.
-        fl.addRow("Hyperbola fit:",      self._chk_hyperbola)
-        fl.addRow("  RDP (εr):",     self._spin_hyperbola_rdp)
-        fl.addRow("  offset Tx-Rx:",     self._spin_hyperbola_txrx)
-        fl.addRow("  velocity:",         self._lbl_hyperbola_vel)
-        fl.addRow("  depth target:",     self._lbl_hyperbola_depth)
-        fl.addRow("  apex:",             self._btn_set_hyper_apex)
-        fl.addRow("  auto-fit:",         self._btn_hyper_auto_fit)
-        fl.addRow("  clear apex:",       self._btn_clear_hyper)
+        # Il fit iperbole ha una scheda a parte ("Stima velocità", vedi
+        # _build_velocity_estimation_panel): non e' un filtro della pipeline.
         fl.addRow(self._btn_save_gain_preset)
         fl.addRow(self._btn_load_gain_preset)
 
@@ -2897,6 +3120,17 @@ class GprProfileViewer(
         processing_scroll.setWidget(proc_content)
         processing_scroll.setMinimumWidth(250)
 
+        velocity_content = QWidget()
+        velocity_layout = QVBoxLayout(velocity_content)
+        velocity_layout.setContentsMargins(0, 0, 0, 0)
+        velocity_layout.addWidget(self._velocity_group_box)
+        velocity_layout.addStretch()
+
+        velocity_scroll = QScrollArea()
+        velocity_scroll.setWidgetResizable(True)
+        velocity_scroll.setWidget(velocity_content)
+        velocity_scroll.setMinimumWidth(250)
+
         slice_content = QWidget()
         slice_layout = QVBoxLayout(slice_content)
         slice_layout.setContentsMargins(0, 0, 0, 0)
@@ -2911,6 +3145,7 @@ class GprProfileViewer(
         # Unified right panel: Process + Slicing + Variants tabs in a single dock.
         tabs = QTabWidget()
         tabs.addTab(processing_scroll, "Elaborazione")
+        tabs.addTab(velocity_scroll, "Stima velocità")
         tabs.addTab(timeslice_scroll, "Slicing")
         try:
             variants_scroll = QScrollArea()
@@ -4361,9 +4596,30 @@ class GprProfileViewer(
         self._safe_set_text(self._lbl_hyperbola_depth, depth_txt)
 
     def _on_hyperbola_rdp_changed(self, _value: float):
+        if not self._syncing_hyperbola_vel and self._is_qt_alive(getattr(self, "_spin_hyperbola_vel_mns", None)):
+            rdp = float(self._spin_hyperbola_rdp.value())
+            v_mns = self._rdp_to_velocity_m_s(rdp) * 1e-9
+            self._syncing_hyperbola_vel = True
+            try:
+                self._spin_hyperbola_vel_mns.setValue(v_mns)
+            finally:
+                self._syncing_hyperbola_vel = False
         self._update_hyperbola_readout()
         if self._chk_hyperbola.isChecked():
             self._redraw()
+
+    def _on_hyperbola_vel_mns_changed(self, value: float):
+        if self._syncing_hyperbola_vel:
+            return
+        rdp = self._velocity_to_rdp(float(value) * 1e9)
+        self._syncing_hyperbola_vel = True
+        try:
+            # setValue rilancia _on_hyperbola_rdp_changed (readout + redraw incluso):
+            # la guardia qui sopra ne blocca solo il ri-sync verso questo spinner.
+            self._spin_hyperbola_rdp.setValue(
+                float(np.clip(rdp, self._spin_hyperbola_rdp.minimum(), self._spin_hyperbola_rdp.maximum())))
+        finally:
+            self._syncing_hyperbola_vel = False
 
     def _set_hyperbola_apex_from_cursor(self):
         if self._cursor_x is None or self._cursor_z is None:
@@ -4371,6 +4627,7 @@ class GprProfileViewer(
             return
         self._hyper_apex_x = float(self._cursor_x)
         self._hyper_apex_depth = float(self._cursor_z)
+        self._hyperbola_last_method = "Manuale"
         self._update_hyperbola_readout()
         if self._chk_hyperbola.isChecked():
             self._redraw()
@@ -4474,6 +4731,7 @@ class GprProfileViewer(
             QMessageBox.information(self, "Hyperbola Fit", "Impossibile stimare RDP con i dati correnti.")
             return
 
+        self._hyperbola_last_method = "Automatico (ricerca ampiezza)"
         self._spin_hyperbola_rdp.setValue(float(best_rdp))
         self._safe_set_text(
             self._lbl_status,
@@ -4481,6 +4739,44 @@ class GprProfileViewer(
         )
         if self._chk_hyperbola.isChecked():
             self._redraw()
+
+    def _save_hyperbola_velocity_to_variant(self):
+        """Salva il valore corrente di RDP/velocita' come preimpostato della
+        variante attiva (gpr_velocity_store.py) - a differenza del preset
+        Gain/Hyper (project.json), sopravvive alla chiusura del progetto ed e'
+        quello letto da RadargramDock. Serve una variante gia' salvata in questa
+        sessione: il nome/cartella non esiste prima (vedi _save_processed_variant)."""
+        variant = getattr(self, "_variant_parent_ctx", None)
+        if not variant:
+            QMessageBox.information(
+                self, "Salva velocità",
+                "Salva prima la variante processata (pulsante 'Salva variante'): "
+                "solo cosi' c'e' una cartella dove registrare il valore preimpostato.")
+            return
+        paths = self._ensure_gpr_processing_layout()
+        if not paths:
+            QMessageBox.warning(self, "Salva velocità", "Nessun workspace disponibile.")
+            return
+        variant_dir = os.path.join(paths["processed"], str(variant))
+        included = [p for p in getattr(self, "_hyper_picks", []) if p.get("included", True)]
+        if included:
+            mode = self._cb_hyper_aggregate.currentData() or "mean"
+            v_list = [float(p["v_mns"]) for p in included]
+            v_mns = float(np.median(v_list)) if mode == "median" else float(np.mean(v_list))
+            rdp = self._velocity_to_rdp(v_mns * 1e9)
+            source = "hyperbola_fit_aggregate"
+        else:
+            rdp = float(self._spin_hyperbola_rdp.value())
+            v_mns = self._rdp_to_velocity_m_s(rdp) * 1e-9
+            source = "manual"
+        try:
+            write_velocity_override(variant_dir, velocity_m_ns=v_mns, rdp=rdp, source=source)
+        except Exception as exc:
+            QMessageBox.warning(self, "Salva velocità", f"Errore nel salvataggio:\n{exc}")
+            return
+        self._safe_set_text(
+            self._lbl_status,
+            f"Velocità salvata nella variante '{variant}': {v_mns:.4f} m/ns  (εr={rdp:.2f}).")
 
     def _collect_gain_hyper_preset(self) -> dict:
         points = self._sanitize_range_gain_breakpoints(self._range_gain_breakpoints)
@@ -4513,13 +4809,12 @@ class GprProfileViewer(
                 "sample_start": int(self._spin_manual_gain_sample_start.value()) if getattr(self, "_spin_manual_gain_sample_start", None) else 0,
                 "sample_end": int(self._spin_manual_gain_sample_end.value()) if getattr(self, "_spin_manual_gain_sample_end", None) else 0,
             },
-            "hyperbola": {
-                "enabled": bool(self._chk_hyperbola.isChecked()),
-                "rdp": float(self._spin_hyperbola_rdp.value()),
-                "txrx_offset_m": self._hyperbola_txrx_offset(),
-                "apex_x": (float(self._hyper_apex_x) if self._hyper_apex_x is not None else None),
-                "apex_depth": (float(self._hyper_apex_depth) if self._hyper_apex_depth is not None else None),
-            },
+            # L'iperbole NON fa parte della pipeline (overlay diagnostico, non
+            # tocca mai i dati): niente piu' salvata/ripristinata qui dal round 3
+            # (aveva una chiave "hyperbola" nei preset del round 2 - un preset
+            # vecchio con quella chiave viene semplicemente ignorato, vedi
+            # _apply_gain_hyper_preset). Il valore utile si salva a parte con
+            # "Salva velocità nella variante" (gpr_velocity_store.py).
         }
         return preset
 
@@ -4634,6 +4929,18 @@ class GprProfileViewer(
         if "bp_taper_frac" in params and self._is_qt_alive(getattr(self, "_spin_bp_taper", None)):
             try:
                 self._set_widget_value(self._spin_bp_taper, float(params["bp_taper_frac"]) * 100.0)
+            except Exception:
+                pass
+        # Range gain (TVG): non e' nella mapping sopra perche' i suoi controlli
+        # (_spin_gain_surface/_spin_gain_deep) sono condivisi con l'editor curva
+        # e vanno aggiornati insieme ai breakpoints, non come singolo spinbox.
+        bkpts = params.get("pre_agc_breakpoints")
+        if bkpts is not None:
+            try:
+                bkpts_arr = np.asarray(bkpts, dtype=np.float64).reshape(-1, 2)
+                if bkpts_arr.shape[0] >= 2:
+                    self._range_gain_breakpoints = self._sanitize_range_gain_breakpoints(bkpts_arr)
+                    self._sync_range_gain_spins_from_breakpoints()
             except Exception:
                 pass
 
@@ -4813,7 +5120,9 @@ class GprProfileViewer(
 
         chain_cfg = payload.get("pipeline_chain", {}) if isinstance(payload.get("pipeline_chain"), dict) else {}
         rg = payload.get("range_gain", {}) if isinstance(payload.get("range_gain"), dict) else {}
-        hy = payload.get("hyperbola", {}) if isinstance(payload.get("hyperbola"), dict) else {}
+        # Un preset del round 2 puo' ancora avere una chiave "hyperbola": viene
+        # semplicemente ignorata (l'iperbole non fa piu' parte di questo preset,
+        # vedi _collect_gain_hyper_preset).
 
         # Basic controls first.
         self._spin_gain.setValue(float(payload.get("display_gain", self._spin_gain.value())))
@@ -4868,19 +5177,6 @@ class GprProfileViewer(
                     self._cb_manual_gain_type.setCurrentIndex(idx)
             self._chk_manual_gain.setChecked(bool(mg.get("enabled", self._chk_manual_gain.isChecked())))
 
-        # Hyperbola.
-        self._spin_hyperbola_rdp.setValue(float(hy.get("rdp", self._spin_hyperbola_rdp.value())))
-        if self._is_qt_alive(getattr(self, "_spin_hyperbola_txrx", None)):
-            self._spin_hyperbola_txrx.setValue(
-                float(hy.get("txrx_offset_m", self._spin_hyperbola_txrx.value()))
-            )
-        self._chk_hyperbola.setChecked(bool(hy.get("enabled", self._chk_hyperbola.isChecked())))
-        apex_x = hy.get("apex_x")
-        apex_d = hy.get("apex_depth")
-        self._hyper_apex_x = float(apex_x) if apex_x is not None else None
-        self._hyper_apex_depth = float(apex_d) if apex_d is not None else None
-        self._update_hyperbola_readout()
-
         if self._is_qt_alive(self._filter_chain_widget):
             order = chain_cfg.get("order")
             enabled_map = chain_cfg.get("enabled")
@@ -4896,12 +5192,24 @@ class GprProfileViewer(
                 pass
             try:
                 if isinstance(enabled_map, dict) and enabled_map:
+                    enabled_norm = {str(k): bool(v) for k, v in enabled_map.items()}
                     self._filter_chain_widget.set_enabled_map(
-                        {str(k): bool(v) for k, v in enabled_map.items()},
+                        enabled_norm,
                         emit_signal=False,
                     )
-                    self._on_filter_chain_widget_changed()
+                    # Non _on_filter_chain_widget_changed(): con _syncing_filter_chain
+                    # ancora True (impostato dal chiamante, es. _apply_full_processing_state)
+                    # farebbe subito return senza specchiare lo stato sulle caselle _chk_*,
+                    # lasciando _apply_processing (chiamata dopo, a guardia sbloccata) a
+                    # leggere filtri tutti spenti.
+                    self._apply_chain_enabled_to_controls(enabled_norm)
                     chain_updated = True
+                    if not self._syncing_filter_chain and self._raw_data is not None:
+                        # Chiamata standalone (es. "Load Gain/Hyper Preset"): nessun
+                        # chiamante esterno rilancera' il processing dopo, va fatto qui,
+                        # come faceva _on_filter_chain_widget_changed() prima di questo fix.
+                        self._apply_processing_async()
+                        self._request_preview_update(immediate=False)
             except Exception:
                 pass
             if (

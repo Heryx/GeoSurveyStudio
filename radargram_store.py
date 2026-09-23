@@ -29,7 +29,9 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from .gpr_hyperbola_math import m_ns_to_velocity_m_s
 from .gpr_npz_io import aligned_geometry_columns, list_variants
+from .gpr_velocity_store import read_velocity_overrides, resolve_velocity_m_ns
 from .slice_manifest import SliceSetError, has_sliceset, read_sliceset
 
 __all__ = [
@@ -159,6 +161,14 @@ class ChannelData:
         e, n = float(self.east[trace]), float(self.north[trace])
         return (e, n) if np.isfinite(e) and np.isfinite(n) else None
 
+    def amplitude_at(self, trace: int, row: int) -> float:
+        """Ampiezza campionata al clic (usata per il campo 'amplitude' auto-compilato
+        delle geometrie disegnate sul radargramma)."""
+        n_rows, n_traces = self.data.shape
+        if not (0 <= row < n_rows and 0 <= trace < n_traces):
+            return float("nan")
+        return float(self.data[row, trace])
+
 
 def _clean_distance_axis(dist: np.ndarray, n_t: int, step_m: float) -> np.ndarray:
     """Asse distanze monotono che parte da 0; se inservibile, tracce equispaziate."""
@@ -258,6 +268,42 @@ class VariantStore:
         self._channels.clear()
         self._index = None
 
+    def reference_velocity_m_ns(self, stem: str) -> dict:
+        """Velocita' preimpostata (m/ns) per un profilo: override per-profilo, poi
+        default di variante, poi la costante condivisa 0.1 m/ns - vedi
+        gpr_velocity_store.py. Usata dal popup informativo del puntatore e dai campi
+        auto-compilati delle geometrie disegnate in RadargramDock."""
+        return resolve_velocity_m_ns(self.path, stem)
+
+    def _explicit_velocity_override_m_ns(self, stem: str):
+        """Solo un override esplicito (per-profilo o default di variante) salvato
+        dall'utente, None se non c'e' nulla - a differenza di
+        `reference_velocity_m_ns` non ripiega mai sulla costante 0.1. Usata per
+        l'asse di profondita' del canale: senza un override esplicito si continua a
+        usare la velocita' dell'header strumento (`ProfileInfo.dz_m`), cosi' i
+        profili mai toccati non cambiano scala sotto l'utente."""
+        data = read_velocity_overrides(self.path)
+        entry = data["profiles"].get(str(stem or "")) or data["default"]
+        if entry and entry.get("velocity_m_ns") is not None:
+            return float(entry["velocity_m_ns"])
+        return None
+
+    def effective_velocity_m_s(self, pi: int) -> float:
+        """Velocita' (m/s) che genera davvero `ChannelData.dz_m` per quel profilo:
+        override esplicito se c'e', altrimenti l'header strumento (`velocity_m_s`),
+        altrimenti la costante condivisa 0.1 m/ns. Usata dal puntatore "Calcola con
+        iperbole" per restare coerente con l'asse di profondita' mostrato (`v_ref`
+        deve essere la stessa velocita' che ha prodotto la profondita' sotto
+        l'apice, non un valore indipendente)."""
+        info = self.profiles[int(pi)]
+        v_override_mns = self._explicit_velocity_override_m_ns(info.stem)
+        if v_override_mns is not None:
+            return m_ns_to_velocity_m_s(v_override_mns)
+        v = float(info.velocity_m_s or 0.0)
+        if np.isfinite(v) and v > 0:
+            return v
+        return m_ns_to_velocity_m_s(resolve_velocity_m_ns(self.path, info.stem)["velocity_m_ns"])
+
     def _geometry(self, npz, info: ProfileInfo, ci: int):
         """(east, north, dist, sorgente) del canale, con `npz` gia' aperto."""
         n_t = int(info.n_traces[ci]) if ci < len(info.n_traces) else 0
@@ -296,11 +342,22 @@ class VariantStore:
         if east.size != n_t or north.size != n_t:
             east = np.full(n_t, np.nan)
             north = np.full(n_t, np.nan)
+        # Profondita' per riga: se l'utente ha salvato esplicitamente una velocita'
+        # (manuale o da fit iperbole) per questo profilo/variante la si usa qui,
+        # cosi' l'asse del radargramma nel dock riflette il valore verificato;
+        # altrimenti si resta sul dz_m di sempre (velocita' dell'header strumento),
+        # cosi' i profili mai toccati non cambiano scala sotto l'utente. Isolato a
+        # RadargramDock: non tocca il rendering del Profile Viewer ne' lo slice engine.
+        v_override_mns = self._explicit_velocity_override_m_ns(info.stem)
+        if v_override_mns is not None:
+            dz_m = float(info.dt_ns) * m_ns_to_velocity_m_s(v_override_mns) / 1e9 / 2.0
+        else:
+            dz_m = info.dz_m
         out = ChannelData(
             data=data,
             dist=_clean_distance_axis(dist, n_t, info.sampling_step_m),
             east=east, north=north,
-            dz_m=info.dz_m,
+            dz_m=dz_m,
             geometry_source=source,
         )
         self._channels[key] = out

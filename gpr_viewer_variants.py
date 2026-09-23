@@ -11,6 +11,7 @@ import time
 from qgis.PyQt.QtCore import QEventLoop
 
 from .gpr_variant_runner import run_channels
+from .gpr_velocity_store import write_velocity_override
 from .gpr_viewer_common import (
     QCheckBox,
     QComboBox,
@@ -417,6 +418,17 @@ class VariantsMixin:
                 )
                 # la prossima variante salvata discende da questa
                 self._variant_parent_ctx = variant
+            except Exception:
+                pass
+            # Se l'utente ha impostato un apice Hyperbola in questa sessione, la
+            # velocita'/RDP corrente non si perde piu' alla chiusura del viewer:
+            # diventa il default preimpostato della variante appena salvata (letto
+            # da RadargramDock e da questo stesso pannello - vedi gpr_velocity_store.py).
+            try:
+                if self._is_qt_alive(getattr(self, "_spin_hyperbola_rdp", None)) and self._hyper_apex_x is not None:
+                    rdp = float(self._spin_hyperbola_rdp.value())
+                    v_mns = self._rdp_to_velocity_m_s(rdp) * 1e-9
+                    write_velocity_override(variant_dir, velocity_m_ns=v_mns, rdp=rdp, source="hyperbola_fit")
             except Exception:
                 pass
             self._refresh_slice_variant_choices()

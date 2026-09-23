@@ -836,16 +836,20 @@ class TraceCaptureSnappingMixin:
                     depth_status = "no_raster_hit"
                 else:
                     depth_status = "hit"
-            clean.append(
-                {
-                    "i": int(row.get("i") or 0),
-                    "d": depth_val,
-                    "dmin": depth_min,
-                    "dmax": depth_max,
-                    "u": str(row.get("u") or "m"),
-                    "s": depth_status,
-                }
-            )
+            entry = {
+                "i": int(row.get("i") or 0),
+                "d": depth_val,
+                "dmin": depth_min,
+                "dmax": depth_max,
+                "u": str(row.get("u") or "m"),
+                "s": depth_status,
+            }
+            # Ampiezza campionata al clic sul radargramma (vedi capture_radargram_feature):
+            # opzionale, non impostata dalla pipeline in pianta esistente.
+            amp_val = self._safe_float(row.get("amp"))
+            if amp_val is not None:
+                entry["amp"] = amp_val
+            clean.append(entry)
         try:
             return json.dumps(clean, ensure_ascii=True, separators=(",", ":"))
         except Exception:

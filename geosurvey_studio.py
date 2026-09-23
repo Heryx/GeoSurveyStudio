@@ -426,6 +426,20 @@ class GeoSurveyStudioPlugin(
                 return prof
         return None
 
+    def _radargram_feature_sink(self, kind, variant_name, profile_stem, channel, epsg, vertices,
+                                 velocity_m_ns=None, rdp=None):
+        """Ponte verso la pipeline "Line Traces": il RadargramDock non conosce QGIS
+        oltre l'essenziale, tutta la logica di layer/schema vive in TraceCaptureMixin."""
+        return self.capture_radargram_feature(
+            kind=kind, variant_name=variant_name, profile_stem=profile_stem,
+            channel=channel, epsg=epsg, vertices=vertices,
+            velocity_m_ns=velocity_m_ns, rdp=rdp)
+
+    def _radargram_feature_query(self, variant_name, profile_stem, channel):
+        """Ponte verso TraceCaptureMixin per ridisegnare sul radargramma le geometrie
+        gia' digitalizzate su quel profilo/canale (vedi RadargramDock `feature_query`)."""
+        return self.query_radargram_features(variant_name, profile_stem, channel)
+
     def open_radargram_dock(self, checked=False, variant=None, profile_stem=None, activate=True):
         """Mostra (creandolo se serve) il pannello dei radargrammi processati.
 
@@ -451,6 +465,8 @@ class GeoSurveyStudioPlugin(
                 self.iface,
                 workspace_provider=self._radargram_workspace_root,
                 geometry_provider=self._radargram_geometry_provider,
+                feature_sink=self._radargram_feature_sink,
+                feature_query=self._radargram_feature_query,
                 parent=self.iface.mainWindow(),
             )
             self.iface.addDockWidget(Qt.BottomDockWidgetArea, dock)

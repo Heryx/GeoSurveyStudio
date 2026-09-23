@@ -15,6 +15,7 @@ from qgis.PyQt.QtWidgets import (
     QFormLayout,
     QVBoxLayout,
     QPlainTextEdit,
+    QLineEdit,
 )
 from qgis.core import (
     QgsCoordinateTransform,
@@ -464,7 +465,7 @@ class TraceCapturePostprocessMixin:
         if layer is None:
             return []
         fields = []
-        for name in ("notes", "interpretation", "comment"):
+        for name in ("anomaly_id", "notes", "interpretation", "comment"):
             idx = layer.fields().indexOf(name)
             if idx >= 0:
                 fields.append((name, idx))
@@ -501,16 +502,23 @@ class TraceCapturePostprocessMixin:
 
         editors = {}
         label_map = {
+            "anomaly_id": "Codice anomalia",
             "notes": "Notes",
             "interpretation": "Interpretation",
             "comment": "Comment",
         }
         for name, _idx in fields:
-            editor = QPlainTextEdit(dlg)
-            editor.setTabChangesFocus(True)
-            editor.setMinimumHeight(70)
-            editor.setPlainText(values.get(name, ""))
-            editor.setPlaceholderText(f"Add {label_map.get(name, name).lower()}...")
+            if name == "anomaly_id":
+                # Un codice libero e' una riga sola, non un testo multi-riga.
+                editor = QLineEdit(dlg)
+                editor.setText(values.get(name, ""))
+                editor.setPlaceholderText("es. AN-01 (libero, a scelta tua)")
+            else:
+                editor = QPlainTextEdit(dlg)
+                editor.setTabChangesFocus(True)
+                editor.setMinimumHeight(70)
+                editor.setPlainText(values.get(name, ""))
+                editor.setPlaceholderText(f"Add {label_map.get(name, name).lower()}...")
             form.addRow(f"{label_map.get(name, name)}:", editor)
             editors[name] = editor
 
@@ -534,7 +542,9 @@ class TraceCapturePostprocessMixin:
 
         for name, idx in fields:
             try:
-                new_val = str(editors[name].toPlainText() or "").strip()
+                editor = editors[name]
+                raw = editor.text() if isinstance(editor, QLineEdit) else editor.toPlainText()
+                new_val = str(raw or "").strip()
             except Exception:
                 new_val = ""
             old_val = str(values.get(name, "") or "").strip()
@@ -715,6 +725,7 @@ class TraceCapturePostprocessMixin:
             self._set_feature_attr(layer, fid, "z_value", metadata.get("z_value"))
             self._set_feature_attr(layer, fid, "vertex_depths", metadata.get("vertex_depths"))
             self._set_feature_attr(layer, fid, "created_at", utc_now_iso())
+            self._set_feature_attr(layer, fid, "source", "timeslice")
             self._trace_debug_log(
                 "Trace metadata summary "
                 f"[fid={fid}] ts='{metadata.get('ts_name')}' depth='{metadata.get('depth_list')}' "

@@ -164,7 +164,9 @@ dal Profile Viewer. Testato offscreen con un `QgsMapCanvas` vero e sul dataset S
    cambiano da tendine, ◀ ▶, PgSu/PgGiu (profilo) e frecce sinistra/destra (canale).
 3. **Profondità**: clic sul radargramma o campo "Profondità" → riga verde; il cursore
    mostra profondità, tempo (ns), traccia, ampiezza, E/N. Rotella = zoom, tasto destro =
-   trascina, doppio clic = vista intera.
+   trascina. **[cambiato, vedi sezione in fondo]** doppio clic non fa più "vista
+   intera" (ora c'è il pulsante dedicato ⤢): attiva la time-slice alla profondità
+   cliccata.
 4. Selezionare una time-slice nel pannello Livelli (con "Segui time-slice"): **atteso**
    fascia verde = finestra di profondità della slice e passaggio alla variante da cui
    è stata generata. Le slice senza `sliceset.json` accanto (gruppi vecchi) non fanno nulla.
@@ -177,3 +179,181 @@ dal Profile Viewer. Testato offscreen con un `QgsMapCanvas` vero e sul dataset S
    rubare il focus) sulla variante sorgente.
 9. Riga di stato: "coordinate: salvate nel .npz" se il viewer è chiuso; assente se è aperto
    (geometria dai profili in memoria). Dopo un nuovo posizionamento premere ⟳.
+
+---
+
+## Disegno anomalie/interfacce sul radargramma + puntatore velocità (2026-09-22, non committato)
+
+Nel pannello "Radargrammi processati": nuovi pulsanti **Punto / Linea / Poligono**
+(disegno) e **Misura velocità** (fit iperbole live), riga di controlli sopra il
+radargramma. Testato offscreen (`test_radargram_dock.py`, `test_radargram_capture.py`
+`test_hyperbola_math.py`); **non** provato nella finestra reale di QGIS. Ricaricare il
+plugin prima.
+
+1. **Linea**: attivare "Linea", cliccare 3-4 punti seguendo un'interfaccia/anomalia
+   visibile sul radargramma (a profondità diverse). "Termina" (o Invio). **Atteso:**
+   compare il layer **"Radargram Lines"** (gruppo "Line Traces" nel pannello Livelli)
+   con una feature; tabella attributi → `vertex_depths` contiene un valore diverso per
+   ogni vertice, `depth_from`/`depth_to` coerenti col minimo/massimo cliccato,
+   `z_source = radargram`, `profile_stem`/`channel` = profilo/canale correnti. La
+   modalità resta attiva: si può disegnare subito un'altra linea.
+2. **Punto**: attivare "Punto", un clic salva subito un punto nel layer
+   **"Radargram Points"** con la profondità cliccata.
+3. **Poligono**: attivare "Poligono", almeno 3 clic, poi "Termina": feature chiusa nel
+   layer **"Radargram Polygons"**.
+4. **Annulla vertice** (Backspace) toglie l'ultimo punto non ancora salvato; **Annulla**
+   (Esc) scarta tutto il disegno in corso senza salvare nulla.
+5. Cambiare profilo/canale **durante** un disegno non ancora terminato: **atteso** il
+   disegno in corso viene scartato silenziosamente (nessuna geometria a cavallo di due
+   profili).
+6. In QGIS → menu plugin → **Build 3D** sul layer "Radargram Lines", modalità
+   **"Per-vertex (from vertex_depths)"**: **atteso** la linea 3D risultante segue
+   davvero la profondità disegnata punto per punto (non una Z costante come le altre
+   modalità).
+7. **[SUPERATO dal round 2 sotto]** "Misura velocità" a ricalcolo continuo — questo
+   comportamento non esiste più: vedi la sezione "Persistenza reale, disegno
+   visibile, velocità preimpostata" più in basso per il puntatore attuale (popup
+   statico + "Calcola con iperbole" separato).
+8. Attivare "Misura velocità"/"Calcola con iperbole" mentre "Linea"/"Punto"/"Poligono"
+   è attivo (o viceversa): **atteso** si disattiva automaticamente l'altro, sono
+   mutuamente esclusivi tra loro.
+
+---
+
+## Persistenza reale, disegno visibile, velocità preimpostata (2026-09-22, round 2, non committato)
+
+Risposta ai 10 feedback dell'utente dopo l'uso reale del round precedente su SUASA
+(screenshot del pannello con layer "Radargram Points/Lines" nel Layer panel e Trace
+Info). Testato offscreen (`test_radargram_dock.py` 45, `test_radargram_capture.py` 8,
+`test_velocity_store.py` 5, `test_hyperbola_math.py` 5,
+`test_profile_viewer_interaction.py` 50 — 113 test totali tra i file toccati,
+nessuna regressione sul resto della suite); **non** provato nella finestra reale di
+QGIS. Serve un progetto GeoSurvey Studio collegato (Project
+Manager) prima di disegnare — senza, un avviso lo dice esplicitamente invece di
+salvare silenziosamente in memoria come prima.
+
+1. **Persistenza reale (niente più layer temporanei)**: collegare un progetto,
+   disegnare una linea sul radargramma. **Atteso:** compare
+   `<progetto>/vector_layers/radargram_traces.gpkg` su disco. Chiudere QGIS
+   **senza salvare il progetto** (o rimuovere e ricaricare il layer dal file), poi
+   riaprire lo stesso `.gpkg` in QGIS: la feature c'è ancora — prova che non è più
+   un memory layer. Disegnare poi anche un punto e un poligono: **atteso** tre
+   layer ("Radargram Points/Lines/Polygons") tutti nello stesso `.gpkg`, nessuno
+   sovrascrive gli altri.
+2. **Disegno visibile sul radargramma**: dopo aver salvato una linea/punto/poligono,
+   **atteso** che restino visibili (colore ciano) sul radargramma anche dopo aver
+   disattivato "Linea"/ecc. Cambiare profilo e tornare indietro: **atteso** la
+   geometria riappaia (letta dal `.gpkg`, non dalla sessione). Cambiare canale sullo
+   stesso profilo: **atteso** sparisca (le geometrie sono per canale). Notare in
+   pianta (vista mappa QGIS) che un poligono disegnato in profondità appare come una
+   linea: è corretto, non un bug (est/nord derivano solo dalla posizione lungo il
+   profilo).
+3. **Attributi auto-compilati**: aprire la tabella attributi di "Radargram Lines".
+   **Atteso** colonne `amplitude`, `velocity_m_ns`, `rdp` valorizzate (non vuote) per
+   ogni feature disegnata da questo round in poi.
+4. **Colonna "Radargramma" in Trace Info**: aprire il pannello Trace Info sul layer
+   "Radargram Lines". **Atteso** una colonna "Radargramma" (accanto a "Time-slice")
+   con `<variante> · <profilo> ch<canale>`; colonna "Vertices" non più sempre a 0 per
+   queste feature (ora conta da `vertex_depths` quando manca il layer companion delle
+   etichette).
+5. **"Misura velocità" (popup statico)**: attivarla senza aver mai toccato nulla.
+   **Atteso** un'etichetta gialla vicino al cursore con `v=0.100 m/ns εr=8.99 (di
+   base)` che **non cambia** muovendo il mouse su punti diversi (a differenza del
+   round 1).
+6. **Campo velocità editabile**: cambiare il valore nel campo "Velocità" (es. a
+   0,09). **Atteso**: si salva subito (nessun pulsante da premere), l'asse di
+   profondità del radargramma nel pannello si ricalcola (confrontare la profondità
+   massima mostrata prima/dopo), e riattivando "Misura velocità" il popup mostra il
+   nuovo valore con `(manuale)`.
+7. **"Calcola con iperbole" + salvataggio**: attivarla, cliccare l'apice di
+   un'iperbole visibile, muovere il puntatore lungo un'ala. **Atteso** stessa lettura
+   live del round 1 (ora in m/ns) e il pulsante "Salva come preimpostato" si abilita.
+   Cliccarlo: **atteso** messaggio di conferma, e il campo "Velocità"/il popup
+   "Misura velocità" riflettono subito il nuovo valore con `(da iperbole)`. Chiudere e
+   riaprire il pannello (o QGIS): **atteso** il valore resta (letto da
+   `velocity_overrides.json` nella cartella della variante).
+8. **Profile Viewer, campo m/ns**: aprire il pannello Hyperbola Fit. **Atteso** un
+   nuovo campo "velocity (m/ns)" accanto a RDP: cambiando l'uno si aggiorna l'altro
+   in entrambe le direzioni.
+9. **Profile Viewer, salvataggio velocità**: senza aver mai salvato una variante in
+   questa sessione, premere "Salva velocità nella variante". **Atteso** messaggio
+   "salva prima la variante". Salvare una variante (anche "Lavoro"), poi premere di
+   nuovo: **atteso** conferma nello stato in basso. Aprire
+   `GPR_Processing/processed/<variante>/velocity_overrides.json`: **atteso** il file
+   c'è con `rdp`/`velocity_m_ns` coerenti col campo. Ripetere impostando un apice
+   Hyperbola Fit e salvando una variante **senza** premere il pulsante: **atteso** il
+   file compaia comunque (salvataggio automatico agganciato al salvataggio variante).
+10. **Bug refresh Profile Viewer**: aprire un progetto con una variante già
+    processata (filtri attivi). **Atteso** il radargramma appaia già filtrato al
+    primo render, senza dover deflaggare/flaggare un filtro a mano.
+
+---
+
+## Correlazione radargramma <-> time-slice nel pannello (2026-09-23, non committato)
+
+Risposta a 4 feedback dopo l'uso reale (il primo giro di questa correlazione,
+uscito lo stesso giorno, non funzionava affatto). **Causa radice trovata ispezionando
+il progetto SUASA reale dell'utente**: `_timeslice_layers_for_variant` (round 1)
+richiedeva che la cartella delle time-slice avesse `processed/<variante>` come
+antenato entro 4 livelli (`variant_dir_from_slice_dir`) - condizione MAI vera nel
+progetto reale, dove le time-slice vivono sotto `SUASA/RadarDataExport/GeosurveyStudio/
+GPR_Processing/timeslices/` mentre i profili processati stanno sotto
+`SUASA/GeosurveyStudio/GPR_Processing/processed/<variante>/`: due alberi di cartelle
+completamente separati. Inoltre lo slider di navigazione del dialogo principale
+(`dlg.Dial`, vedi `catalog_group_mixin.update_visibility_with_dial`) esiste già e
+naviga le time-slice per indice leggendo il **catalogo di progetto**
+(`metadata/project_catalog.json`, `depth_from`/`depth_to` per raster), un meccanismo
+diverso e più usato di `sliceset.json`.
+
+**Fix**: la ricerca delle time-slice ora ignora del tutto la relazione di cartelle
+con la variante (qualunque raster caricato nel progetto con una fascia di profondità
+nota va bene, letta prima da `sliceset.json` e poi, se assente, dal catalogo), e il
+pannello ora ascolta anche i cambi di visibilità nell'albero dei livelli (non solo i
+propri clic), cosicché lo slider `Dial` del dialogo principale aggiorni la riga verde
+in tempo reale. Testato offscreen (`test_radargram_dock.py`, 57 test, incluso un test
+con time-slice in una cartella scollegata dalla variante e uno con dati solo nel
+catalogo, senza `sliceset.json`); **non** ancora provato nella finestra reale di QGIS
+sul progetto SUASA.
+
+1. **Doppio clic sul radargramma -> attiva la time-slice**: con un gruppo di
+   time-slice caricato nel canvas (Import to Canvas, o già presenti dal Project
+   Manager/catalogo - non serve alcuna relazione con la variante aperta nel
+   pannello), doppio clic sul radargramma a una profondità qualsiasi. **Atteso**: nel
+   pannello Livelli resta spuntato solo il raster la cui fascia contiene quella
+   profondità (le sorelle nello stesso gruppo dell'albero si spengono da sole), quel
+   raster diventa il livello attivo, e la riga verde/fascia nel pannello si allinea
+   alla sua finestra di profondità. Doppio clic più in profondità di tutte le fasce:
+   **atteso** si attiva comunque la fascia più vicina (nessun errore).
+2. **Slider di navigazione (`Dial`) -> riga verde live**: nel dialogo principale,
+   selezionare il gruppo di time-slice e scorrere lo slider di navigazione (quello
+   con tooltip "Navigation slider: switch visible rasters in selected groups").
+   **Atteso**: con "Segui time-slice" attivo nel pannello Radargrammi processati, la
+   riga verde/fascia seguono lo slider **senza** dover cliccare sul radargramma.
+   Disattivando "Segui time-slice": **atteso** la riga verde smette di seguire lo
+   slider.
+3. **Clic su "Punta sulla mappa" -> indicatore preciso**: con una sola time-slice del
+   gruppo spuntata/visibile, attivare "Punta sulla mappa" e cliccare un punto
+   qualsiasi sopra l'area rilevata. **Atteso**: il pannello passa a profilo/canale/
+   traccia più vicini (come prima) **e** la riga verde/fascia si aggiornano alla
+   profondità della time-slice effettivamente visibile in quel momento sul canvas
+   (non un vecchio riferimento rimasto da prima). Se nessuna time-slice è visibile,
+   il riferimento precedente resta invariato (nessun azzeramento a caso).
+4. **Nessuna time-slice caricata**: doppio clic sul radargramma senza aver mai
+   caricato time-slice nel progetto. **Atteso** messaggio nello stato in basso
+   ("Nessuna time-slice caricata nel progetto"), nessun errore/crash.
+5. **"Misura velocità" ora si aggiorna dal vivo dopo un clic (round 4)**: chiarito
+   con l'utente che il campo "Velocità" (spinbox accanto a "Materiale") deve restare
+   il preimpostato statico per profilo, ma il **popup** "Misura velocità" deve invece
+   mostrare un valore che cambia muovendo il puntatore, per confrontarlo con i
+   valori tipici di materiale (aria/argilla/vuoto ecc. nel menu "Materiale..."), a
+   supporto della lettura delle anomalie. Attivare "Misura velocità", **cliccare
+   sull'apice di un'iperbole di diffrazione visibile** (il popup mostra "n/d" finche'
+   il puntatore non e' sotto l'apice), poi muovere il puntatore lungo un'ala.
+   **Atteso**: il popup mostra "v=... m/ns εr=... (dal vivo)" che cambia con la
+   posizione del puntatore (stessa fisica di "Calcola con iperbole", ma letta dalla
+   posizione del mouse invece che dalla rotellina), e una curva d'anteprima gialla
+   segue il puntatore. **Esc** toglie l'apice e torna alla lettura statica
+   preimpostata. Senza mai cliccare un apice, il popup resta la lettura statica
+   preimpostata come prima (nessuna regressione per chi lo usa solo così). Cambiare
+   profilo/canale o attivare "Calcola con iperbole" durante la misura: **atteso**
+   l'apice si scarta silenziosamente.

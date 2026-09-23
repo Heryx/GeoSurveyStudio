@@ -8,6 +8,7 @@ import importlib
 import os
 import pathlib
 import sys
+import tempfile
 import time
 import unittest
 
@@ -139,7 +140,7 @@ class BlitManagerTest(unittest.TestCase):
         self.assertIsNone(mgr._bg)
 
 
-def _make_profile(n_s=128, n_t=400):
+def _make_profile(n_s=128, n_t=400, n_channels=1):
     rng = np.random.default_rng(3)
     data = rng.normal(0, 0.05, (n_s, n_t)).astype(np.float32)
     t = np.arange(n_s)[:, None]
@@ -150,7 +151,7 @@ def _make_profile(n_s=128, n_t=400):
     ch = _RD.OgprChannel(0, data, 500000 + dist, 4500000 + 0 * dist, 0 * dist, 0 * dist, dist)
     return _RD.OgprProfile(
         path="synthetic.ogpr", version_major=1, version_minor=0, swath_name="s", swath_id="1",
-        array_id=0, n_samples=n_s, n_channels=1, n_slices=n_t, sampling_step_m=0.02,
+        array_id=0, n_samples=n_s, n_channels=n_channels, n_slices=n_t, sampling_step_m=0.02,
         sampling_time_ns=0.117, velocity_m_s=1.0e8, frequency_mhz=400.0, polarization="HH",
         epsg=32633, value_type="f4", channels=[ch], header_raw={},
     )
@@ -504,6 +505,196 @@ class ViewerInteractionTest(_ViewerTestBase):
             _CM.apply_pipeline = real
         self.assertEqual(errors, ["boom"])
         self.assertFalse(v._proc_busy)
+
+
+@unittest.skipUnless(HAS_MPL and HAS_VIEWER, "matplotlib/viewer non disponibili")
+class RestoredProcessingStateAppliesFiltersTest(_ViewerTestBase):
+    """Riaprire un progetto con processing salvato deve mostrare subito il
+    radargramma filtrato, senza dover deflaggare/flaggare un filtro a mano
+    (bug: _apply_gain_hyper_preset non specchiava l'enabled-map sulle caselle
+    _chk_* quando chiamato durante il restore, con _syncing_filter_chain=True)."""
+
+    def test_restoring_a_state_with_dewow_enabled_checks_the_box_and_reprocesses(self):
+        v = self.v
+        self.assertFalse(v._chk_dewow.isChecked())    # baseline: nessun filtro attivo
+        raw_before = np.array(v._disp_data, copy=True) if v._disp_data is not None else None
+
+        state = {
+            "gain_hyper": {
+                "format": "gpr_gain_hyper_preset",
+                "pipeline_chain": {"enabled": {"dewow": True}},
+            },
+            "params": {},
+        }
+        v._apply_full_processing_state(state)
+        self._pump(50)
+
+        self.assertTrue(v._chk_dewow.isChecked())     # specchiato subito, non solo dopo un toggle manuale
+        self.assertNotIn("RAW", v._lbl_status.text().upper())
+        if raw_before is not None and v._disp_data is not None:
+            self.assertFalse(np.array_equal(v._disp_data, raw_before))   # il dewow ha davvero cambiato l'immagine
+
+
+@unittest.skipUnless(HAS_MPL and HAS_VIEWER, "matplotlib/viewer non disponibili")
+class HyperbolaVelocityFieldTest(_ViewerTestBase):
+    """Campo velocita' in m/ns accanto all'RDP (item 8) e salvataggio del fit
+    come preimpostato di variante (item 7, gpr_velocity_store.py)."""
+
+    def test_rdp_and_velocity_spin_stay_in_sync_both_ways(self):
+        v = self.v
+        HM = importlib.import_module("rasterlinker_feature_interpolation.gpr_hyperbola_math")
+        v._spin_hyperbola_rdp.setValue(16.0)
+        self.assertAlmostEqual(
+            v._spin_hyperbola_vel_mns.value(), HM.rdp_to_velocity_m_s(16.0) * 1e-9, places=4)
+        v._spin_hyperbola_vel_mns.setValue(0.12)
+        self.assertAlmostEqual(v._spin_hyperbola_rdp.value(), HM.velocity_to_rdp(0.12 * 1e9), places=1)
+
+    def test_save_velocity_refuses_without_a_saved_variant(self):
+        v = self.v
+        v._variant_parent_ctx = None
+        warned = []
+        orig = _GV.QMessageBox.information
+        _GV.QMessageBox.information = staticmethod(lambda *a, **k: warned.append(a))
+        try:
+            v._save_hyperbola_velocity_to_variant()
+        finally:
+            _GV.QMessageBox.information = orig
+        self.assertEqual(len(warned), 1)
+
+    def test_save_velocity_writes_the_sidecar_for_the_saved_variant(self):
+        v = self.v
+        VS = importlib.import_module("rasterlinker_feature_interpolation.gpr_velocity_store")
+        with tempfile.TemporaryDirectory() as root:
+            v._gpr_workspace_override = root
+            v._variant_parent_ctx = "Lavoro"
+            v._spin_hyperbola_rdp.setValue(11.0)
+            v._save_hyperbola_velocity_to_variant()
+            variant_dir = os.path.join(root, "GPR_Processing", "processed", "Lavoro")
+            got = VS.resolve_velocity_m_ns(variant_dir, None)
+            self.assertEqual(got["source"], "manual")
+            self.assertAlmostEqual(got["rdp"], 11.0, places=3)
+
+
+@unittest.skipUnless(HAS_MPL and HAS_VIEWER, "matplotlib/viewer non disponibili")
+class VelocityEstimationTabTest(_ViewerTestBase):
+    """Scheda 'Stima velocità' separata dalla pipeline (round 3): i controlli
+    dell'iperbole vivono fuori da 'Processing', metodo due-punti, lista di
+    stime multiple con aggregato media/mediana, niente più salvataggio come
+    parte del preset Gain/Hyperbola."""
+
+    def test_velocity_tab_exists_and_hosts_the_hyperbola_controls(self):
+        v = self.v
+        titles = [v._right_tabs.tabText(i) for i in range(v._right_tabs.count())]
+        self.assertIn("Stima velocità", titles)
+        self.assertTrue(v._velocity_group_box.isAncestorOf(v._chk_hyperbola))
+        self.assertTrue(v._velocity_group_box.isAncestorOf(v._tbl_hyper_picks))
+        self.assertFalse(v._processing_panel_widget.isAncestorOf(v._chk_hyperbola))
+
+    def test_two_point_method_matches_the_math_module(self):
+        v = self.v
+        HM = importlib.import_module("rasterlinker_feature_interpolation.gpr_hyperbola_math")
+        depth = v._depth_max_display(v._profiles[0])
+        v._on_mouse_move(self._event(4.0, depth * 0.2))
+        v._set_hyperbola_apex_from_cursor()
+        self.assertEqual(v._hyperbola_last_method, "Manuale")
+        v._on_mouse_move(self._event(4.3, depth * 0.35))
+        v._set_hyperbola_two_point()
+        self.assertEqual(v._hyperbola_last_method, "Due punti")
+        prof = v._profiles[v._prof_idx]
+        v_ref = v._profile_reference_velocity(prof)
+        s = v._hyperbola_txrx_offset()
+        expected = HM.velocity_from_two_points(
+            v._hyper_apex_x, v._hyper_apex_depth, v._cursor_x, v._cursor_z, v_ref, s=s)
+        self.assertIsNotNone(expected)
+        _, expected_rdp = expected
+        self.assertAlmostEqual(v._spin_hyperbola_rdp.value(), expected_rdp, places=3)
+
+    def test_two_point_button_requires_an_apex_first(self):
+        v = self.v
+        v._hyper_apex_x = None
+        v._hyper_apex_depth = None
+        warned = []
+        orig = _GV.QMessageBox.information
+        _GV.QMessageBox.information = staticmethod(lambda *a, **k: warned.append(a))
+        try:
+            v._set_hyperbola_two_point()
+        finally:
+            _GV.QMessageBox.information = orig
+        self.assertEqual(len(warned), 1)
+
+    def test_pick_list_aggregate_mean_median_and_exclusion(self):
+        from qgis.PyQt.QtCore import Qt
+        v = self.v
+        v._hyper_picks = [
+            {"depth": 0.2, "method": "Manuale", "v_mns": 0.08, "rdp": 14.0, "included": True},
+            {"depth": 0.4, "method": "Due punti", "v_mns": 0.10, "rdp": 9.0, "included": True},
+            {"depth": 0.6, "method": "Automatico (ricerca ampiezza)", "v_mns": 0.20, "rdp": 2.25, "included": True},
+        ]
+        v._refresh_hyper_picks_table()
+        self.assertEqual(v._tbl_hyper_picks.rowCount(), 3)
+        self.assertIn("media", v._lbl_hyper_aggregate.text())
+        self.assertIn(f"v={(0.08 + 0.10 + 0.20) / 3.0:.4f}", v._lbl_hyper_aggregate.text())
+
+        idx = v._cb_hyper_aggregate.findData("median")
+        self.assertGreaterEqual(idx, 0)
+        v._cb_hyper_aggregate.setCurrentIndex(idx)
+        self.assertIn("mediana", v._lbl_hyper_aggregate.text())
+        self.assertIn("v=0.1000", v._lbl_hyper_aggregate.text())
+
+        # deselezionare una riga la esclude dall'aggregato
+        v._tbl_hyper_picks.item(2, 0).setCheckState(Qt.Unchecked)
+        self.assertIn("2 stime", v._lbl_hyper_aggregate.text())
+        self.assertFalse(v._hyper_picks[2]["included"])
+
+    def test_add_current_pick_requires_an_apex(self):
+        v = self.v
+        v._hyper_apex_depth = None
+        v._hyper_picks = []
+        warned = []
+        orig = _GV.QMessageBox.information
+        _GV.QMessageBox.information = staticmethod(lambda *a, **k: warned.append(a))
+        try:
+            v._add_current_hyperbola_pick()
+        finally:
+            _GV.QMessageBox.information = orig
+        self.assertEqual(len(warned), 1)
+        self.assertEqual(v._hyper_picks, [])
+
+    def test_save_velocity_uses_the_aggregate_when_picks_are_included(self):
+        v = self.v
+        VS = importlib.import_module("rasterlinker_feature_interpolation.gpr_velocity_store")
+        with tempfile.TemporaryDirectory() as root:
+            v._gpr_workspace_override = root
+            v._variant_parent_ctx = "Lavoro"
+            v._hyper_picks = [
+                {"depth": 0.2, "method": "Manuale", "v_mns": 0.08, "rdp": 14.0, "included": True},
+                {"depth": 0.4, "method": "Due punti", "v_mns": 0.12, "rdp": 6.25, "included": True},
+            ]
+            v._save_hyperbola_velocity_to_variant()
+            variant_dir = os.path.join(root, "GPR_Processing", "processed", "Lavoro")
+            got = VS.resolve_velocity_m_ns(variant_dir, None)
+            self.assertEqual(got["source"], "hyperbola_fit_aggregate")
+            self.assertAlmostEqual(got["velocity_m_ns"], 0.10, places=6)
+
+    def test_gain_hyper_preset_no_longer_carries_hyperbola_state(self):
+        v = self.v
+        v._chk_hyperbola.setChecked(True)
+        v._spin_hyperbola_rdp.setValue(15.0)
+        v._hyper_apex_x, v._hyper_apex_depth = 3.0, 0.4
+        preset = v._collect_gain_hyper_preset()
+        self.assertNotIn("hyperbola", preset)
+
+    def test_apply_gain_hyper_preset_ignores_a_round2_hyperbola_key(self):
+        v = self.v
+        v._chk_hyperbola.setChecked(False)
+        v._spin_hyperbola_rdp.setValue(9.0)
+        old_format_payload = {
+            "format": "gpr_gain_hyper_preset",
+            "hyperbola": {"enabled": True, "rdp": 30.0, "apex_x": 1.0, "apex_depth": 0.1},
+        }
+        v._apply_gain_hyper_preset(old_format_payload)   # non deve sollevare, e va ignorato
+        self.assertFalse(v._chk_hyperbola.isChecked())
+        self.assertAlmostEqual(v._spin_hyperbola_rdp.value(), 9.0, places=3)
 
 
 @unittest.skipUnless(HAS_VIEWER, "gpr_profile_viewer non importabile")
