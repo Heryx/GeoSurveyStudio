@@ -81,8 +81,23 @@ class ProjectPersistenceMixin:
         folder = QFileDialog.getExistingDirectory(
             self, "Cartella di lavoro GPR (dove salvare raw/processed/timeslices)", start
         )
-        if folder:
-            self._set_active_workspace(folder)
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        enclosing = self._find_enclosing_gpr_project(folder)
+        if enclosing and enclosing != folder:
+            ret = QMessageBox.warning(
+                self, "Cartella di lavoro GPR",
+                "La cartella scelta e' dentro un progetto GPR gia' esistente:\n"
+                f"{enclosing}\n\n"
+                "Usarla come nuovo workspace crea un progetto annidato dentro l'altro "
+                "(di solito e' un errore: probabilmente intendevi 'Apri progetto GPR' "
+                "su quella cartella).\n\nVuoi usarla comunque?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                return
+        self._set_active_workspace(folder)
 
     def _project_manager_root(self) -> str:
         """Progetto attualmente caricato nel Project Manager ('' se nessuno)."""
@@ -147,11 +162,23 @@ class ProjectPersistenceMixin:
         if not ok or not name:
             return False
         folder = os.path.normpath(os.path.join(parent_dir, name))
-        if os.path.isfile(os.path.join(folder, "GPR_Processing", "project.json")):
-            QMessageBox.information(
-                self, "Nuovo progetto GPR",
-                "La cartella contiene gia' un progetto GPR. Usa 'Apri progetto GPR'.",
-            )
+        enclosing = self._find_enclosing_gpr_project(folder)
+        if enclosing:
+            if enclosing == folder:
+                QMessageBox.information(
+                    self, "Nuovo progetto GPR",
+                    "La cartella contiene gia' un progetto GPR. Usa 'Apri progetto GPR'.",
+                )
+            else:
+                QMessageBox.warning(
+                    self, "Nuovo progetto GPR",
+                    "La cartella scelta e' dentro un progetto GPR gia' esistente:\n"
+                    f"{enclosing}\n\n"
+                    "Creare un progetto qui lo annida dentro quello (di solito e' un "
+                    "errore capitato scegliendo per sbaglio la sua cartella "
+                    "'GPR_Processing'). Scegli una cartella fuori da li', oppure usa "
+                    "'Apri progetto GPR' su quella cartella per aggiungere una nuova zona.",
+                )
             return False
 
         try:
@@ -218,6 +245,30 @@ class ProjectPersistenceMixin:
                 return os.path.dirname(os.path.normpath(qgs_file))
             except Exception:
                 return ""
+        return ""
+
+    @staticmethod
+    def _find_enclosing_gpr_project(folder: str) -> str:
+        """Risale gli antenati di ``folder`` (``folder`` incluso) cercando un
+        progetto GPR gia' esistente (una cartella con ``GPR_Processing/project.json``).
+
+        Ritorna quella cartella, o '' se non trovata. Usato prima di creare o
+        impostare un workspace per evitare di annidare un progetto dentro
+        un altro (es. scegliendo per sbaglio la ``GPR_Processing`` di un
+        progetto esistente come "cartella che contiene" un progetto nuovo).
+        """
+        cur = os.path.normpath(str(folder or "").strip())
+        if not cur:
+            return ""
+        seen = set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            if os.path.isfile(os.path.join(cur, "GPR_Processing", "project.json")):
+                return cur
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
         return ""
 
     def _set_active_workspace(self, root: str, register_in_project_manager: bool = True) -> None:
@@ -615,11 +666,25 @@ class ProjectPersistenceMixin:
         except Exception as exc:
             print(f"[GPR viewer][WARN] ripristino processing_state fallito: {exc}")
         self._update_slice_profile_info()
+        ts_note = ""
         try:
             ts_saved = self._path_from_gpr_processing_store(str(meta.get("last_timeslice") or ""))
-            if ts_saved and self._is_qt_alive(getattr(self, "_le_slice_outdir", None)):
-                self._le_slice_outdir.setText(ts_saved)
+            # Se la cartella salvata non esiste piu' (progetto spostato/copiato,
+            # o puntava a un percorso di un altro progetto) non fidarsi del
+            # percorso assoluto stantio: ripartire dalla cartella timeslices del
+            # progetto corrente, cosi' l'output segue sempre la cartella attiva.
+            if ts_saved and os.path.isdir(ts_saved):
+                target = ts_saved
+            else:
+                target = self._default_slice_output_dir()
+                if ts_saved:
+                    ts_note = " Cartella time-slice salvata non trovata: ripristinata quella del progetto."
+            if target and self._is_qt_alive(getattr(self, "_le_slice_outdir", None)):
+                self._le_slice_outdir.setText(target)
         except Exception:
             pass
-        self._safe_set_text(self._lbl_status, f"Progetto GPR importato: {len(self._profiles)} profili.")
+        self._safe_set_text(
+            self._lbl_status,
+            f"Progetto GPR importato: {len(self._profiles)} profili.{ts_note}",
+        )
         return True
