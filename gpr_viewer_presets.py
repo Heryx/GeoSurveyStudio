@@ -2,8 +2,9 @@
 """Preset di processing per strumento nel GPR Profile Viewer.
 
 Il menu a tendina elenca tutti i preset e funziona con qualunque dato; il
-pulsante rapido di uno strumento (es. "Preset IDS") compare solo quando il
-profilo corrente e' stato acquisito da quello strumento. Un preset scrive i
+pulsante rapido di uno strumento (es. "Preset Stream C", "Preset Opera Duo")
+compare solo quando il profilo corrente e' stato acquisito da quello
+strumento (vedi gpr_instrument_presets.detect_instrument). Un preset scrive i
 valori nei controlli normali del pannello Processing, quindi resta modificabile."""
 
 from __future__ import annotations
