@@ -419,6 +419,10 @@ class GeoSurveyStudioPlugin(
                     return base
             except Exception:
                 pass
+        return _active_zone_base(self._radargram_project_root())
+
+    def _radargram_project_root(self) -> str:
+        """Radice del progetto GPR (impostazioni, progetto QGIS legato, cartella del .qgz)."""
         root = ""
         try:
             root = (self.settings.value(self.settings_key_active_project, "", type=str) or "").strip()
@@ -437,7 +441,27 @@ class GeoSurveyStudioPlugin(
                 root = os.path.dirname(os.path.normpath(qgs)) if qgs else ""
             except Exception:
                 root = ""
-        return _active_zone_base(root)
+        return root
+
+    def _radargram_zones(self) -> list:
+        """Aree indagate del progetto per il pannello dei radargrammi: [{"name","base","active"}].
+        Vuoto se il progetto non ha un project.json (il pannello usa allora la sola cartella di lavoro)."""
+        root = self._radargram_project_root()
+        if not root:
+            return []
+        try:
+            from . import project_zones
+            if not os.path.isfile(project_zones.project_json_path(root)):
+                return []
+            state = project_zones.read_state(root)
+            out = []
+            for name in state["zones"]:
+                base = project_zones.zone_base(root, name)
+                if os.path.isdir(base):
+                    out.append({"name": name, "base": base, "active": name == state["active_zone"]})
+            return out
+        except Exception:
+            return []
 
     def _live_profile_viewer(self):
         """Il Profile Viewer se e' aperto e ha profili in memoria, altrimenti None."""
@@ -498,6 +522,7 @@ class GeoSurveyStudioPlugin(
             dock = RadargramDock(
                 self.iface,
                 workspace_provider=self._radargram_workspace_root,
+                zones_provider=getattr(self, "_radargram_zones", None),
                 geometry_provider=self._radargram_geometry_provider,
                 feature_sink=self._radargram_feature_sink,
                 feature_query=self._radargram_feature_query,

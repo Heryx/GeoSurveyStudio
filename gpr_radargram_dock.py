@@ -38,9 +38,11 @@ from qgis.PyQt.QtWidgets import (
     QDockWidget,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLayout,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QToolButton,
@@ -62,6 +64,7 @@ import numpy as np
 from .radargram_store import (
     VariantStore,
     discover_variants,
+    processed_dir_for,
     slice_info_for_path,
     variant_dir_from_slice_dir,
 )
@@ -75,7 +78,7 @@ from .gpr_hyperbola_math import (
     velocity_to_rdp,
 )
 from .gpr_velocity_store import write_velocity_override
-from .gpr_material_presets import MATERIAL_PRESETS, material_preset
+from .gpr_material_presets import material_preset
 from .gpr_training_export import export_variant_for_training
 
 try:
@@ -150,6 +153,8 @@ class _FlowLayout(QLayout):
     def minimumSize(self):
         size = QSize()
         for it in self._items:
+            if it.isEmpty():
+                continue
             size = size.expandedTo(it.minimumSize())
         m = self.contentsMargins()
         return size + QSize(m.left() + m.right(), m.top() + m.bottom())
@@ -159,6 +164,8 @@ class _FlowLayout(QLayout):
         area = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
         x, y, line_h = area.x(), area.y(), 0
         for it in self._items:
+            if it.isEmpty():                 # widget nascosto: non occupa spazio
+                continue
             hint = it.sizeHint()
             if x > area.x() and x + hint.width() > area.right() + 1:
                 x, y, line_h = area.x(), y + line_h + self._v, 0
@@ -364,7 +371,7 @@ class RadargramDock(QDockWidget):
     MIN_PICK_TOL_M = 2.0
 
     def __init__(self, iface, workspace_provider=None, geometry_provider=None,
-                 feature_sink=None, feature_query=None, parent=None):
+                 feature_sink=None, feature_query=None, parent=None, zones_provider=None):
         super().__init__("Radargrammi processati", parent or (iface.mainWindow() if iface else None))
         self.setObjectName("GeoSurveyRadargramDock")
         self.setAllowedAreas(Qt.AllDockWidgetAreas)
@@ -374,6 +381,12 @@ class RadargramDock(QDockWidget):
         )
         self.iface = iface
         self._workspace_provider = workspace_provider
+        # Aree indagate del progetto: callable -> [{"name", "base", "active"}, ...]. Senza,
+        # il pannello ha un'unica area implicita: la cartella di `workspace_provider`.
+        self._zones_provider = zones_provider
+        self._zones: list = []
+        self._active_zone_seen: str | None = None
+        self._viewer_zone = ""             # area attiva nel Profile Viewer (anche se senza varianti)
         self._geometry_provider = geometry_provider
         self._feature_sink = feature_sink
         self._feature_query = feature_query
@@ -471,43 +484,59 @@ class RadargramDock(QDockWidget):
             b.setAutoRaise(True)
             return b
 
-        ctrl = QWidget()
-        flow = _FlowLayout(ctrl)
-        root.addWidget(ctrl)
+        def _sep():
+            f = QFrame()
+            f.setFrameShape(QFrame.VLine)
+            f.setFrameShadow(QFrame.Sunken)
+            return f
+
+        # Riga 1: cosa si guarda (area, variante, profilo, canale) e come lo si vede.
+        view_bar = QWidget()
+        flow = _FlowLayout(view_bar)
+        root.addWidget(view_bar)
+
+        self._lbl_zone = QLabel("Area")
+        self._cb_zone = _combo(10)
+        self._cb_zone.setToolTip("Area indagata del progetto: ognuna ha le sue varianti e i suoi profili.")
+        self._cb_zone.currentIndexChanged.connect(self._on_zone_changed)
+        self._grp_zone = _group(self._lbl_zone, self._cb_zone)
+        flow.addWidget(self._grp_zone)
 
         self._cb_variant = _combo(14)
         self._cb_variant.setToolTip("Radargrammi processati salvati nel progetto (Processing/processed).")
         self._cb_variant.currentIndexChanged.connect(self._on_variant_changed)
-        self._btn_refresh = _tool("\u27f3", "Rileggi le varianti e le coordinate (dopo un nuovo posizionamento o salvataggio).")
+        self._btn_refresh = _tool("⟳", "Rileggi le varianti e le coordinate (dopo un nuovo posizionamento o salvataggio).")
         self._btn_refresh.clicked.connect(self.refresh)
-        self._btn_browse = _tool("\u2026", "Scegli a mano una cartella-variante (.npz).")
-        self._btn_browse.clicked.connect(self._browse_variant)
-        flow.addWidget(_group(QLabel("Variante"), self._cb_variant, self._btn_refresh, self._btn_browse))
-
-        self._btn_export_training = QPushButton("Esporta per training")
-        self._btn_export_training.setToolTip(
+        self._btn_more = _tool("⋯", "Altre azioni sulla variante")
+        self._btn_more.setPopupMode(QToolButton.InstantPopup)
+        more_menu = QMenu(self._btn_more)
+        self._act_browse = more_menu.addAction("Scegli a mano una cartella-variante (.npz)…")
+        self._act_browse.triggered.connect(self._browse_variant)
+        self._act_export_training = more_menu.addAction("Esporta per training…")
+        self._act_export_training.setToolTip(
             "Scrive su disco, in una cartella a scelta, tutti i profili/canali della\n"
             "variante aperta in un formato semplice per una pipeline di Deep Learning\n"
             "esterna: un radargramma.npz per canale, la geometria del posizionamento\n"
             "attuale (geometry.json) e i parametri di processing (meta.json).\n"
             "Non modifica nulla nel progetto QGIS.")
-        self._btn_export_training.clicked.connect(self._export_training)
-        flow.addWidget(_group(self._btn_export_training))
+        self._act_export_training.triggered.connect(self._export_training)
+        self._btn_more.setMenu(more_menu)
+        flow.addWidget(_group(QLabel("Variante"), self._cb_variant, self._btn_refresh, self._btn_more))
 
-        self._btn_prev_p = _tool("\u25c0", "Profilo precedente (PgSu)")
+        self._btn_prev_p = _tool("◀", "Profilo precedente (PgSu)")
         self._btn_prev_p.clicked.connect(lambda: self.select_profile(self._pi - 1))
         self._cb_profile = _combo(20)
         self._cb_profile.setMaxVisibleItems(30)
         self._cb_profile.currentIndexChanged.connect(self._on_profile_combo)
-        self._btn_next_p = _tool("\u25b6", "Profilo successivo (PgGiu)")
+        self._btn_next_p = _tool("▶", "Profilo successivo (PgGiu)")
         self._btn_next_p.clicked.connect(lambda: self.select_profile(self._pi + 1))
         flow.addWidget(_group(QLabel("Profilo"), self._btn_prev_p, self._cb_profile, self._btn_next_p))
 
-        self._btn_prev_c = _tool("\u25c0", "Canale precedente (freccia sinistra)")
+        self._btn_prev_c = _tool("◀", "Canale precedente (freccia sinistra)")
         self._btn_prev_c.clicked.connect(lambda: self.select_profile(self._pi, self._ci - 1))
         self._cb_channel = _combo(3)
         self._cb_channel.currentIndexChanged.connect(self._on_channel_combo)
-        self._btn_next_c = _tool("\u25b6", "Canale successivo (freccia destra)")
+        self._btn_next_c = _tool("▶", "Canale successivo (freccia destra)")
         self._btn_next_c.clicked.connect(lambda: self.select_profile(self._pi, self._ci + 1))
         flow.addWidget(_group(QLabel("Canale"), self._btn_prev_c, self._cb_channel, self._btn_next_c))
 
@@ -517,10 +546,10 @@ class RadargramDock(QDockWidget):
         self._spin_depth.setRange(0.0, 50.0)
         self._spin_depth.setSuffix(" m")
         self._spin_depth.setToolTip(
-            "Profondit\u00e0 di riferimento (riga verde): si imposta qui, con un clic sul\n"
-            "radargramma, con le frecce su/gi\u00f9, o seguendo la time-slice selezionata.")
+            "Profondità di riferimento (riga verde): si imposta qui, con un clic sul\n"
+            "radargramma, con le frecce su/giù, o seguendo la time-slice selezionata.")
         self._spin_depth.valueChanged.connect(self._on_depth_spin)
-        flow.addWidget(_group(QLabel("Profondit\u00e0"), self._spin_depth))
+        flow.addWidget(_group(QLabel("Profondità"), self._spin_depth))
 
         self._spin_gain = QDoubleSpinBox()
         self._spin_gain.setRange(0.2, 30.0)
@@ -534,35 +563,30 @@ class RadargramDock(QDockWidget):
         self._cb_cmap = _combo(8)
         _populate_cmap_combo(self._cb_cmap, current=str(QSettings().value(_SETTINGS + "cmap", "") or "") or None)
         self._cb_cmap.currentIndexChanged.connect(self._on_look_changed)
-        flow.addWidget(_group(QLabel("Gain"), self._spin_gain, self._cb_cmap))
+        self._btn_zoom = _tool("⤢", "Vista intera")
+        self._btn_zoom.clicked.connect(self._reset_zoom)
+        flow.addWidget(_group(QLabel("Gain"), self._spin_gain, self._cb_cmap, self._btn_zoom))
 
-        self._chk_follow = QCheckBox("Segui time-slice")
-        self._chk_follow.setChecked(True)
-        self._chk_follow.setToolTip(
-            "Selezionando una time-slice nel pannello Livelli, il radargramma mostra la sua\n"
-            "finestra di profondit\u00e0 (fascia verde) e passa alla variante da cui \u00e8 stata generata.")
-        self._chk_follow.toggled.connect(self._on_follow_toggled)
-        flow.addWidget(self._chk_follow)
-        self._chk_map = QCheckBox("Sulla mappa")
-        self._chk_map.setChecked(True)
-        self._chk_map.setToolTip("Disegna sulla mappa la traccia del profilo e il punto sotto il cursore.")
-        self._chk_map.toggled.connect(self._on_map_toggled)
-        flow.addWidget(self._chk_map)
+        # Riga 2: strumenti. Ogni strumento attivo mostra accanto i suoi comandi, gli altri restano nascosti.
+        tool_bar = QWidget()
+        tools = _FlowLayout(tool_bar, hspacing=6)
+        root.addWidget(tool_bar)
+
         self._btn_pick = QPushButton("Punta sulla mappa")
         self._btn_pick.setCheckable(True)
         self._btn_pick.setToolTip(
             "Attiva lo strumento: un clic sulla mappa apre il profilo, il canale e la traccia\n"
-            "pi\u00f9 vicini al punto. Si disattiva scegliendo un altro strumento di QGIS.")
+            "più vicini al punto. Si disattiva scegliendo un altro strumento di QGIS.")
         self._btn_pick.toggled.connect(self._on_pick_toggled)
-        self._btn_zoom = _tool("\u2922", "Vista intera")
-        self._btn_zoom.clicked.connect(self._reset_zoom)
-        flow.addWidget(_group(self._btn_pick, self._btn_zoom))
+        tools.addWidget(self._btn_pick)
+        tools.addWidget(_sep())
 
         def _draw_btn(text, mode, tip):
             b = QPushButton(text)
             b.setCheckable(True)
             b.setToolTip(tip)
             b.toggled.connect(lambda on, m=mode: self._on_draw_mode_toggled(m, on))
+            b.toggled.connect(self._update_tool_context)
             self._draw_mode_buttons[mode] = b
             return b
 
@@ -575,15 +599,17 @@ class RadargramDock(QDockWidget):
         self._btn_draw_polygon = _draw_btn("Poligono", "polygon",
             "Disegna un poligono (es. il contorno di un'anomalia): un clic per\n"
             "vertice (almeno 3), poi 'Termina' (o Invio) per chiudere il contorno.")
-        self._btn_draw_undo = _tool("\u232b", "Rimuovi l'ultimo vertice (Backspace)")
+        self._btn_draw_undo = _tool("⌫", "Rimuovi l'ultimo vertice (Backspace)")
         self._btn_draw_undo.clicked.connect(self._undo_draw_vertex)
-        self._btn_draw_finish = _tool("\u2713", "Termina e salva la geometria (Invio)")
+        self._btn_draw_finish = _tool("✓", "Termina e salva la geometria (Invio)")
         self._btn_draw_finish.clicked.connect(self._finalize_drawn_feature)
-        self._btn_draw_cancel = _tool("\u2715", "Annulla il disegno in corso (Esc)")
+        self._btn_draw_cancel = _tool("✕", "Annulla il disegno in corso (Esc)")
         self._btn_draw_cancel.clicked.connect(self._cancel_draw)
-        flow.addWidget(_group(
-            QLabel("Disegna"), self._btn_draw_point, self._btn_draw_line, self._btn_draw_polygon,
-            self._btn_draw_undo, self._btn_draw_finish, self._btn_draw_cancel))
+        tools.addWidget(_group(
+            QLabel("Disegna"), self._btn_draw_point, self._btn_draw_line, self._btn_draw_polygon))
+        self._grp_draw_ctx = _group(self._btn_draw_undo, self._btn_draw_finish, self._btn_draw_cancel)
+        tools.addWidget(self._grp_draw_ctx)
+        tools.addWidget(_sep())
 
         self._spin_vel_mns = QDoubleSpinBox()
         self._spin_vel_mns.setDecimals(4)
@@ -591,49 +617,39 @@ class RadargramDock(QDockWidget):
         self._spin_vel_mns.setSingleStep(0.005)
         self._spin_vel_mns.setSuffix(" m/ns")
         self._spin_vel_mns.setToolTip(
-            "Velocit\u00e0 preimpostata per questo profilo (di base 0,1 m/ns se non\n"
+            "Velocità preimpostata per questo profilo (di base 0,1 m/ns se non\n"
             "ancora calcolata). Modificandola si salva subito e si aggiorna la\n"
-            "profondit\u00e0 mostrata sul radargramma.")
+            "profondità mostrata sul radargramma.")
         self._spin_vel_mns.valueChanged.connect(self._on_vel_spin_changed)
-        self._cb_vel_material = _combo(14)
-        self._cb_vel_material.addItem("Materiale...", "")
-        for _preset in MATERIAL_PRESETS:
-            self._cb_vel_material.addItem(_preset["label"], _preset["key"])
-        self._cb_vel_material.setToolTip(
-            "Valori tipici di velocit\u00e0 per materiale/condizione (letteratura GPR):\n"
-            "un punto di partenza comodo, resta poi modificabile a mano o con un fit\n"
-            "sull'iperbole.")
-        self._cb_vel_material.currentIndexChanged.connect(self._on_material_preset_chosen)
-        flow.addWidget(_group(QLabel("Velocit\u00e0"), self._spin_vel_mns, self._cb_vel_material))
-
-        self._btn_vel = QPushButton("Misura velocit\u00e0")
+        self._btn_vel = QPushButton("Misura")
         self._btn_vel.setCheckable(True)
         self._btn_vel.setToolTip(
-            "Senza apice, mostra vicino al puntatore la velocit\u00e0 preimpostata di\n"
+            "Senza apice, mostra vicino al puntatore la velocità preimpostata di\n"
             "questo profilo (il campo qui a sinistra). Un clic su un'iperbole/anomalia\n"
             "fissa l'apice: muovendo poi il puntatore lungo un'ala il valore si legge\n"
-            "dal vivo (utile per confrontarlo coi valori tipici di materiale). Esc\n"
-            "toglie l'apice e torna alla lettura preimpostata.")
+            "dal vivo. Esc toglie l'apice e torna alla lettura preimpostata.")
         self._btn_vel.toggled.connect(self._on_vel_toggled)
-        self._btn_hyper = QPushButton("Calcola con iperbole")
+        self._btn_vel.toggled.connect(self._update_tool_context)
+        self._btn_hyper = QPushButton("Iperbole")
         self._btn_hyper.setCheckable(True)
         self._btn_hyper.setToolTip(
-            "Un clic sull'apice di un'iperbole di diffrazione lo fissa. Con l'apice\n"
-            "fissato: la rotellina del mouse cambia la velocit\u00e0/larghezza della\n"
-            "curva, il tasto destro blocca/sblocca il fit corrente (bloccato, la\n"
-            "rotellina non lo modifica pi\u00f9). 'Salva come preimpostato' registra il\n"
-            "valore mostrato.")
+            "Calcola la velocità da un'iperbole di diffrazione. Un clic sull'apice lo\n"
+            "fissa. Con l'apice fissato: la rotellina del mouse cambia la velocità/larghezza\n"
+            "della curva, il tasto destro blocca/sblocca il fit corrente (bloccato, la\n"
+            "rotellina non lo modifica più). 'Salva' registra il valore mostrato.")
         self._btn_hyper.toggled.connect(self._on_hyper_toggled)
-        self._btn_hyper_save = QPushButton("Salva come preimpostato")
+        self._btn_hyper.toggled.connect(self._update_tool_context)
+        self._btn_hyper_save = QPushButton("Salva")
         self._btn_hyper_save.setEnabled(False)
-        self._btn_hyper_save.setToolTip("Salva il valore calcolato con l'iperbole come velocit\u00e0 preimpostata del profilo.")
+        self._btn_hyper_save.setToolTip("Salva il valore calcolato con l'iperbole come velocità preimpostata del profilo.")
         self._btn_hyper_save.clicked.connect(self._save_hyper_fit_as_preset)
-        self._btn_vel_clear = _tool("\u2715", "Pulisci l'apice dell'iperbole")
+        self._btn_vel_clear = _tool("✕", "Pulisci l'apice dell'iperbole")
         self._btn_vel_clear.clicked.connect(self._clear_hyper_apex)
         self._lbl_vel = QLabel("v=n/d")
-        self._lbl_vel.setToolTip("Velocit\u00e0 (m/ns) e permittivit\u00e0 dielettrica (\u03b5r).")
-        flow.addWidget(_group(self._btn_vel))
-        flow.addWidget(_group(self._btn_hyper, self._btn_hyper_save, self._btn_vel_clear, self._lbl_vel))
+        self._lbl_vel.setToolTip("Velocità (m/ns) e permittività dielettrica (εr).")
+        tools.addWidget(_group(QLabel("Velocità"), self._spin_vel_mns, self._btn_vel, self._btn_hyper))
+        self._grp_hyper_ctx = _group(self._btn_hyper_save, self._btn_vel_clear, self._lbl_vel)
+        tools.addWidget(self._grp_hyper_ctx)
 
         self._fig = Figure(figsize=(8, 2.6))
         self._ax = self._fig.add_axes([0.06, 0.17, 0.92, 0.80])
@@ -654,8 +670,24 @@ class RadargramDock(QDockWidget):
         self._lbl_status = QLabel("")
         self._lbl_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self._lbl_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        root.addWidget(self._lbl_status)
+        self._chk_follow = QCheckBox("Segui time-slice")
+        self._chk_follow.setChecked(True)
+        self._chk_follow.setToolTip(
+            "Selezionando una time-slice nel pannello Livelli, il radargramma mostra la sua\n"
+            "finestra di profondit\u00e0 (fascia verde) e passa alla variante da cui \u00e8 stata generata.")
+        self._chk_follow.toggled.connect(self._on_follow_toggled)
+        self._chk_map = QCheckBox("Sulla mappa")
+        self._chk_map.setChecked(True)
+        self._chk_map.setToolTip("Disegna sulla mappa la traccia del profilo e il punto sotto il cursore.")
+        self._chk_map.toggled.connect(self._on_map_toggled)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(10)
+        status_row.addWidget(self._lbl_status, 1)
+        status_row.addWidget(self._chk_follow)
+        status_row.addWidget(self._chk_map)
+        root.addLayout(status_row)
         self.setWidget(host)
+        self._update_tool_context()
         self._show_message("Nessuna variante processata: salva una variante dal Profile Viewer "
                            "oppure scegli una cartella con …")
 
@@ -669,33 +701,130 @@ class RadargramDock(QDockWidget):
         except Exception:
             return ""
 
+    # -- aree ---------------------------------------------------------------------------
+
+    def _zone_list(self) -> list:
+        """Aree del progetto come [{"name", "base", "active"}]. Senza un fornitore di aree
+        (progetto senza project.json, uso da solo) c'e' un'unica area senza nome."""
+        zones = []
+        if self._zones_provider is not None:
+            try:
+                for z in (self._zones_provider() or []):
+                    zones.append({"name": str(z.get("name") or ""), "base": str(z.get("base") or ""),
+                                  "active": bool(z.get("active"))})
+            except Exception:
+                zones = []
+        if not zones:
+            self._viewer_zone = ""
+            return [{"name": "", "base": self._workspace_root(), "active": True}]
+        self._viewer_zone = next((z["name"] for z in zones if z["active"]), zones[0]["name"])
+        # Solo le aree con radargrammi processati (se nessuna ne ha, resta l'elenco intero: il
+        # pannello dira' che non c'e' nulla da mostrare).
+        with_data = [z for z in zones if discover_variants(z["base"])]
+        return with_data or zones
+
+    def _zone_named(self, name: str):
+        return next((z for z in self._zones if z["name"] == name), None)
+
+    def _current_zone(self):
+        name = self._cb_zone.currentData()
+        return self._zone_named(str(name)) if name is not None else (self._zones[0] if self._zones else None)
+
+    def _zone_of_variant(self, target: str):
+        """Nome dell'area che contiene la variante `target` (cartella o solo nome), o None."""
+        target = str(target or "").strip()
+        if not target:
+            return None
+        norm = os.path.normcase(os.path.normpath(target))
+        if os.path.isabs(target) or os.sep in target or "/" in target:
+            parent = os.path.normcase(os.path.dirname(norm))
+            for z in self._zones:
+                proc = processed_dir_for(z["base"])
+                if proc and os.path.normcase(os.path.normpath(proc)) == parent:
+                    return z["name"]
+            return None
+        cur = self._current_zone()
+        ordered = ([cur] if cur else []) + [z for z in self._zones if z is not cur]
+        for z in ordered:
+            if any(r.name == target for r in discover_variants(z["base"])):
+                return z["name"]
+        return None
+
+    def _make_geometry_provider(self, zone_name: str):
+        """Il Profile Viewer ha in memoria SOLO i profili dell'area attiva: per le altre aree
+        (o dopo un cambio d'area) la geometria resta quella salvata nei .npz."""
+        if self._geometry_provider is None:
+            return None
+
+        def provider(stem):
+            z = self._zone_named(zone_name)
+            if z is not None and not z["active"]:
+                return None
+            return self._geometry_provider(stem)
+        return provider
+
+    def _fill_zone_combo(self, want: str | None) -> None:
+        self._cb_zone.clear()
+        for z in self._zones:
+            self._cb_zone.addItem(z["name"] or "-", z["name"])
+        idx = next((i for i, z in enumerate(self._zones) if z["name"] == want), -1)
+        if idx < 0:
+            idx = next((i for i, z in enumerate(self._zones) if z["active"]), 0)
+        self._cb_zone.setCurrentIndex(idx)
+        self._grp_zone.setVisible(len(self._zones) > 1)
+
+    def _fill_variant_combo(self, keep_dir: str = "") -> None:
+        """Varianti dell'area scelta; `keep_dir` (se presente) resta selezionata."""
+        zone = self._current_zone()
+        refs = discover_variants(zone["base"]) if zone else []
+        self._cb_variant.clear()
+        for r in refs:
+            self._cb_variant.addItem(f"{r.name}  ({r.n_files})", r.path)
+        # una cartella scelta a mano fuori dal progetto resta nell'elenco
+        if keep_dir and os.path.isdir(keep_dir) and self._zone_of_variant(keep_dir) is None:
+            self._cb_variant.addItem(os.path.basename(os.path.normpath(keep_dir)), os.path.normpath(keep_dir))
+        want = -1
+        for i in range(self._cb_variant.count()):
+            d = str(self._cb_variant.itemData(i))
+            if keep_dir and (os.path.normcase(d) == os.path.normcase(os.path.normpath(keep_dir))
+                             or os.path.basename(d) == keep_dir):
+                want = i
+                break
+        if want < 0 and self._cb_variant.count():
+            names = [os.path.basename(str(self._cb_variant.itemData(i))) for i in range(self._cb_variant.count())]
+            want = names.index("Lavoro") if "Lavoro" in names else 0
+        self._cb_variant.setCurrentIndex(want)
+
     def refresh_variants(self, select: str | None = None, force: bool = False) -> None:
-        """Rilegge l'elenco delle varianti. `select` = nome o cartella da selezionare;
+        """Rilegge aree e varianti. `select` = nome o cartella da selezionare;
         `force` ricarica anche la variante gia' aperta."""
         if not HAS_MPL:
             return
         keep_dir = select or (self._store.path if self._store is not None else "")
-        refs = discover_variants(self._workspace_root())
+        prev_zone = self._current_zone()
+        self._zones = self._zone_list()
+        active = self._viewer_zone
+        # Se nel Profile Viewer e' cambiata l'area attiva il pannello la segue (e la geometria
+        # in memoria del viewer non e' piu' quella dell'area che stava mostrando).
+        active_changed = self._active_zone_seen is not None and active != self._active_zone_seen
+        self._active_zone_seen = active
+        want_zone = self._zone_of_variant(select) if select else None
+        if want_zone is None:
+            if active_changed:
+                want_zone = active
+            elif prev_zone is not None and self._zone_named(prev_zone["name"]) is not None:
+                want_zone = prev_zone["name"]
+            elif self._store is not None:
+                want_zone = self._zone_of_variant(self._store.path)
+        if active_changed:
+            force = True
+            keep_dir = select or ""
+            if self._store is not None:
+                self._store.invalidate_geometry()
         self._updating = True
         try:
-            self._cb_variant.clear()
-            for r in refs:
-                self._cb_variant.addItem(f"{r.name}  ({r.n_files})", r.path)
-            # una cartella scelta a mano fuori dal progetto resta nell'elenco
-            if keep_dir and os.path.isdir(keep_dir) and all(
-                    os.path.normcase(os.path.normpath(keep_dir)) != os.path.normcase(r.path) for r in refs):
-                self._cb_variant.addItem(os.path.basename(os.path.normpath(keep_dir)), os.path.normpath(keep_dir))
-            want = -1
-            for i in range(self._cb_variant.count()):
-                d = str(self._cb_variant.itemData(i))
-                if keep_dir and (os.path.normcase(d) == os.path.normcase(os.path.normpath(keep_dir))
-                                 or os.path.basename(d) == keep_dir):
-                    want = i
-                    break
-            if want < 0 and self._cb_variant.count():
-                names = [os.path.basename(str(self._cb_variant.itemData(i))) for i in range(self._cb_variant.count())]
-                want = names.index("Lavoro") if "Lavoro" in names else 0
-            self._cb_variant.setCurrentIndex(want)
+            self._fill_zone_combo(want_zone)
+            self._fill_variant_combo(keep_dir)
         finally:
             self._updating = False
         if self._cb_variant.count() == 0:
@@ -710,21 +839,33 @@ class RadargramDock(QDockWidget):
         self.refresh_variants(select=self._store.path if self._store is not None else None, force=True)
 
     def open_variant(self, name_or_dir: str, profile_stem: str | None = None, channel: int | None = None) -> bool:
-        """Apre la variante indicata (nome o cartella), opzionalmente su un profilo/canale."""
+        """Apre la variante indicata (nome o cartella, in qualunque area), opzionalmente su un profilo/canale."""
         if not HAS_MPL:
             return False
         target = str(name_or_dir or "").strip()
         if not target:
             return False
-        if not any(os.path.basename(str(self._cb_variant.itemData(i))) == target
-                   or os.path.normcase(str(self._cb_variant.itemData(i))) == os.path.normcase(os.path.normpath(target))
-                   for i in range(self._cb_variant.count())):
-            self.refresh_variants(select=target)
+        zone = self._zone_of_variant(target)
+        if zone is None:
+            self.refresh_variants(select=target)         # variante nuova o cartella scelta a mano
+            zone = self._zone_of_variant(target)
+        cur = self._current_zone()
+        if zone is not None and (cur is None or cur["name"] != zone):
+            self._updating = True
+            try:
+                self._fill_zone_combo(zone)
+                self._fill_variant_combo(target)
+            finally:
+                self._updating = False
         for i in range(self._cb_variant.count()):
             d = str(self._cb_variant.itemData(i))
             if os.path.basename(d) == target or os.path.normcase(d) == os.path.normcase(os.path.normpath(target)):
-                if self._cb_variant.currentIndex() != i:
-                    self._cb_variant.setCurrentIndex(i)      # -> _on_variant_changed
+                self._updating = True
+                try:
+                    self._cb_variant.setCurrentIndex(i)
+                finally:
+                    self._updating = False
+                self._open_variant_dir(d)
                 break
         else:
             return False
@@ -765,6 +906,19 @@ class RadargramDock(QDockWidget):
             msg += f"  |  {n_err} falliti"
         self._show_message(msg)
 
+    def _on_zone_changed(self, _i: int) -> None:
+        if self._updating:
+            return
+        self._updating = True
+        try:
+            self._fill_variant_combo("")
+        finally:
+            self._updating = False
+        if self._cb_variant.count() == 0:
+            self._set_store(None)
+        else:
+            self._open_variant_dir(str(self._cb_variant.currentData()))
+
     def _on_variant_changed(self, _i: int) -> None:
         if self._updating:
             return
@@ -781,7 +935,8 @@ class RadargramDock(QDockWidget):
         prev_stem = None
         if self._store is not None and 0 <= self._pi < len(self._store):
             prev_stem = self._store.profiles[self._pi].stem
-        store = VariantStore(path, geometry_provider=self._geometry_provider)
+        zone = self._current_zone()
+        store = VariantStore(path, geometry_provider=self._make_geometry_provider(zone["name"] if zone else ""))
         self._set_store(store, keep_stem=prev_stem)
 
     def _set_store(self, store, keep_stem: str | None = None) -> None:
@@ -1366,6 +1521,12 @@ class RadargramDock(QDockWidget):
             if self._canvas is not None:
                 self._canvas.unsetCursor()
 
+    def _update_tool_context(self, *_a) -> None:
+        """Mostra i comandi di uno strumento solo mentre e' attivo (disegno, iperbole)."""
+        draw_on = any(b.isChecked() for b in self._draw_mode_buttons.values())
+        self._grp_draw_ctx.setVisible(draw_on)
+        self._grp_hyper_ctx.setVisible(self._btn_hyper.isChecked())
+
     def _set_draw_mode(self, mode: str | None) -> None:
         self._draw_mode = mode
         self._draw_vertices = []
@@ -1520,10 +1681,6 @@ class RadargramDock(QDockWidget):
         self._spin_vel_mns.blockSignals(True)
         self._spin_vel_mns.setValue(float(preset["velocity_m_ns"]))
         self._spin_vel_mns.blockSignals(False)
-        if getattr(self, "_cb_vel_material", None) is not None:
-            self._cb_vel_material.blockSignals(True)
-            self._cb_vel_material.setCurrentIndex(0)
-            self._cb_vel_material.blockSignals(False)
 
     def _on_vel_spin_changed(self, value: float) -> None:
         if self._store is None or not (0 <= self._pi < len(self._store)):
@@ -1532,27 +1689,6 @@ class RadargramDock(QDockWidget):
         write_velocity_override(self._store.path, profile_stem=stem, velocity_m_ns=float(value), source="manual")
         self._store.invalidate_geometry()   # l'asse di profondita' del canale dipende dalla velocita'
         self._show_message(f"Velocità preimpostata per {stem}: {value:.4f} m/ns (salvata).")
-        self._load_current(reset_view=False, keep_y=True)
-
-    def _on_material_preset_chosen(self, index: int) -> None:
-        if self._updating:
-            return
-        key = self._cb_vel_material.itemData(index)
-        if not key:
-            return
-        preset = material_preset(key)
-        if preset is None or self._store is None or not (0 <= self._pi < len(self._store)):
-            return
-        stem = self._store.profiles[self._pi].stem
-        v_mns = float(preset["velocity_m_ns"])
-        write_velocity_override(
-            self._store.path, profile_stem=stem, velocity_m_ns=v_mns, rdp=float(preset["rdp"]),
-            source=f"preset:{preset['key']}")
-        self._store.invalidate_geometry()
-        self._spin_vel_mns.blockSignals(True)
-        self._spin_vel_mns.setValue(v_mns)
-        self._spin_vel_mns.blockSignals(False)
-        self._show_message(f"Velocità preimpostata per {stem}: {v_mns:.4f} m/ns ({preset['label']}).")
         self._load_current(reset_view=False, keep_y=True)
 
     def _on_vel_toggled(self, on: bool) -> None:
@@ -1821,8 +1957,9 @@ class RadargramDock(QDockWidget):
         if self._cur is None or self._store is None:
             return
         info = self._store.profiles[self._pi]
-        head = (f"Profilo {self._pi + 1}/{len(self._store)}  Ch {self._ci}  "
-                f"({self._store.name})")
+        zone = self._current_zone()
+        where = f"{zone['name']} / {self._store.name}" if zone and zone["name"] and len(self._zones) > 1 else self._store.name
+        head = f"Profilo {self._pi + 1}/{len(self._store)}  Ch {self._ci}  ({where})"
         ref = ""
         if self._ref_z is not None:
             ref = f"  |  riferimento {self._ref_z:.3f} m"

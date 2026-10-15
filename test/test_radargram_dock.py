@@ -901,21 +901,39 @@ class DockTest(_DockBase):
         self.assertAlmostEqual(got["rdp"], expected_rdp, places=3)
         self.assertAlmostEqual(d._spin_vel_mns.value(), expected_v_mns, places=4)   # rispecchiato subito
 
-    # -- velocita' per materiale ---------------------------------------------------------
+    # -- niente scelta del materiale; comandi degli strumenti solo quando servono ----------
 
-    def test_material_preset_combo_writes_override_with_preset_source(self):
+    def test_no_material_chooser(self):
         d = self.dock
+        self.assertFalse(hasattr(d, "_cb_vel_material"))
+        self.assertFalse(hasattr(d, "_on_material_preset_chosen"))
+
+    def test_old_preset_source_is_still_readable(self):
         VS = importlib.import_module("rasterlinker_feature_interpolation.gpr_velocity_store")
-        MP = importlib.import_module("rasterlinker_feature_interpolation.gpr_material_presets")
+        d = self.dock
         stem = d._store.profiles[d._pi].stem
-        idx = d._cb_vel_material.findData("acqua_dolce")
-        self.assertGreaterEqual(idx, 0)
-        d._cb_vel_material.setCurrentIndex(idx)
-        got = VS.resolve_velocity_m_ns(d._store.path, stem)
-        self.assertEqual(got["source"], "preset:acqua_dolce")
-        preset = MP.material_preset("acqua_dolce")
-        self.assertAlmostEqual(got["velocity_m_ns"], preset["velocity_m_ns"], places=6)
-        self.assertAlmostEqual(d._spin_vel_mns.value(), preset["velocity_m_ns"], places=4)
+        VS.write_velocity_override(d._store.path, profile_stem=stem, velocity_m_ns=0.033,
+                                   rdp=81.0, source="preset:acqua_dolce")
+        d._store.invalidate_geometry()
+        d._sync_velocity_spin()
+        self.assertAlmostEqual(d._spin_vel_mns.value(), 0.033, places=4)
+        self.assertNotEqual(d._format_velocity_source("preset:acqua_dolce"), "preset:acqua_dolce")
+
+    def test_tool_commands_are_hidden_until_the_tool_is_active(self):
+        d = self.dock
+        self.assertTrue(d._grp_draw_ctx.isHidden())
+        self.assertTrue(d._grp_hyper_ctx.isHidden())
+        d._btn_draw_line.setChecked(True)
+        self.assertFalse(d._grp_draw_ctx.isHidden())
+        d._btn_draw_line.setChecked(False)
+        self.assertTrue(d._grp_draw_ctx.isHidden())
+        d._btn_hyper.setChecked(True)
+        self.assertFalse(d._grp_hyper_ctx.isHidden())
+        d._btn_hyper.setChecked(False)
+        self.assertTrue(d._grp_hyper_ctx.isHidden())
+
+    def test_zone_chooser_is_hidden_with_a_single_area(self):
+        self.assertTrue(self.dock._grp_zone.isHidden())
 
     # -- overlay persistente delle geometrie gia' disegnate -----------------------------
 
@@ -984,7 +1002,7 @@ class FlowLayoutTest(_DockBase):
     def test_dock_can_be_narrow_and_controls_stay_inside(self):
         d = self.dock
         self.assertLess(d.minimumSizeHint().width(), 1000)                # non impone una larghezza enorme
-        ctrl = d.widget().layout().itemAt(0).widget()
+        ctrl = d.widget().layout().itemAt(0).widget()           # riga dei dati
         h_wide = ctrl.layout().heightForWidth(1400)
         h_narrow = ctrl.layout().heightForWidth(400)
         self.assertGreater(h_narrow, h_wide)                              # stretto: piu' righe
@@ -993,6 +1011,8 @@ class FlowLayoutTest(_DockBase):
         self._pump(80)
         cw = ctrl.width()
         for g in ctrl.findChildren(type(ctrl), options=Qt.FindDirectChildrenOnly):
+            if g.isHidden():
+                continue                                                  # strumenti non attivi, area unica
             self.assertLessEqual(g.x() + g.width(), cw + 1, "gruppo di controlli fuori dal pannello")
 
     def test_axis_labels_keep_a_fixed_margin_when_narrow(self):
@@ -1013,6 +1033,106 @@ class FlowLayoutTest(_DockBase):
         self.assertIn("time-slice 0.10", d._lbl_status.toolTip())
 
 
+@unittest.skipUnless(HAS_ENV, "QGIS/matplotlib non disponibili")
+class ZonesTest(unittest.TestCase):
+    """Piu' aree indagate nello stesso progetto: ognuna ha le sue varianti e i suoi profili."""
+
+    @classmethod
+    def setUpClass(cls):
+        from qgis.PyQt.QtWidgets import QApplication
+        cls._qapp = QApplication.instance()
+
+    def setUp(self):
+        _DockBase._forget_saved_look()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = self._tmp.name
+        crs = QgsCoordinateReferenceSystem("EPSG:32632")
+        QgsProject.instance().setCrs(crs)
+        self.iface = _Iface()
+        self.iface.mapCanvas().setDestinationCrs(crs)
+        self.sud = os.path.join(self.root, "sud")
+        self.nord = os.path.join(self.root, "nord")
+        self.v_sud, _ = _write_variant(self.sud, "Lavoro", ["Sud1", "Sud2", "Sud3"])
+        self.v_nord, _ = _write_variant(self.nord, "Lavoro", ["Nord1", "Nord2"])
+        self.v_nord2, _ = _write_variant(self.nord, "v3", ["Nord1", "Nord2"])
+        self.active = "Sud"
+        self.dock = _DOCK.RadargramDock(
+            self.iface, workspace_provider=lambda: os.path.join(self.sud, "Processing"),
+            zones_provider=self._zones, geometry_provider=self._geom,
+            parent=self.iface.mainWindow())
+        self.iface.addDockWidget(Qt.BottomDockWidgetArea, self.dock)
+        self.iface.mainWindow().show()
+        self.dock.show()
+
+    def tearDown(self):
+        self.dock.cleanup()
+        self.dock.close()
+        self.iface.mainWindow().close()
+        gc.collect()
+        self._tmp.cleanup()
+        _DockBase._forget_saved_look()
+
+    def _zones(self):
+        return [
+            {"name": "Sud", "base": os.path.join(self.sud, "Processing"), "active": self.active == "Sud"},
+            {"name": "Nord", "base": os.path.join(self.nord, "Processing"), "active": self.active == "Nord"},
+            {"name": "Vuota", "base": os.path.join(self.root, "vuota"), "active": False},
+        ]
+
+    def _geom(self, stem):
+        self.geom_asked = getattr(self, "geom_asked", []) + [stem]
+        return None
+
+    def test_every_area_with_data_is_selectable_and_empty_ones_are_left_out(self):
+        d = self.dock
+        self.assertFalse(d._grp_zone.isHidden())
+        self.assertEqual([d._cb_zone.itemText(i) for i in range(d._cb_zone.count())], ["Sud", "Nord"])
+        self.assertEqual(d._cb_zone.currentText(), "Sud")          # parte dall'area attiva
+        self.assertEqual(d._cb_profile.count(), 3)
+
+    def test_choosing_another_area_shows_its_variants_and_profiles(self):
+        d = self.dock
+        d._cb_zone.setCurrentIndex(d._cb_zone.findData("Nord"))
+        self.assertEqual(d._cb_variant.count(), 2)                  # Lavoro + v3
+        self.assertEqual(d._store.path, os.path.normpath(self.v_nord))
+        self.assertEqual(d._cb_profile.count(), 2)
+        self.assertIn("Nord1", d._cb_profile.itemText(0))
+        self.assertIn("Nord / Lavoro", d._lbl_status.text())
+
+    def test_open_variant_by_path_in_another_area_switches_area(self):
+        d = self.dock
+        self.assertTrue(d.open_variant(self.v_nord2, profile_stem="Nord2"))
+        self.assertEqual(d._cb_zone.currentText(), "Nord")
+        self.assertEqual(d._store.name, "v3")
+        self.assertEqual(d._store.profiles[d._pi].stem, "Nord2")
+        self.assertTrue(d.open_variant(self.v_sud))
+        self.assertEqual(d._cb_zone.currentText(), "Sud")
+        self.assertEqual(len(d._store), 3)
+
+    def test_geometry_from_viewer_only_for_the_area_it_holds(self):
+        d = self.dock
+        self.geom_asked = []
+        d._store.invalidate_geometry()
+        d._load_current(reset_view=True)
+        self.assertTrue(self.geom_asked)                             # area attiva: chiede al viewer
+        d._cb_zone.setCurrentIndex(d._cb_zone.findData("Nord"))
+        self.geom_asked = []
+        d._store.invalidate_geometry()
+        d._load_current(reset_view=True)
+        self.assertEqual(self.geom_asked, [])                        # altra area: fotografia dei .npz
+        self.assertEqual(d._cur.geometry_source, "npz")
+
+    def test_follows_the_area_made_active_in_the_viewer(self):
+        d = self.dock
+        self.active = "Nord"
+        d.refresh_variants()
+        self.assertEqual(d._cb_zone.currentText(), "Nord")
+        self.assertEqual(d._store.path, os.path.normpath(self.v_nord))
+        d._cb_zone.setCurrentIndex(d._cb_zone.findData("Sud"))     # sfoglio un'altra area a mano...
+        d.refresh_variants()                                         # ...e un refresh non mi riporta indietro
+        self.assertEqual(d._cb_zone.currentText(), "Sud")
+
+
 class PluginWiringTest(unittest.TestCase):
     """open_radargram_dock del plugin: crea una volta sola, riusa, apre la variante richiesta."""
 
@@ -1030,6 +1150,7 @@ class PluginWiringTest(unittest.TestCase):
                     iface=iface, _radargram_dock=None, _gpr_profile_viewer=None,
                     settings=types.SimpleNamespace(value=lambda *a, **k: root),
                     settings_key_active_project="k")
+                fake._radargram_project_root = lambda: GS.GeoSurveyStudioPlugin._radargram_project_root(fake)
                 fake._radargram_workspace_root = lambda: GS.GeoSurveyStudioPlugin._radargram_workspace_root(fake)
                 fake._live_profile_viewer = lambda: GS.GeoSurveyStudioPlugin._live_profile_viewer(fake)
                 fake._radargram_geometry_provider = lambda s: GS.GeoSurveyStudioPlugin._radargram_geometry_provider(fake, s)
