@@ -308,6 +308,16 @@ class _MapBridge(QObject):
         if pos is not None:
             rb.addPoint(self.to_canvas(pos[0], pos[1]), True)
 
+    def center_on(self, east, north) -> None:
+        """Sposta la mappa sul punto (solo pan: la scala resta quella dell'utente)."""
+        if self._canvas is None:
+            return
+        try:
+            self._canvas.setCenter(self.to_canvas(east, north))
+            self._canvas.refresh()
+        except Exception:
+            pass
+
     def clear(self) -> None:
         if self._rb_line is not None:
             self._rb_line.reset(QgsWkbTypes.LineGeometry)
@@ -371,7 +381,8 @@ class RadargramDock(QDockWidget):
     MIN_PICK_TOL_M = 2.0
 
     def __init__(self, iface, workspace_provider=None, geometry_provider=None,
-                 feature_sink=None, feature_query=None, parent=None, zones_provider=None):
+                 feature_sink=None, feature_query=None, parent=None, zones_provider=None,
+                 project_root_provider=None):
         super().__init__("Radargrammi processati", parent or (iface.mainWindow() if iface else None))
         self.setObjectName("GeoSurveyRadargramDock")
         self.setAllowedAreas(Qt.AllDockWidgetAreas)
@@ -384,6 +395,7 @@ class RadargramDock(QDockWidget):
         # Aree indagate del progetto: callable -> [{"name", "base", "active"}, ...]. Senza,
         # il pannello ha un'unica area implicita: la cartella di `workspace_provider`.
         self._zones_provider = zones_provider
+        self._project_root_provider = project_root_provider   # radice del progetto (dove sta il catalogo)
         self._zones: list = []
         self._active_zone_seen: str | None = None
         self._viewer_zone = ""             # area attiva nel Profile Viewer (anche se senza varianti)
@@ -1247,25 +1259,36 @@ class RadargramDock(QDockWidget):
         accanto (es. generate/importate dal Project Manager, dove la cartella
         `processed/<variante>` puo' anche vivere in un albero di cartelle del
         tutto separato da quella delle time-slice - verificato su dati reali)."""
-        root = self._workspace_root()
-        if not root:
-            return None
+        roots = []
+        for getter in (self._project_root_provider, self._workspace_provider):
+            try:
+                r = str(getter() or "").strip() if getter else ""
+            except Exception:
+                r = ""
+            if r and r not in roots:
+                roots.append(r)
+        path = os.path.normcase(os.path.normpath(str(layer.source() or "").split("|")[0].strip()))
         try:
-            from .project_catalog import load_catalog
-            catalog = load_catalog(root)
+            from .project_catalog import catalog_path, load_catalog
         except Exception:
             return None
-        path = os.path.normcase(os.path.normpath(str(layer.source() or "").split("|")[0].strip()))
-        for rec in catalog.get("timeslices") or []:
-            rec_path = str(rec.get("project_path") or "").strip()
-            if not rec_path or os.path.normcase(os.path.normpath(rec_path)) != path:
-                continue
+        for root in roots:
+            if not os.path.isfile(catalog_path(root)):
+                continue                  # il catalogo sta nella radice del progetto, non in Processing/
             try:
-                z0, z1 = float(rec["depth_from"]), float(rec["depth_to"])
-            except (KeyError, TypeError, ValueError):
+                catalog = load_catalog(root)
+            except Exception:
                 continue
-            lo, hi = (z0, z1) if z0 <= z1 else (z1, z0)
-            return {"z_from": lo, "z_to": hi, "z_center": 0.5 * (lo + hi)}
+            for rec in catalog.get("timeslices") or []:
+                rec_path = str(rec.get("project_path") or "").strip()
+                if not rec_path or os.path.normcase(os.path.normpath(rec_path)) != path:
+                    continue
+                try:
+                    z0, z1 = float(rec["depth_from"]), float(rec["depth_to"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                lo, hi = (z0, z1) if z0 <= z1 else (z1, z0)
+                return {"z_from": lo, "z_to": hi, "z_center": 0.5 * (lo + hi)}
         return None
 
     def _timeslice_band_for_layer(self, layer) -> dict | None:
@@ -1305,20 +1328,53 @@ class RadargramDock(QDockWidget):
                 return band
         return None
 
-    def _activate_timeslice_at_depth(self, z: float) -> None:
-        """Doppio clic sul radargramma: mostra sul canvas la time-slice la cui
-        fascia di profondita' contiene z, nascondendo le sorelle nello stesso
-        gruppo dell'albero dei livelli (stesso pattern di
-        `gpr_viewer_timeslice._update_timeslice_visibility_in_canvas` /
-        `catalog_group_mixin.update_visibility_with_dial`)."""
+    def _layer_covers_point(self, layer, point) -> bool:
+        """`point` = (E, N) nel CRS dei profili: cade nell'estensione del raster?"""
+        try:
+            pt = QgsPointXY(float(point[0]), float(point[1]))
+            src = self._map._profile_crs() if self._map is not None else QgsProject.instance().crs()
+            dst = layer.crs()
+            if src.isValid() and dst.isValid() and src != dst:
+                pt = QgsCoordinateTransform(src, dst, QgsProject.instance()).transform(pt)
+            return bool(layer.extent().contains(pt))
+        except Exception:
+            return False
+
+    def _timeslice_rank(self, layer, band, z: float, point) -> tuple:
+        """Ordine di preferenza per il doppio clic: la time-slice che si vede sotto il punto
+        cliccato, della variante aperta, la cui fascia contiene la profondita'."""
+        covers = 0 if (point is None or self._layer_covers_point(layer, point)) else 1
+        info = slice_info_for_path(layer.source())
+        same_variant = 1
+        if info is not None and self._store is not None:
+            vdir = variant_dir_from_slice_dir(info["dir"], info.get("variant", ""))
+            if vdir and os.path.normcase(os.path.normpath(vdir)) == os.path.normcase(self._store.path):
+                same_variant = 0
+        inside = 0 if band["z_from"] <= z <= band["z_to"] else 1
+        return (covers, inside, same_variant, abs(band["z_center"] - z))
+
+    def _warn(self, text: str) -> None:
+        """Avviso che resta visibile (la riga di stato si riscrive a ogni movimento del mouse)."""
+        self._show_message(text)
+        bar = getattr(self.iface, "messageBar", None)
+        if callable(bar):
+            try:
+                bar().pushWarning("Radargrammi processati", text)
+            except Exception:
+                pass
+
+    def _activate_timeslice_at_depth(self, z: float, point=None) -> None:
+        """Doppio clic sul radargramma: porta la mappa sul punto cliccato e mostra la
+        time-slice a quella profondita' (la fascia che contiene z, sotto il punto),
+        nascondendo le sorelle nello stesso gruppo dell'albero dei livelli (stesso
+        pattern di `gpr_viewer_timeslice._update_timeslice_visibility_in_canvas` /
+        `catalog_group_mixin.update_visibility_with_dial`). `point` = (E, N) del punto."""
         candidates = self._timeslice_layers_in_project()
         if not candidates:
-            self._show_message("Nessuna time-slice caricata nel progetto.")
+            self._warn("Nessuna time-slice caricata nel progetto (o senza fascia di profondit\u00e0 nota): "
+                       "carica una time-slice generata dal plugin per usare il doppio clic.")
             return
-        match = next((lc for lc in candidates if lc[1]["z_from"] <= z <= lc[1]["z_to"]), None)
-        if match is None:
-            match = min(candidates, key=lambda lc: abs(lc[1]["z_center"] - z))
-        layer, band = match
+        layer, band = min(candidates, key=lambda lc: self._timeslice_rank(lc[0], lc[1], z, point))
         root = QgsProject.instance().layerTreeRoot()
         node = root.findLayer(layer.id())
         if node is None:
@@ -1330,13 +1386,21 @@ class RadargramDock(QDockWidget):
             sib_layer = getattr(sibling, "layer", lambda: None)()
             if sib_layer is not None and sib_layer.id() in candidate_ids:
                 sibling.setItemVisibilityChecked(sib_layer.id() == layer.id())
+        anc = node.parent()
+        while anc is not None and anc is not root:          # un gruppo spento nasconderebbe comunque la slice
+            anc.setItemVisibilityChecked(True)
+            anc = anc.parent()
         if self.iface is not None:
             try:
                 self.iface.setActiveLayer(layer)
             except Exception:
                 pass
+        if point is not None and self._map is not None:
+            self._map.center_on(point[0], point[1])
+            self._map.show_point(point)
         self.set_reference_depth(band["z_center"], band=(band["z_from"], band["z_to"]))
-        self._show_message(self._lbl_status.text() + "  |  time-slice attivata sul canvas")
+        self._show_message(self._lbl_status.text() + f"  |  time-slice {band['z_from']:.2f}\u2013{band['z_to']:.2f} m "
+                           f"({layer.name()}) attivata sul canvas")
 
     def _connect_tree_visibility_signal(self) -> None:
         try:
@@ -1405,7 +1469,9 @@ class RadargramDock(QDockWidget):
             elif self._vel_mode_active:
                 self._set_vel_apex(float(event.xdata), float(event.ydata))
             elif getattr(event, "dblclick", False):
-                self._activate_timeslice_at_depth(float(np.clip(event.ydata, 0.0, self._cur.depth_max_m)))
+                self._activate_timeslice_at_depth(
+                    float(np.clip(event.ydata, 0.0, self._cur.depth_max_m)),
+                    point=self._cur.position(self._cur.trace_at_distance(float(event.xdata))))
             else:
                 # clic: la profondita' cliccata diventa il riferimento
                 self._band = None

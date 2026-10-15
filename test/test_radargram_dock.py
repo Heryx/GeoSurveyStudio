@@ -31,7 +31,7 @@ try:
     _PC = importlib.import_module("rasterlinker_feature_interpolation.project_catalog")
     from qgis.PyQt.QtCore import QObject, Qt, pyqtSignal
     from qgis.PyQt.QtWidgets import QMainWindow
-    from qgis.core import QgsCoordinateReferenceSystem, QgsPointXY, QgsProject, QgsRasterLayer
+    from qgis.core import QgsCoordinateReferenceSystem, QgsPointXY, QgsProject, QgsRasterLayer, QgsRectangle
     from qgis.gui import QgsMapCanvas
     from matplotlib.backend_bases import MouseEvent
     HAS_ENV = bool(_DOCK.HAS_MPL)
@@ -579,6 +579,70 @@ class DockTest(_DockBase):
         d._on_mouse_press(self._event("button_press_event", 1.0, 0.15, dblclick=True))
         root = QgsProject.instance().layerTreeRoot()
         self.assertTrue(root.findLayer(layer.id()).itemVisibilityChecked())
+        self.assertEqual(d._band, (0.10, 0.20))
+
+    def _slice_at(self, tag, x_min, y_min, y_max, z0=0.10, z1=0.20, variant="v3"):
+        """Time-slice (con sliceset.json) in una cartella propria, in un punto preciso della mappa."""
+        folder = os.path.join(self.root, "slices_" + tag)
+        os.makedirs(folder, exist_ok=True)
+        grid = tag + ".tif"
+        _RIO.write_tif_singleband(np.ones((4, 4), dtype=np.float32), os.path.join(folder, grid),
+                                  x_min, y_min, y_max, 1.0, 32632)
+        _SM.write_sliceset(
+            folder, _SS.SliceSpec(), [{"index": 0, "z_from": z0, "z_to": z1, "grid": grid}],
+            {"kind": "ogpr", "variant_id": variant, "n_profiles": 2}, crs_epsg=32632)
+        return os.path.join(folder, grid)
+
+    def test_double_click_prefers_the_timeslice_under_the_clicked_point(self):
+        # Piu' gruppi di time-slice (aree/varianti) con la stessa fascia: vince quella che
+        # copre il punto cliccato, non la prima dell'elenco.
+        d = self.dock
+        far = self._project_layer(self._slice_at("a_far", 600000.0, 0.0, 4.0))
+        near = self._project_layer(self._slice_at("b_near", 500000.0, 8.0, 12.0))
+        root = QgsProject.instance().layerTreeRoot()
+        root.findLayer(far.id()).setItemVisibilityChecked(False)
+        root.findLayer(near.id()).setItemVisibilityChecked(False)
+        d._on_mouse_press(self._event("button_press_event", 1.0, 0.15, dblclick=True))   # profilo 0: N = 10
+        self.assertTrue(root.findLayer(near.id()).itemVisibilityChecked())
+        self.assertIs(self.iface.activeLayer(), near)
+
+    def test_double_click_moves_the_map_to_the_clicked_point(self):
+        d = self.dock
+        self._project_layer(self._slice_at("s", 500000.0, 8.0, 12.0))
+        self.iface.mapCanvas().setExtent(QgsRectangle(-10.0, -10.0, 10.0, 10.0))     # lontano dal profilo
+        d._on_mouse_press(self._event("button_press_event", 1.0, 0.15, dblclick=True))
+        c = self.iface.mapCanvas().center()
+        e, n = d._cur.position(d._cur.trace_at_distance(1.0))
+        self.assertAlmostEqual(c.x(), e, delta=0.5)
+        self.assertAlmostEqual(c.y(), n, delta=0.5)
+
+    def test_double_click_turns_on_a_hidden_group(self):
+        d = self.dock
+        lyr = self._layer(self._slice_at("g", 500000.0, 8.0, 12.0))
+        QgsProject.instance().addMapLayer(lyr, False)
+        self._project_layers.append(lyr)
+        root = QgsProject.instance().layerTreeRoot()
+        grp = root.addGroup("gruppo time-slice")
+        self.addCleanup(lambda: root.removeChildNode(grp))
+        grp.addLayer(lyr)
+        grp.setItemVisibilityChecked(False)
+        d._on_mouse_press(self._event("button_press_event", 1.0, 0.15, dblclick=True))
+        self.assertTrue(grp.itemVisibilityChecked())
+        self.assertTrue(root.findLayer(lyr.id()).itemVisibilityChecked())
+
+    def test_catalog_is_read_from_the_project_root_not_only_the_workspace(self):
+        # Il catalogo sta nella radice del progetto; la cartella di lavoro del pannello e' Processing/.
+        d = self.dock
+        project = os.path.join(self.root, "progetto")
+        os.makedirs(os.path.join(project, "Processing"))
+        path = os.path.join(self.root, "solo_catalogo.tif")
+        _RIO.write_tif_singleband(np.ones((4, 4), dtype=np.float32), path, 500000.0, 0.0, 3.0, 1.0, 32632)
+        _PC.register_timeslice(project, {"project_path": path, "depth_from": 0.10, "depth_to": 0.20})
+        d._workspace_provider = lambda: os.path.join(project, "Processing")
+        d._project_root_provider = lambda: project
+        layer = self._project_layer(path)
+        d._on_mouse_press(self._event("button_press_event", 1.0, 0.15, dblclick=True))
+        self.assertIs(self.iface.activeLayer(), layer)
         self.assertEqual(d._band, (0.10, 0.20))
 
     def test_layer_tree_visibility_change_updates_the_reference_line_live(self):

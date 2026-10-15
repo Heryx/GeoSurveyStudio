@@ -523,6 +523,7 @@ class GeoSurveyStudioPlugin(
                 self.iface,
                 workspace_provider=self._radargram_workspace_root,
                 zones_provider=getattr(self, "_radargram_zones", None),
+                project_root_provider=getattr(self, "_radargram_project_root", None),
                 geometry_provider=self._radargram_geometry_provider,
                 feature_sink=self._radargram_feature_sink,
                 feature_query=self._radargram_feature_query,
