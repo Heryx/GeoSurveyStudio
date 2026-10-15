@@ -198,6 +198,20 @@ class GridBinnedTest(unittest.TestCase):
         self.assertGreaterEqual(int(cols.min()), 8)
         self.assertLessEqual(int(cols.max()), 16)
 
+    def test_body_reaches_line_ends_at_grid_border(self):
+        # Rilievo che tocca il bordo della griglia: il riempimento fra le linee
+        # deve arrivare fino alla fine delle linee (prima la chiusura veniva
+        # erosa dal bordo dell'array e le code delle linee sporgevano).
+        res = 0.1
+        ys = np.arange(0.0, 6.0, 0.02)
+        x = np.concatenate([np.full(ys.size, c) for c in (1.0, 1.5)])
+        y = np.concatenate([ys, ys])
+        v = np.ones(x.size)
+        g = slicing.grid_binned(x, y, v, 0.0, 0.0, 30, 62, res, reach_m=1.0)
+        # colonna 12 = x 1.2 m (fra le due linee), righe vicine alla fine (y = 5.9)
+        self.assertTrue(np.isfinite(g[58, 12]))
+        self.assertTrue(np.isfinite(g[2, 12]))
+
     def test_blanking(self):
         x, y, v = self._line_points([1.0, 2.0])
         g = slicing.grid_binned(x, y, v, 0.0, 0.0, 30, 70, 0.1, reach_m=1.0, blanking_m=0.2)

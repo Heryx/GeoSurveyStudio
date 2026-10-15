@@ -500,9 +500,15 @@ def grid_binned(
     out = np.where(np.isfinite(fine), t * fine_f + (1.0 - t) * wide_f, wide)
 
     # Which cells are allowed to carry a value.
-    dist = distance_transform_edt(~cover)
+    # Morphological closing (bridges gaps up to 2*reach). The dilation must be
+    # computed on a PADDED array: if the survey touches the grid border, a
+    # dilation cut at the array edge is eroded back by ``reach`` and the body
+    # loses up to ``reach`` metres in front of every line end, leaving the line
+    # tails sticking out as thin strips.
     pad = int(np.ceil(reach_cells)) + 2
-    dilated = np.pad(dist <= reach_cells, pad)
+    dist_p = distance_transform_edt(~np.pad(cover, pad))
+    dist = dist_p[pad:-pad, pad:-pad]
+    dilated = dist_p <= reach_cells
     closed = (distance_transform_edt(dilated) > reach_cells)[pad:-pad, pad:-pad]
     allowed = closed | (dist <= 1.5)
     if float(blanking_m) > 0.0:
