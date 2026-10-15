@@ -47,7 +47,7 @@ def _profile(name, channels):
 
 def _write_variant(root, variant, names, north0=0.0, n_t=100, n_ch=2):
     """Variante con un profilo per nome; profilo k a 10 m dal precedente (nord), canali a 4 cm."""
-    vdir = os.path.join(root, "GPR_Processing", "processed", variant)
+    vdir = os.path.join(root, "Processing", "processed", variant)
     profs = []
     for k, name in enumerate(names):
         chans = [
@@ -67,14 +67,14 @@ class DiscoverTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             _write_variant(root, "Lavoro", ["p1"])
             _write_variant(root, "v3", ["p1", "p2"])
-            os.makedirs(os.path.join(root, "GPR_Processing", "processed", "vuota"))
+            os.makedirs(os.path.join(root, "Processing", "processed", "vuota"))
             refs = _RS.discover_variants(root)
             self.assertEqual([(r.name, r.n_files) for r in refs], [("Lavoro", 1), ("v3", 2)])
             self.assertEqual(
-                [r.name for r in _RS.discover_variants(os.path.join(root, "GPR_Processing"))],
+                [r.name for r in _RS.discover_variants(os.path.join(root, "Processing"))],
                 ["Lavoro", "v3"])
             self.assertEqual([r.name for r in _RS.discover_variants(
-                os.path.join(root, "GPR_Processing", "processed"))], ["Lavoro", "v3"])
+                os.path.join(root, "Processing", "processed"))], ["Lavoro", "v3"])
             self.assertEqual(_RS.discover_variants(os.path.join(root, "nulla")), [])
             self.assertEqual(_RS.discover_variants(""), [])
 
@@ -205,7 +205,7 @@ class SliceInfoTest(unittest.TestCase):
 
     def test_reads_depth_window_and_variant(self):
         with tempfile.TemporaryDirectory() as root:
-            folder = os.path.join(root, "GPR_Processing", "timeslices", "Lavoro")
+            folder = os.path.join(root, "Processing", "timeslices", "Lavoro")
             self._write_set(folder)
             info = _RS.slice_info_for_path(os.path.join(folder, "s0.tif"))
             self.assertEqual((info["z_from"], info["z_to"], info["z_center"]), (0.30, 0.40, 0.35))
@@ -224,7 +224,7 @@ class SliceInfoTest(unittest.TestCase):
     def test_variant_dir_is_found_from_slice_dir(self):
         with tempfile.TemporaryDirectory() as root:
             vdir, _ = _write_variant(root, "v3", ["p1"])
-            sdir = os.path.join(root, "GPR_Processing", "timeslices", "v3")
+            sdir = os.path.join(root, "Processing", "timeslices", "v3")
             os.makedirs(sdir)
             self.assertEqual(os.path.normcase(_RS.variant_dir_from_slice_dir(sdir, "v3")),
                              os.path.normcase(vdir))

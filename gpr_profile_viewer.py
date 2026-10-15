@@ -84,6 +84,7 @@ from .gpr_viewer_radargram import RadargramViewMixin
 from .gpr_viewer_timeslice import TimesliceViewMixin
 from .gpr_viewer_variants import VariantsMixin
 from .gpr_viewer_project import ProjectPersistenceMixin
+from .gpr_viewer_zones import ZonesMixin
 from .gpr_viewer_presets import PresetsMixin
 from .gpr_velocity_store import write_velocity_override
 from .gpr_hyperbola_math import velocity_from_two_points
@@ -96,6 +97,7 @@ class GprProfileViewer(
     TimesliceViewMixin,
     VariantsMixin,
     ProjectPersistenceMixin,
+    ZonesMixin,
     PresetsMixin,
     QMainWindow,
 ):
@@ -234,7 +236,8 @@ class GprProfileViewer(
             self._update_cmap_previews()
         except Exception:
             pass
-        # Auto-import profili da GPR_Processing/project.json se presente.
+        self._synced_plugin_root = self._active_project_root()
+        # Auto-import profili da metadata/project.json se presente.
         try:
             QTimer.singleShot(0, self._try_import_saved_gpr_processing_project)
         except Exception:
@@ -523,6 +526,7 @@ class GprProfileViewer(
         act_open.triggered.connect(self.import_files)
         tb.addAction(act_open)
         tb.addAction(self._nav_toggle_action())
+        self._zone_add_toolbar_widgets(tb)
 
         act_prev = QAction("\u25c4 Profilo", self)
         act_prev.triggered.connect(self._prev_profile)
@@ -637,10 +641,11 @@ class GprProfileViewer(
         tb.addAction(act_view3d)
 
         tb.addSeparator()
-        act_manual_pos = QAction("\U0001f4cd Posizionamento Griglia", self)
+        act_manual_pos = QAction("\U0001f4cd Posizionamento", self)
         act_manual_pos.setToolTip(
-            "Apri il dialog di posizionamento manuale della griglia di rilievo\n"
-            "(profili senza GPS: assegna coordinate, gestisci zig-zag, rinomina)."
+            "Apri la finestra di Posizionamento dei profili GPR\n"
+            "(profili senza GPS: assegna coordinate, gestisci zig-zag, rinomina;\n"
+            "per i profili con GPS mostra le coordinate reali e i loro metadati)."
         )
         act_manual_pos.triggered.connect(self._open_manual_positioning_dialog)
         tb.addAction(act_manual_pos)
@@ -930,11 +935,33 @@ class GprProfileViewer(
             return
         self._processing_dock.show()
         self._processing_dock.raise_()
-        if self._is_qt_alive(self._right_tabs):
-            try:
-                self._right_tabs.setCurrentIndex(0)
-            except Exception:
-                pass
+        self._select_right_tab("Elaborazione")
+
+    def _select_right_tab(self, title: str) -> bool:
+        """Porta in primo piano la scheda del pannello destro per TITOLO: gli
+        indici cambiano ogni volta che si aggiunge una scheda (e' cosi' che
+        "Timeslice" apriva "Stima velocità")."""
+        tabs = self._right_tabs
+        if not self._is_qt_alive(tabs):
+            return False
+        try:
+            for i in range(tabs.count()):
+                if tabs.tabText(i) == title:
+                    tabs.setCurrentIndex(i)
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _open_right_tab(self, title: str) -> None:
+        """Mostra il pannello laterale sulla scheda ``title`` (creandolo se serve)."""
+        if self._processing_dock is None:
+            self._init_aux_windows()
+        if self._processing_dock is None:
+            return
+        self._processing_dock.show()
+        self._processing_dock.raise_()
+        self._select_right_tab(title)
 
     def _open_timeslice_window(self):
         # Preferred path: unified Process/Slicing tabs in the same dock.
@@ -944,7 +971,7 @@ class GprProfileViewer(
             try:
                 self._processing_dock.show()
                 self._processing_dock.raise_()
-                self._right_tabs.setCurrentIndex(1)
+                self._select_right_tab("Slicing")
                 return
             except Exception:
                 pass
@@ -979,71 +1006,43 @@ class GprProfileViewer(
         except Exception:
             pass
 
+        def _act(menu, text, slot, shortcut=None, tip=None):
+            act = QAction(text, self)
+            if shortcut:
+                act.setShortcut(shortcut)
+            if tip:
+                act.setToolTip(tip)
+            act.triggered.connect(slot)
+            menu.addAction(act)
+            return act
+
+        # --- File: progetto, import/export, chiusura -------------------
         m_file = mb.addMenu("File")
-        act_new_proj = QAction("Nuovo progetto GPR...", self)
-        act_new_proj.setShortcut("Ctrl+N")
-        act_new_proj.triggered.connect(self._new_gpr_project)
-        m_file.addAction(act_new_proj)
-
-        act_open_proj = QAction("Apri progetto GPR...", self)
-        act_open_proj.triggered.connect(self._open_gpr_project)
-        m_file.addAction(act_open_proj)
+        _act(m_file, "Nuovo progetto GPR...", self._new_gpr_project, "Ctrl+N")
+        _act(m_file, "Apri progetto GPR...", self._open_gpr_project)
+        _act(m_file, "Nuova area indagata...", self._new_zone,
+             tip="Crea un'area separata nello stesso progetto (profili, varianti e time-slice propri).")
+        _act(m_file, "Apri Project Manager...", self._open_project_manager, "Ctrl+Shift+O")
         m_file.addSeparator()
-
-        act_import = QAction("Importa profili...", self)
-        act_import.setShortcut("Ctrl+O")
-        act_import.triggered.connect(self.import_files)
-        m_file.addAction(act_import)
-
-        act_import_saved = QAction("Ricarica ultimo progetto GPR", self)
-        act_import_saved.triggered.connect(lambda: self._try_import_saved_gpr_processing_project(force=True))
-        m_file.addAction(act_import_saved)
-
-        act_open_pm = QAction("Apri Project Manager...", self)
-        act_open_pm.setShortcut("Ctrl+Shift+O")
-        act_open_pm.triggered.connect(self._open_project_manager)
-        m_file.addAction(act_open_pm)
-
-        act_save_proj = QAction("Salva progetto", self)
-        act_save_proj.setShortcut("Ctrl+S")
-        act_save_proj.triggered.connect(self._save_project_file)
-        m_file.addAction(act_save_proj)
-
+        _act(m_file, "Importa profili...", self.import_files, "Ctrl+O")
+        _act(m_file, "Salva progetto", self._save_project_file, "Ctrl+S")
         m_file.addSeparator()
-        act_export = QAction("Export Radargram...", self)
-        act_export.triggered.connect(self._export_radargram_image)
-        m_file.addAction(act_export)
-
-        act_import_slice = QAction("Import Timeslices to Canvas", self)
-        act_import_slice.triggered.connect(self._import_slices_to_canvas)
-        m_file.addAction(act_import_slice)
-
+        _act(m_file, "Esporta radargramma...", self._export_radargram_image)
         m_file.addSeparator()
-        act_close = QAction("Chiudi", self)
-        act_close.setShortcut("Ctrl+W")
-        act_close.triggered.connect(self.close)
-        m_file.addAction(act_close)
+        _act(m_file, "Chiudi", self.close, "Ctrl+W")
 
+        # --- View: pannelli e visualizzazione --------------------------
         m_view = mb.addMenu("View")
         if self._processing_dock is not None:
-            act_proc = QAction("Processing", self)
-            act_proc.setCheckable(True)
-            act_proc.setChecked(bool(self._processing_dock.isVisible()))
-            act_proc.toggled.connect(self._processing_dock.setVisible)
-            self._processing_dock.visibilityChanged.connect(act_proc.setChecked)
-            m_view.addAction(act_proc)
-
-        if self._timeslice_dock is not None:
-            act_slice = QAction("Timeslice", self)
-            act_slice.setCheckable(True)
-            act_slice.setChecked(bool(self._timeslice_dock.isVisible()))
-            act_slice.toggled.connect(self._timeslice_dock.setVisible)
-            self._timeslice_dock.visibilityChanged.connect(act_slice.setChecked)
-            m_view.addAction(act_slice)
-        elif self._is_qt_alive(self._right_tabs):
-            act_slice_tab = QAction("Vai a Slicing", self)
-            act_slice_tab.triggered.connect(self._open_timeslice_window)
-            m_view.addAction(act_slice_tab)
+            act_panel = QAction("Pannello laterale", self)
+            act_panel.setCheckable(True)
+            act_panel.setChecked(bool(self._processing_dock.isVisible()))
+            act_panel.toggled.connect(self._processing_dock.setVisible)
+            self._processing_dock.visibilityChanged.connect(act_panel.setChecked)
+            m_view.addAction(act_panel)
+        for title in ("Elaborazione", "Stima velocit\u00e0", "Slicing", "Varianti"):
+            _act(m_view, title, lambda _checked=False, t=title: self._open_right_tab(t))
+        m_view.addSeparator()
 
         act_wiggle = QAction("Wiggle", self)
         act_wiggle.setCheckable(True)
@@ -1051,92 +1050,74 @@ class GprProfileViewer(
         act_wiggle.toggled.connect(self._toggle_wiggle_panel)
         m_view.addAction(act_wiggle)
 
-        m_view.addSeparator()
-        act_reset = QAction("Reset Zoom", self)
-        act_reset.setShortcut("Ctrl+0")
-        act_reset.triggered.connect(self._reset_zoom)
-        m_view.addAction(act_reset)
-
         act_real_scale = QAction("Scala reale", self)
         act_real_scale.setCheckable(True)
         act_real_scale.setChecked(bool(self._chk_real_aspect.isChecked()))
         act_real_scale.toggled.connect(self._chk_real_aspect.setChecked)
         self._chk_real_aspect.toggled.connect(act_real_scale.setChecked)
         m_view.addAction(act_real_scale)
+        _act(m_view, "Reset Zoom", self._reset_zoom, "Ctrl+0")
 
+        # --- Processing: radargrammi e varianti ------------------------
         m_proc = mb.addMenu("Processing")
-        act_apply = QAction("Applica pipeline", self)
-        act_apply.setShortcut("F5")
-        act_apply.triggered.connect(self._apply_processing_async)
-        m_proc.addAction(act_apply)
-
-        act_gain = QAction("Aggiorna gain", self)
-        act_gain.setShortcut("F6")
-        act_gain.triggered.connect(self._apply_gain_only)
-        m_proc.addAction(act_gain)
-
+        _act(m_proc, "Applica pipeline", self._apply_processing_async, "F5")
+        _act(m_proc, "Aggiorna gain", self._apply_gain_only, "F6")
         m_proc.addSeparator()
-        act_save_variant = QAction("Salva variante processata (.npz)...", self)
-        act_save_variant.triggered.connect(self._save_processed_variant)
-        m_proc.addAction(act_save_variant)
-
-        act_save_working = QAction("Aggiorna variante di lavoro (sovrascrive 'Lavoro')", self)
-        act_save_working.setToolTip(
-            "Scrive i radargrammi filtrati nell'unica variante di lavoro, sempre\n"
-            "con lo stesso nome. Viene aggiornata in automatico alla chiusura."
+        _act(m_proc, "Salva variante processata (.npz)...", self._save_processed_variant)
+        _act(
+            m_proc, "Aggiorna variante di lavoro (sovrascrive 'Lavoro')",
+            lambda *_: self._save_working_variant(),
+            tip=(
+                "Scrive i radargrammi filtrati nell'unica variante di lavoro, sempre\n"
+                "con lo stesso nome. Viene aggiornata in automatico alla chiusura."
+            ),
         )
-        act_save_working.triggered.connect(lambda *_: self._save_working_variant())
-        m_proc.addAction(act_save_working)
-
-        act_slice_variant = QAction("Time-slice da variante processata...", self)
-        act_slice_variant.triggered.connect(self._build_slices_from_variant)
-        m_proc.addAction(act_slice_variant)
-
-        act_blend = QAction("Combina multi-frequenza → variante...", self)
-        act_blend.setToolTip(
-            "Fonde un'antenna dual/triple frequenza in un unico radargramma\n"
-            "(somma pesata + allineamento tempo-zero). Sorgenti: i canali di un\n"
-            "file multicanale OPPURE piu' profili caricati (un file per frequenza\n"
-            "dello stesso tracciato). La frequenza nominale non e' richiesta."
+        _act(m_proc, "Time-slice da variante processata...", self._build_slices_from_variant)
+        _act(
+            m_proc, "Combina multi-frequenza \u2192 variante...",
+            self._blend_multifreq_to_variant,
+            tip=(
+                "Fonde un'antenna dual/triple frequenza in un unico radargramma\n"
+                "(somma pesata + allineamento tempo-zero). Sorgenti: i canali di un\n"
+                "file multicanale OPPURE piu' profili caricati (un file per frequenza\n"
+                "dello stesso tracciato). La frequenza nominale non e' richiesta."
+            ),
         )
-        act_blend.triggered.connect(self._blend_multifreq_to_variant)
-        m_proc.addAction(act_blend)
-
-        act_grid_filter = QAction("Filtra time-slice (dominio griglia)...", self)
-        act_grid_filter.setToolTip(
-            "Applica un filtro 2D (passa-basso, laplaciano, background di linea,\n"
-            "notch FFT direzionale) a tutte le GeoTIFF di un set di time-slice,\n"
-            "scrivendo un nuovo set filtrato."
-        )
-        act_grid_filter.triggered.connect(self._filter_timeslices_grid)
-        m_proc.addAction(act_grid_filter)
-
-        act_merge_sets = QAction("Unisci set di time-slice...", self)
-        act_merge_sets.setToolTip(
-            "Fonde due o piu' cartelle di GeoTIFF (stessa cell size, stessi\n"
-            "indici z) in un unico set: per ogni z pareggia la giunzione\n"
-            "(edge-match opzionale) e appende le griglie (media sulle\n"
-            "sovrapposizioni). Utile per survey a piu' griglie adiacenti."
-        )
-        act_merge_sets.triggered.connect(self._merge_timeslice_sets)
-        m_proc.addAction(act_merge_sets)
-
-        act_rt_set = QAction("Ruota/trasla set di time-slice...", self)
-        act_rt_set.setToolTip(
-            "Ruota (CCW) e trasla ogni GeoTIFF di un set verso un'origine\n"
-            "comune, con ricampionamento bilineare. Scrive un nuovo set _rt."
-        )
-        act_rt_set.triggered.connect(self._rotate_translate_timeslice_set)
-        m_proc.addAction(act_rt_set)
         m_proc.addSeparator()
+        _act(m_proc, "Salva preset gain/hyperbola...", self._save_gain_hyper_preset)
+        _act(m_proc, "Carica preset gain/hyperbola...", self._load_gain_hyper_preset)
 
-        act_save_preset = QAction("Salva preset gain/hyperbola...", self)
-        act_save_preset.triggered.connect(self._save_gain_hyper_preset)
-        m_proc.addAction(act_save_preset)
-
-        act_load_preset = QAction("Carica preset gain/hyperbola...", self)
-        act_load_preset.triggered.connect(self._load_gain_hyper_preset)
-        m_proc.addAction(act_load_preset)
+        # --- Time-slice: operazioni sui set di GeoTIFF -----------------
+        m_ts = mb.addMenu("Time-slice")
+        _act(
+            m_ts, "Importa nel canvas...", self._import_slices_to_canvas,
+            tip="Carica i GeoTIFF della cartella output come sottogruppo di GeoSurvey Studio.",
+        )
+        m_ts.addSeparator()
+        _act(
+            m_ts, "Filtra set (dominio griglia)...", self._filter_timeslices_grid,
+            tip=(
+                "Applica un filtro 2D (passa-basso, laplaciano, background di linea,\n"
+                "notch FFT direzionale) a tutte le GeoTIFF di un set di time-slice,\n"
+                "scrivendo un nuovo set filtrato."
+            ),
+        )
+        _act(
+            m_ts, "Unisci set...", self._merge_timeslice_sets,
+            tip=(
+                "Fonde due o piu' cartelle di GeoTIFF (stessa cell size, stessi\n"
+                "indici z) in un unico set: per ogni z pareggia la giunzione\n"
+                "(edge-match opzionale) e appende le griglie (media sulle\n"
+                "sovrapposizioni). Utile per survey a piu' griglie adiacenti."
+            ),
+        )
+        _act(
+            m_ts, "Ruota/trasla set...", self._rotate_translate_timeslice_set,
+            tip=(
+                "Ruota (CCW) e trasla ogni GeoTIFF di un set verso un'origine\n"
+                "comune, con ricampionamento bilineare. Scrive un nuovo set _rt."
+            ),
+        )
 
     def _on_toggle_wiggle(self, checked: bool):
         self._show_wiggle = bool(checked)
@@ -1817,6 +1798,7 @@ class GprProfileViewer(
         self._refresh_hyper_picks_table()
 
     def _refresh_hyper_picks_table(self) -> None:
+        from qgis.PyQt.QtWidgets import QTableWidgetItem
         tbl = self._tbl_hyper_picks
         tbl.blockSignals(True)
         try:
@@ -3362,7 +3344,7 @@ class GprProfileViewer(
             self._apply_processing_async()
 
     def import_files(self):
-        # Il progetto (con GPR_Processing e cartelle Project Manager) esiste gia':
+        # Il progetto (con Processing e cartelle Project Manager) esiste gia':
         # l'import non chiede piu' dove creare le cartelle di lavoro.
         if not self._gpr_processing_paths():
             ret = QMessageBox.question(
@@ -3372,20 +3354,37 @@ class GprProfileViewer(
             )
             if ret != QMessageBox.Yes or not self._new_gpr_project():
                 return
+        # Con profili gia' caricati: aggiungere all'area attuale, aprire una
+        # nuova area o sostituire. Lo si chiede PRIMA di scegliere i file.
+        target = self._ask_import_target()
+        if target is None:
+            return
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Importa profili GPR", "",
             import_dialog_filter(),
         )
         if not paths:
             return
+        if isinstance(target, tuple):
+            if not self._create_zone(target[1]):
+                return
+            target = "replace"        # l'area nuova e' vuota
         self._ensure_gpr_processing_layout()
         staged_paths = [self._stage_profile_in_project_raw(p) for p in paths]
-        # Nuova sessione import: reset completo stato+UI per evitare riferimenti stale a widget Qt.
-        self._reset_session_state()
+        append = target == "append"
+        if append:
+            known = {os.path.normcase(os.path.abspath(str(getattr(pr, "path", "")))) for pr in self._profiles}
+        else:
+            # Nuova sessione import: reset completo stato+UI per evitare riferimenti stale a widget Qt.
+            self._reset_session_state()
+            known = set()
         errors = []
         imported_warnings = []
         newly_imported = []
         for p in staged_paths:
+            if os.path.normcase(os.path.abspath(p)) in known:
+                imported_warnings.append(f"{os.path.basename(p)}: gia' presente nell'area, non aggiunto di nuovo.")
+                continue
             md5_failed = False
             try:
                 prof = detect_and_read(p, verify_md5=True)
@@ -3440,7 +3439,7 @@ class GprProfileViewer(
                 f"<b>{len(newly_imported)} profilo/i importato/i non contiene coordinate GPS/GEC.</b><br><br>"
                 "I dati verranno trattati come acquisiti senza georeferenziazione GPS.<br>"
                 "Puoi assegnare manualmente la geometria della griglia di rilievo adesso.<br><br>"
-                "<b>Aprire ora il dialog di Posizionamento Griglia Manuale?</b>",
+                "<b>Aprire ora la finestra di Posizionamento?</b>",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.Yes,
             )
@@ -3457,14 +3456,14 @@ class GprProfileViewer(
 
         Può essere chiamato:
         - Automaticamente dopo l'import di profili privi di GPS.
-        - Manualmente dall'utente tramite il pulsante toolbar '📍 Posizionamento Griglia'.
+        - Manualmente dall'utente tramite il pulsante toolbar '📍 Posizionamento'.
         """
         profiles = list(profiles_override or self._profiles or [])
         if not profiles:
             QMessageBox.information(
                 self,
-                "Posizionamento Griglia",
-                "Importa almeno un profilo .ogpr prima di aprire il posizionamento manuale.",
+                "Posizionamento",
+                "Importa almeno un profilo .ogpr prima di aprire il Posizionamento.",
             )
             return
 
@@ -3533,7 +3532,12 @@ class GprProfileViewer(
                             dlg._spin_pos_param.setValue(int(nav.get("pos_param", 0) or 0))
                         except (TypeError, ValueError):
                             pass
-                    if hasattr(dlg, "_chk_reverse_far"):
+                    if "keep_gps" in nav and hasattr(dlg, "_chk_keep_gps") \
+                            and dlg._chk_keep_gps.isEnabled():
+                        dlg._chk_keep_gps.setChecked(bool(nav.get("keep_gps")))
+                    # con GPS originale l'ancoraggio e' dedotto dai dati: prevale sul salvato
+                    if hasattr(dlg, "_chk_reverse_far") \
+                            and getattr(dlg, "_inferred_reverse_anchor", None) is None:
                         dlg._chk_reverse_far.setChecked(
                             str(nav.get("reverse_anchor", "near") or "near").lower().startswith("far")
                         )
@@ -3595,7 +3599,7 @@ class GprProfileViewer(
                 pass
             self._safe_set_text(
                 self._lbl_status,
-                f"Posizionamento manuale applicato a {len(result.get('profiles', []))} profilo/i. "
+                f"Posizionamento applicato a {len(result.get('profiles', []))} profilo/i. "
                 "Le coordinate sono ora disponibili per il viewer e lo slicing 3D.",
             )
 
@@ -5448,12 +5452,18 @@ class GprProfileViewer(
             self._gpr_3d_viewer = None
 
         try:
+            processed_root = ""
+            try:
+                processed_root = str(self._gpr_processing_paths().get("processed", "") or "")
+            except Exception:
+                processed_root = ""
             viewer = Gpr3dViewerDialog(
                 volume=volume,
                 meta=meta_3d,
                 profiles=self._profiles,
                 grids=grids,
                 parent=self,
+                processed_root=processed_root,
             )
         except Exception as exc:
             import traceback
@@ -5508,6 +5518,26 @@ class GprProfileViewer(
             pass
         self._gpr_3d_viewer = None
 
+    def _clear_canvas_rubber_bands(self):
+        """Toglie dal canvas linea del profilo, punto e crosshair (viewer chiuso)."""
+        for rb in (self._rb_point, self._rb_line, self._rb_crosshair_h, self._rb_crosshair_v):
+            if rb is not None:
+                try:
+                    rb.reset()
+                    rb.setVisible(False)
+                except Exception:
+                    pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # alla riapertura (dopo una chiusura "soft") ridisegna la traccia del profilo
+        if getattr(self, "_profiles", None) and not event.spontaneous():
+            try:
+                self._draw_profile_line_on_canvas()
+                self._update_rubber_band()
+            except Exception:
+                pass
+
     def closeEvent(self, event):
         # Default UX: closing hides the window to preserve child widgets/docks.
         # This avoids stale Python refs to deleted Qt C++ objects on next reopen.
@@ -5530,6 +5560,7 @@ class GprProfileViewer(
                 self._close_3d_viewer()
             except Exception:
                 pass
+            self._clear_canvas_rubber_bands()
             self.hide()
             event.ignore()
             return

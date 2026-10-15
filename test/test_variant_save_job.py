@@ -63,7 +63,7 @@ class VariantSaveJobTest(_ViewerTestBase):
 
     # -- helpers --------------------------------------------------------
     def _variant_dir(self, name="t"):
-        return os.path.join(self._tmp.name, "GPR_Processing", "processed", name)
+        return os.path.join(self._tmp.name, "Processing", "processed", name)
 
     def _saved(self, name="t"):
         d = self._variant_dir(name)

@@ -63,6 +63,8 @@ from .radargram_metadata import inspect_radargram
 from .catalog_editor_dialog import CatalogEditorDialog
 from .link_editor_dialog import LinkEditorDialog
 from .timeslice_group_manager_dialog import TimesliceGroupManagerDialog
+from .variant_manager_dialog import VariantManagerDialog
+from .cross_project_import_dialog import CrossProjectImportDialog
 from .project_health_dialog import ProjectHealthDialog
 from .vector_layer_manager_dialog import VectorLayerManagerDialog
 from .project_manager_import_rollback_mixin import ProjectManagerImportRollbackMixin
@@ -219,6 +221,16 @@ class ProjectManagerDialog(
         self.import_manifest_btn.clicked.connect(self._import_manifest)
         self.import_manifest_btn.setMinimumHeight(28)
         import_layout.addWidget(self.import_manifest_btn, 1, 1)
+
+        import_cross_btn = QPushButton("Import from another project...")
+        import_cross_btn.setToolTip(
+            "Bring time-slices from another GPR project folder into this\n"
+            "project's canvas as read-only references, without switching\n"
+            "the active processing workspace."
+        )
+        import_cross_btn.clicked.connect(self._open_cross_project_import)
+        import_cross_btn.setMinimumHeight(28)
+        import_layout.addWidget(import_cross_btn, 2, 0, 1, 2)
         sections_col.addWidget(import_sec)
 
         # --- Data Catalog & QA (open by default) ---
@@ -262,6 +274,23 @@ class ProjectManagerDialog(
         edit_catalog_btn.setMinimumHeight(28)
         rg3d_layout.addWidget(edit_catalog_btn, 0, 0)
         sections_col.addWidget(rg3d_sec)
+
+        # --- Variants (closed by default) ---
+        variants_sec = _CollapsibleSection("Variants", expanded=False)
+        variants_layout = _section_grid(variants_sec)
+
+        variants_scope_label = QLabel(
+            "Delete a processing variant (from Processing) together with any\n"
+            "variant derived from it, its time-slices, catalog rows and canvas layers."
+        )
+        variants_scope_label.setWordWrap(True)
+        variants_layout.addWidget(variants_scope_label, 0, 0)
+
+        variant_mgr_btn = QPushButton("Variant Manager")
+        variant_mgr_btn.clicked.connect(self._open_variant_manager)
+        variant_mgr_btn.setMinimumHeight(28)
+        variants_layout.addWidget(variant_mgr_btn, 1, 0)
+        sections_col.addWidget(variants_sec)
 
         # --- Advanced (closed by default) ---
         adv_sec = _CollapsibleSection("Advanced", expanded=False)
@@ -1598,6 +1627,23 @@ class ProjectManagerDialog(
         )
         dlg.exec_()
         self._notify_project_updated()
+
+    def _open_variant_manager(self):
+        if not self._ensure_project_ready():
+            return
+        dlg = VariantManagerDialog(
+            self.project_root,
+            self,
+            on_updated=self._notify_project_updated,
+        )
+        dlg.exec_()
+        self._notify_project_updated()
+
+    def _open_cross_project_import(self):
+        if not self._ensure_project_ready():
+            return
+        dlg = CrossProjectImportDialog(self.project_root, self, self)
+        dlg.exec_()
 
     def _open_vector_layer_manager(self):
         if not self._ensure_project_ready():

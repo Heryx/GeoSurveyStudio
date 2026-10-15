@@ -3,7 +3,7 @@
 
 import os.path
 
-from qgis.PyQt.QtCore import QSettings, QCoreApplication
+from qgis.PyQt.QtCore import QSettings, QCoreApplication, QTimer
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QMessageBox
 from qgis.core import QgsMessageLog, Qgis
@@ -37,6 +37,23 @@ try:
     _HAS_QT_RESOURCES = True
 except Exception:
     _HAS_QT_RESOURCES = False
+
+
+def _active_zone_base(root):
+    """Cartella di lavoro dell'area attiva di ``root`` (Processing/ per l'area
+    principale), cosi' il pannello legge le varianti dell'area giusta anche con
+    il viewer chiuso. Senza ``project.json`` ritorna ``root`` invariata."""
+    if not root:
+        return root
+    try:
+        from . import project_zones
+        if os.path.isfile(project_zones.project_json_path(root)):
+            base = project_zones.zone_base(root)
+            if os.path.isdir(base):
+                return base
+    except Exception:
+        pass
+    return root
 
 
 class GeoSurveyStudioPlugin(
@@ -220,6 +237,10 @@ class GeoSurveyStudioPlugin(
         try:
             from qgis.core import QgsProject
             QgsProject.instance().projectRead.connect(self._on_qgis_project_read)
+            # Plugin caricato (o ricaricato) con un progetto gia' aperto:
+            # projectRead non scatta piu', quindi si lega il progetto adesso.
+            if QgsProject.instance().fileName() or QgsProject.instance().mapLayers():
+                QTimer.singleShot(1500, self._on_qgis_project_read)
         except Exception as exc:
             QgsMessageLog.logMessage(
                 f"Could not connect projectRead signal: {exc}",
@@ -373,6 +394,13 @@ class GeoSurveyStudioPlugin(
                 self._gpr_profile_viewer.destroyed.connect(lambda *_a: setattr(self, "_gpr_profile_viewer", None))
             except Exception:
                 pass
+        else:
+            # Viewer gia' creato in precedenza: potrebbe essere rimasto sul
+            # progetto di prima se nel frattempo e' stato aperto un altro.
+            try:
+                self._gpr_profile_viewer.sync_with_active_project()
+            except Exception:
+                pass
         self._gpr_profile_viewer.show()
         self._gpr_profile_viewer.raise_()
         self._gpr_profile_viewer.activateWindow()
@@ -382,7 +410,7 @@ class GeoSurveyStudioPlugin(
     # ------------------------------------------------------------------
 
     def _radargram_workspace_root(self) -> str:
-        """Cartella-progetto (o GPR_Processing) che contiene `processed/`."""
+        """Cartella-progetto (o Processing) che contiene `processed/`."""
         viewer = self._live_profile_viewer()
         if viewer is not None:
             try:
@@ -398,12 +426,18 @@ class GeoSurveyStudioPlugin(
             root = ""
         if not root:
             try:
+                from . import project_binding
+                root = project_binding.recall_root()
+            except Exception:
+                root = ""
+        if not root:
+            try:
                 from qgis.core import QgsProject
                 qgs = str(QgsProject.instance().fileName() or "").strip()
                 root = os.path.dirname(os.path.normpath(qgs)) if qgs else ""
             except Exception:
                 root = ""
-        return root
+        return _active_zone_base(root)
 
     def _live_profile_viewer(self):
         """Il Profile Viewer se e' aperto e ha profili in memoria, altrimenti None."""

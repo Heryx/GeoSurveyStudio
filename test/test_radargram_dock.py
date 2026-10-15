@@ -76,7 +76,7 @@ class _Iface(QObject if HAS_ENV else object):
 
 def _write_slice(root, variant, grid, z0, z1):
     """GeoTIFF minuscolo + sliceset.json accanto, come li scrive la generazione time-slice."""
-    folder = os.path.join(root, "GPR_Processing", "timeslices", variant)
+    folder = os.path.join(root, "Processing", "timeslices", variant)
     os.makedirs(folder, exist_ok=True)
     _RIO.write_tif_singleband(np.ones((4, 4), dtype=np.float32), os.path.join(folder, grid),
                               500000.0, 0.0, 3.0, 1.0, 32632)
@@ -89,7 +89,7 @@ def _write_slice(root, variant, grid, z0, z1):
 
 def _write_sliceset(root, variant, slices):
     """Piu' time-slice nello stesso gruppo/sliceset.json: slices = [(grid, z0, z1), ...]."""
-    folder = os.path.join(root, "GPR_Processing", "timeslices", variant)
+    folder = os.path.join(root, "Processing", "timeslices", variant)
     os.makedirs(folder, exist_ok=True)
     for grid, _z0, _z1 in slices:
         _RIO.write_tif_singleband(np.ones((4, 4), dtype=np.float32), os.path.join(folder, grid),

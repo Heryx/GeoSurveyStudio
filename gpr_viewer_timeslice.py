@@ -5,6 +5,7 @@ Estratto da gpr_profile_viewer.py senza modifiche ai metodi."""
 
 from __future__ import annotations
 
+from . import project_zones
 from .amplitude_stats import finite_values, format_stats, value_stats
 from .gpr_viewer_common import (
     DEFAULT_CHAIN_ORDER,
@@ -1538,8 +1539,16 @@ class TimesliceViewMixin:
             name = os.path.basename(path)
             idx = fallback_idx
             z_center = None
+            m_win = re.search(r"^slice_(\d+)_(n?\d+\.\d+)-(n?\d+\.\d+)m\.tiff?$", name, flags=re.IGNORECASE)
             m = re.search(r"^slice_(\d+)_z([A-Za-z0-9_]+)\.tiff?$", name, flags=re.IGNORECASE)
-            if m:
+            if m_win:
+                try:
+                    idx = int(m_win.group(1))
+                    lo, hi = (float(g.replace("n", "-")) for g in m_win.group(2, 3))
+                    z_center = 0.5 * (lo + hi)
+                except Exception:
+                    idx = fallback_idx
+            elif m:
                 try:
                     idx = int(m.group(1))
                 except Exception:
@@ -1855,6 +1864,11 @@ class TimesliceViewMixin:
             return
 
         default_name = os.path.basename(os.path.normpath(outdir)) or "gpr_slices"
+        zone = self._current_zone_name()
+        if zone and zone != project_zones.DEFAULT_ZONE:
+            # Stesso nome di variante in aree diverse (es. "Lavoro") non deve
+            # finire nello stesso gruppo del catalogo.
+            default_name = f"{zone} - {default_name}"
         group_name, ok = QInputDialog.getText(
             self, "Import Timeslice",
             "Nome del sottogruppo da creare in GeoSurvey Studio:",
@@ -2221,14 +2235,14 @@ class TimesliceViewMixin:
                 n_y, n_x = arr.shape
                 y_top = y0 + (n_y - 1) * cell
                 x_right = x0 + (n_x - 1) * cell
-                name = "slice_%04d.tif" % i
+                zf, zt, zc = meta if meta else (float(i), float(i), float(i))
+                name = sm.slice_file_name(i, zf, zt)
                 out_path = os.path.join(out_dir, name)
                 write_tif_singleband(arr, out_path, x0, y0, y_top, cell, epsg_out or 0)
                 try:
                     write_qml_singleband(out_path, arr, self._slice_display_style())
                 except Exception:
                     pass
-                zf, zt, zc = meta if meta else (float(i), float(i), float(i))
                 out_slices.append({
                     "index": i, "z_from": zf, "z_to": zt, "z_center": zc,
                     "grid": name, "stats": sm.compute_slice_stats(arr),

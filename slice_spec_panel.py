@@ -120,7 +120,7 @@ class SliceSpecPanel(QWidget):
             "Radargrammi da affettare:\n"
             " • 'raw' = i profili attualmente caricati (grezzi o con la pipeline\n"
             "   di anteprima), come prima;\n"
-            " • una variante salvata (GPR_Processing/processed/<nome>) = usa i\n"
+            " • una variante salvata (Processing/processed/<nome>) = usa i\n"
             "   suoi .npz gia' filtrati, senza riapplicare la pipeline.\n"
             "L'elenco si aggiorna con le varianti presenti nel progetto."
         )

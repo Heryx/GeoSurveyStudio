@@ -965,6 +965,7 @@ class CatalogGroupMixin:
             project_root,
             records,
             description="GeoSurvey Studio: Importing selected images",
+            name_prefix=str(group.get("name") or ""),
         )
         def _finalize(done_task):
             cancelled = bool(done_task.cancelled)

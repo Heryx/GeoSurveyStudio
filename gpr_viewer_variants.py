@@ -799,7 +799,7 @@ class VariantsMixin:
         lay.setSpacing(6)
 
         lay.addWidget(QLabel(
-            "Varianti di radargrammi processati in GPR_Processing/processed/.\n"
+            "Varianti di radargrammi processati in Processing/processed/.\n"
             "L'albero segue la provenienza (variant_graph.json): ogni variante\n"
             "e' figlia di quella da cui e' stata derivata. Tasto destro per le azioni."
         ))
@@ -1046,27 +1046,29 @@ class VariantsMixin:
         name = self._selected_variant_name()
         if not d or not os.path.isdir(d):
             return
+        paths = self._gpr_processing_paths()
+        processed = paths.get("processed", "") if paths else ""
+        timeslices_root = paths.get("timeslices", "") if paths else ""
+        project_root = self._active_project_root()
+
+        from . import variant_cascade
+        plan = variant_cascade.plan_cascade_delete(processed, timeslices_root, project_root, name)
         ans = QMessageBox.question(
-            self, "Elimina variante",
-            f"Eliminare la cartella della variante '{name}'?\n{d}\n\n"
-            "I .npz e il manifesto verranno rimossi. Operazione non annullabile.",
+            self, "Elimina variante", variant_cascade.describe_plan(plan),
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if ans != QMessageBox.Yes:
             return
+
         try:
-            shutil.rmtree(d)
-        except Exception as exc:
-            QMessageBox.critical(self, "Elimina variante", f"Rimozione fallita:\n{exc}")
-            return
-        try:
-            paths = self._gpr_processing_paths()
-            processed = paths.get("processed", "") if paths else ""
-            if processed:
-                from . import variant_provenance as vp
-                vp.remove_entry(processed, name)
+            from . import layer_source_utils
+            layer_source_utils.remove_layers_for_paths(plan.get("layer_paths"))
         except Exception:
             pass
+
+        result = variant_cascade.execute_cascade_delete(processed, timeslices_root, project_root, plan)
+        if result.get("warnings"):
+            QMessageBox.warning(self, "Elimina variante", "\n".join(result["warnings"]))
         self._refresh_variants_list()
 
     def _slice_selected_variant(self):

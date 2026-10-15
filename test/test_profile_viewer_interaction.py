@@ -569,7 +569,7 @@ class HyperbolaVelocityFieldTest(_ViewerTestBase):
             v._variant_parent_ctx = "Lavoro"
             v._spin_hyperbola_rdp.setValue(11.0)
             v._save_hyperbola_velocity_to_variant()
-            variant_dir = os.path.join(root, "GPR_Processing", "processed", "Lavoro")
+            variant_dir = os.path.join(root, "Processing", "processed", "Lavoro")
             got = VS.resolve_velocity_m_ns(variant_dir, None)
             self.assertEqual(got["source"], "manual")
             self.assertAlmostEqual(got["rdp"], 11.0, places=3)
@@ -588,7 +588,13 @@ class VelocityEstimationTabTest(_ViewerTestBase):
         self.assertIn("Stima velocità", titles)
         self.assertTrue(v._velocity_group_box.isAncestorOf(v._chk_hyperbola))
         self.assertTrue(v._velocity_group_box.isAncestorOf(v._tbl_hyper_picks))
-        self.assertFalse(v._processing_panel_widget.isAncestorOf(v._chk_hyperbola))
+        # _processing_panel_widget e' l'intero pannello a schede: i controlli devono
+        # stare nella scheda velocita', non in quella 'Elaborazione'.
+        tabs = v._right_tabs
+        proc_tab = tabs.widget(titles.index("Elaborazione"))
+        vel_tab = tabs.widget(titles.index("Stima velocità"))
+        self.assertTrue(vel_tab.isAncestorOf(v._chk_hyperbola))
+        self.assertFalse(proc_tab.isAncestorOf(v._chk_hyperbola))
 
     def test_two_point_method_matches_the_math_module(self):
         v = self.v
@@ -607,7 +613,8 @@ class VelocityEstimationTabTest(_ViewerTestBase):
             v._hyper_apex_x, v._hyper_apex_depth, v._cursor_x, v._cursor_z, v_ref, s=s)
         self.assertIsNotNone(expected)
         _, expected_rdp = expected
-        self.assertAlmostEqual(v._spin_hyperbola_rdp.value(), expected_rdp, places=3)
+        # la casella RDP mostra 2 decimali: si confronta il valore arrotondato
+        self.assertAlmostEqual(v._spin_hyperbola_rdp.value(), expected_rdp, delta=0.006)
 
     def test_two_point_button_requires_an_apex_first(self):
         v = self.v
@@ -671,7 +678,7 @@ class VelocityEstimationTabTest(_ViewerTestBase):
                 {"depth": 0.4, "method": "Due punti", "v_mns": 0.12, "rdp": 6.25, "included": True},
             ]
             v._save_hyperbola_velocity_to_variant()
-            variant_dir = os.path.join(root, "GPR_Processing", "processed", "Lavoro")
+            variant_dir = os.path.join(root, "Processing", "processed", "Lavoro")
             got = VS.resolve_velocity_m_ns(variant_dir, None)
             self.assertEqual(got["source"], "hyperbola_fit_aggregate")
             self.assertAlmostEqual(got["velocity_m_ns"], 0.10, places=6)
@@ -924,6 +931,221 @@ class RangeGainCurveLimitTest(_ViewerTestBase):
         self.assertFalse(dlg._chk_auto_axis.isChecked())
         self.assertEqual(float(dlg.points()[-1, 1]), 500.0)
         self.assertGreaterEqual(dlg.gain_max(), 500.0)   # l'asse non nasconde il punto
+
+
+@unittest.skipUnless(HAS_MPL and HAS_VIEWER, "matplotlib/viewer non disponibili")
+class ProjectSwitchAndTabsTest(_ViewerTestBase):
+    """Cambio del progetto GPR attivo con il viewer gia' creato, e schede del
+    pannello destro raggiunte per titolo (non per indice)."""
+
+    class _FakeSettings:
+        def __init__(self):
+            self.d = {}
+
+        def value(self, key, default="", type=None):
+            return self.d.get(key, default)
+
+        def setValue(self, key, value):
+            self.d[key] = value
+
+    def test_menu_tabs_open_the_tab_with_that_title(self):
+        v = self.v
+        v._open_timeslice_window()
+        self.assertEqual(v._right_tabs.tabText(v._right_tabs.currentIndex()), "Slicing")
+        v._open_processing_window()
+        self.assertEqual(v._right_tabs.tabText(v._right_tabs.currentIndex()), "Elaborazione")
+
+    def test_menu_layout_and_view_entries_open_their_tab(self):
+        v = self.v
+        top = [a.text() for a in v.menuBar().actions()]
+        self.assertEqual(top, ["File", "View", "Processing", "Time-slice"])
+
+        def texts(title):
+            return [a.text() for a in v.menuBar().actions()
+                    if a.text() == title][0], [
+                a.text() for a in
+                [x for x in v.menuBar().actions() if x.text() == title][0].menu().actions()
+                if a.text()]
+
+        _, file_items = texts("File")
+        self.assertNotIn("Ricarica ultimo progetto GPR", file_items)
+        self.assertNotIn("Import Timeslices to Canvas", file_items)
+        _, ts_items = texts("Time-slice")
+        self.assertEqual(len(ts_items), 4)
+        view_menu = [x for x in v.menuBar().actions() if x.text() == "View"][0].menu()
+        for act in view_menu.actions():
+            if act.text() in ("Elaborazione", "Stima velocità", "Slicing", "Varianti"):
+                act.trigger()
+                self.assertEqual(v._right_tabs.tabText(v._right_tabs.currentIndex()), act.text())
+
+    def test_sync_with_active_project_shows_variants_of_the_new_project(self):
+        import types
+        v = self.v
+        settings = self._FakeSettings()
+        v.plugin = types.SimpleNamespace(settings=settings, settings_key_active_project="k")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root_a = os.path.join(tmp, "A")
+            root_b = os.path.join(tmp, "B")
+            for r in (root_a, root_b):
+                os.makedirs(os.path.join(r, "metadata"))
+            var = os.path.join(root_b, "Processing", "processed", "Lavoro")
+            os.makedirs(var)
+            open(os.path.join(var, "p1.npz"), "wb").close()
+
+            settings.d["k"] = root_a
+            v._synced_plugin_root = None
+            v.sync_with_active_project()             # primo allineamento: nessun cambio
+            v._refresh_variants_list()
+            self.assertEqual(v._tree_variants.topLevelItemCount(), 1)
+            self.assertNotEqual(v._tree_variants.topLevelItem(0).text(0), "Lavoro")
+
+            v._gpr_workspace_override = root_a       # workspace locale stantio
+            settings.d["k"] = root_b                 # aperto un altro progetto QGIS
+            v.sync_with_active_project()
+            self.assertEqual(v._gpr_workspace_override, "")
+            names = [v._tree_variants.topLevelItem(i).text(0)
+                     for i in range(v._tree_variants.topLevelItemCount())]
+            self.assertIn("Lavoro", names)
+
+
+@unittest.skipUnless(HAS_MPL and HAS_VIEWER, "matplotlib/viewer non disponibili")
+class ZonesWorkflowTest(_ViewerTestBase):
+    """Piu' aree indagate nello stesso progetto, importate in momenti diversi."""
+
+    def setUp(self):
+        super().setUp()
+        import types
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = os.path.join(self._tmp.name, "GPR_P")
+        os.makedirs(os.path.join(self.root, "metadata"))
+        settings = ProjectSwitchAndTabsTest._FakeSettings()
+        settings.d["k"] = self.root
+        self.v.plugin = types.SimpleNamespace(settings=settings, settings_key_active_project="k")
+        self.v._gpr_workspace_override = ""
+        self.v._invalidate_zone_context()
+        # i "file" dell'area sono profili sintetici: la lettura da disco e' sostituita
+        self._real = importlib.import_module("rasterlinker_feature_interpolation.gpr_viewer_project")
+        self._orig_read = self._real.detect_and_read
+        self._real.detect_and_read = lambda p, verify_md5=True: self._fake_profile(p)
+
+    def tearDown(self):
+        self._real.detect_and_read = self._orig_read
+        super().tearDown()
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _fake_profile(path):
+        prof = _make_profile()
+        prof.path = path
+        return prof
+
+    def _put_raw(self, zone_paths, names):
+        out = []
+        for n in names:
+            p = os.path.join(zone_paths["raw"], n)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "wb").close()
+            out.append(p)
+        return out
+
+    def test_new_zone_does_not_touch_the_previous_one_and_switch_restores_it(self):
+        v = self.v
+        pz = importlib.import_module("rasterlinker_feature_interpolation.project_zones")
+        paths_a = v._ensure_gpr_processing_layout()
+        raw_a = self._put_raw(paths_a, ["a1.ogpr", "a2.ogpr"])
+        v._reset_session_state()
+        v._profiles = [self._fake_profile(p) for p in raw_a]
+        v._prof_idx = 0
+        v._save_gpr_processing_project_meta()
+        zone_a = v._current_zone_name()
+        self.assertEqual(zone_a, pz.DEFAULT_ZONE)
+
+        self.assertEqual(v._create_zone("Area Nord"), "Area Nord")
+        self.assertEqual(v._current_zone_name(), "Area Nord")
+        self.assertEqual(v._profiles, [])                       # area nuova: vuota
+        paths_b = v._gpr_processing_paths()
+        self.assertNotEqual(paths_a["raw"], paths_b["raw"])
+        self.assertTrue(os.path.isdir(paths_b["raw"]))
+
+        raw_b = self._put_raw(paths_b, ["b1.ogpr"])
+        v._profiles = [self._fake_profile(p) for p in raw_b]
+        v._save_gpr_processing_project_meta()
+
+        self.assertTrue(v._switch_zone(zone_a))
+        self.assertEqual(sorted(os.path.basename(p.path) for p in v._profiles), ["a1.ogpr", "a2.ogpr"])
+        self.assertTrue(v._switch_zone("Area Nord"))
+        self.assertEqual([os.path.basename(p.path) for p in v._profiles], ["b1.ogpr"])
+        items = [v._cb_zone.itemText(i) for i in range(v._cb_zone.count())]
+        self.assertEqual(items[:2], [pz.DEFAULT_ZONE, "Area Nord"])
+
+    def test_variants_are_listed_per_zone(self):
+        v = self.v
+        pz = importlib.import_module("rasterlinker_feature_interpolation.project_zones")
+        paths_a = v._ensure_gpr_processing_layout()
+        os.makedirs(os.path.join(paths_a["processed"], "VarA"))
+        open(os.path.join(paths_a["processed"], "VarA", "p.npz"), "wb").close()
+        v._profiles = [self._fake_profile(p) for p in self._put_raw(paths_a, ["a1.ogpr"])]
+        v._save_gpr_processing_project_meta()
+        v._create_zone("Area B")
+        names = [v._tree_variants.topLevelItem(i).text(0) for i in range(v._tree_variants.topLevelItemCount())]
+        self.assertNotIn("VarA", names)
+        v._switch_zone(pz.DEFAULT_ZONE)
+        names = [v._tree_variants.topLevelItem(i).text(0) for i in range(v._tree_variants.topLevelItemCount())]
+        self.assertIn("VarA", names)
+
+    def _run_import(self, target, paths):
+        v = self.v
+        orig_dlg = _GV.QFileDialog.getOpenFileNames
+        orig_read = _GV.detect_and_read
+        orig_ask = v._ask_import_target
+        _GV.QFileDialog.getOpenFileNames = staticmethod(lambda *a, **k: (list(paths), ""))
+        _GV.detect_and_read = lambda p, verify_md5=True: self._fake_profile(p)
+        v._ask_import_target = lambda: target
+        # nessuna finestra modale: "profili senza GPS" -> No, avvisi ignorati
+        mb = _GV.QMessageBox
+        saved = (mb.question, mb.information, mb.warning)
+        mb.question = staticmethod(lambda *a, **k: mb.No)
+        mb.information = staticmethod(lambda *a, **k: None)
+        mb.warning = staticmethod(lambda *a, **k: None)
+        try:
+            v.import_files()
+        finally:
+            mb.question, mb.information, mb.warning = saved
+            _GV.QFileDialog.getOpenFileNames = orig_dlg
+            _GV.detect_and_read = orig_read
+            v._ask_import_target = orig_ask
+
+    def test_import_can_append_to_the_current_zone(self):
+        v = self.v
+        paths = v._ensure_gpr_processing_layout()
+        raw = self._put_raw(paths, ["a1.ogpr", "a2.ogpr"])
+        v._profiles = [self._fake_profile(raw[0])]
+        v._prof_idx = 0
+        self._run_import("append", [raw[1], raw[0]])      # a1 e' gia' presente
+        self.assertEqual([os.path.basename(p.path) for p in v._profiles], ["a1.ogpr", "a2.ogpr"])
+
+    def test_import_into_a_new_zone_keeps_the_old_zone_profiles(self):
+        v = self.v
+        pz = importlib.import_module("rasterlinker_feature_interpolation.project_zones")
+        paths_a = v._ensure_gpr_processing_layout()
+        raw_a = self._put_raw(paths_a, ["a1.ogpr"])
+        v._profiles = [self._fake_profile(raw_a[0])]
+        v._prof_idx = 0
+        v._save_gpr_processing_project_meta()
+        src = os.path.join(self._tmp.name, "campagna2", "n1.ogpr")
+        os.makedirs(os.path.dirname(src))
+        open(src, "wb").close()
+        self._run_import(("new", "Campagna 2"), [src])
+        self.assertEqual(v._current_zone_name(), "Campagna 2")
+        self.assertEqual([os.path.basename(p.path) for p in v._profiles], ["n1.ogpr"])
+        self.assertTrue(v._profiles[0].path.startswith(v._gpr_processing_paths()["raw"]))
+        self.assertEqual(
+            [r["filename"] for r in pz.get_payload(self.root, pz.DEFAULT_ZONE)["profiles"]], ["a1.ogpr"])
+
+    def test_import_target_question_only_when_profiles_exist(self):
+        v = self.v
+        v._profiles = []
+        self.assertEqual(v._ask_import_target(), "replace")
 
 
 if __name__ == "__main__":

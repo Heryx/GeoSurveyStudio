@@ -50,9 +50,11 @@ class TimesliceImportTask(CallbackTask):
       }
     """
 
-    def __init__(self, project_root, records, description="GeoSurvey Studio: Importing time-slices"):
+    def __init__(self, project_root, records, description="GeoSurvey Studio: Importing time-slices",
+                 name_prefix=""):
         super().__init__(description)
         self.project_root = project_root
+        self.name_prefix = str(name_prefix or "")
         self.records = list(records or [])
         self.imported_records = []
         self.imported_paths = []
@@ -79,7 +81,7 @@ class TimesliceImportTask(CallbackTask):
 
             try:
                 project_path, normalized_name = normalize_copy_into_project(
-                    self.project_root, "timeslices_2d", source_path
+                    self.project_root, "timeslices_2d", source_path, name_prefix=self.name_prefix
                 )
                 src_meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
                 record = {
@@ -95,6 +97,16 @@ class TimesliceImportTask(CallbackTask):
                     "band_count": src_meta.get("band_count"),
                     "extent": src_meta.get("extent"),
                 }
+                # Profondita' dalla slice (sliceset.json / tag del GeoTIFF / nome file):
+                # senza, il catalogo non sa a che quota sta il raster.
+                try:
+                    from .slice_manifest import depth_window_for_file
+                    window = depth_window_for_file(source_path)
+                except Exception:
+                    window = None
+                if window:
+                    record["depth_from"], record["depth_to"] = window
+                    record["unit"] = "m"
 
                 link_info = link_surfer_grid_into_project(
                     self.project_root,

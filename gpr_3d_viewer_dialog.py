@@ -9,7 +9,8 @@ import sys
 import numpy as np
 from . import gpr_debug_log as _dbg
 
-from qgis.PyQt.QtCore import Qt, pyqtSignal
+from qgis.PyQt.QtCore import QEvent, Qt, pyqtSignal
+from qgis.PyQt.QtGui import QColor, QPainter, QPen
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -21,6 +22,7 @@ from qgis.PyQt.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -189,11 +191,86 @@ def _bootstrap_pyvista_runtime() -> bool:
     return False
 
 
+class _DepthMinimapWidget(QWidget):
+    """Barra verticale con un trattino per ciascun livello disponibile
+    (time-slice/inline/crossline/profilo) ed evidenziazione della
+    posizione corrente. Click sulla barra salta al livello piu' vicino."""
+
+    levelClicked = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._values = np.zeros(0, dtype=np.float64)
+        self._current = 0
+        self.setMinimumWidth(18)
+        self.setToolTip("Riferimento posizione: click per saltare al livello piu' vicino")
+
+    def set_levels(self, values, current: int):
+        self._values = np.asarray(values, dtype=np.float64).ravel()
+        self._current = int(current)
+        self.update()
+
+    def set_current(self, current: int):
+        self._current = int(current)
+        self.update()
+
+    @staticmethod
+    def _value_to_y(value: float, top: float, bottom: float, height: float) -> float:
+        if bottom <= top:
+            return height / 2.0
+        ratio = (float(value) - top) / (bottom - top)
+        return float(np.clip(ratio, 0.0, 1.0)) * height
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            w = self.width()
+            h = self.height()
+            painter.fillRect(0, 0, w, h, QColor(40, 40, 40))
+            n = int(self._values.size)
+            if n <= 0:
+                return
+            top = float(self._values[0])
+            bottom = float(self._values[-1])
+            pen = QPen(QColor(150, 150, 150))
+            pen.setWidth(1)
+            painter.setPen(pen)
+            for i in range(n):
+                y = self._value_to_y(self._values[i], top, bottom, float(h))
+                painter.drawLine(2, int(y), w - 2, int(y))
+            i_cur = int(np.clip(self._current, 0, n - 1))
+            y_cur = self._value_to_y(self._values[i_cur], top, bottom, float(h))
+            cur_pen = QPen(QColor(255, 180, 0))
+            cur_pen.setWidth(2)
+            painter.setPen(cur_pen)
+            painter.drawLine(0, int(y_cur), w, int(y_cur))
+        finally:
+            painter.end()
+
+    def mousePressEvent(self, event):
+        n = int(self._values.size)
+        if n <= 0:
+            return
+        top = float(self._values[0])
+        bottom = float(self._values[-1])
+        h = float(max(self.height(), 1))
+        y = float(event.pos().y())
+        if bottom <= top:
+            idx = 0
+        else:
+            ratio = float(np.clip(y / h, 0.0, 1.0))
+            target = top + ratio * (bottom - top)
+            idx = int(np.argmin(np.abs(self._values - target)))
+        idx = int(np.clip(idx, 0, n - 1))
+        self.levelClicked.emit(idx)
+
+
 class Gpr3dViewerDialog(QDialog):
     """Interactive 3D volume viewer based on pyvistaqt in a QDialog."""
     depth_changed = pyqtSignal(float)
 
-    def __init__(self, volume, meta, profiles=None, grids=None, parent=None):
+    def __init__(self, volume, meta, profiles=None, grids=None, parent=None, processed_root=None):
         super().__init__(parent, Qt.Window)
         self.setWindowTitle("GPR 3D Volume Viewer")
         self.resize(1280, 800)
@@ -225,6 +302,7 @@ class Gpr3dViewerDialog(QDialog):
         self._meta = dict(meta or {})
         self._profiles = list(profiles or [])
         self._grids = list(grids or [])
+        self._processed_root = str(processed_root or "")
 
         self._volume_grid = None
         self._spatial = {}
@@ -275,6 +353,9 @@ class Gpr3dViewerDialog(QDialog):
         self._profile_actor_count = 0
         self._profile_curtain_cache = {}
         self._drawing_volume_actor = False
+        self._variant_choices: list = []
+        self._basemap_actor_name = "basemap_plane"
+        self._xyz_connections: dict = {}
 
         root = QVBoxLayout(self)
         splitter = QSplitter(Qt.Horizontal, self)
@@ -287,10 +368,19 @@ class Gpr3dViewerDialog(QDialog):
         self._plotter = QtInteractor(left)
         if hasattr(self._plotter, "interactor"):
             left_layout.addWidget(self._plotter.interactor)
+            try:
+                self._plotter.interactor.installEventFilter(self)
+            except Exception:
+                pass
         else:
             left_layout.addWidget(self._plotter)
 
-        right = QWidget(splitter)
+        right_scroll = QScrollArea(splitter)
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QScrollArea.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        right = QWidget()
+        right_scroll.setWidget(right)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(6, 6, 6, 6)
 
@@ -305,20 +395,57 @@ class Gpr3dViewerDialog(QDialog):
         form.addRow("Section:", self._section_combo)
 
         slice_row = QWidget()
-        slice_row_l = QHBoxLayout(slice_row)
-        slice_row_l.setContentsMargins(0, 0, 0, 0)
-        self._slice_slider = QSlider(Qt.Horizontal)
+        slice_row_v = QVBoxLayout(slice_row)
+        slice_row_v.setContentsMargins(0, 0, 0, 0)
+
+        slider_row = QWidget()
+        slider_row_l = QHBoxLayout(slider_row)
+        slider_row_l.setContentsMargins(0, 0, 0, 0)
+        self._slice_slider = QSlider(Qt.Vertical)
         self._slice_slider.setTracking(True)
+        self._slice_slider.setInvertedAppearance(True)
+        self._slice_slider.setMinimumHeight(220)
         self._slice_slider.valueChanged.connect(self._on_slice_changed)
+        self._slice_minimap = _DepthMinimapWidget()
+        self._slice_minimap.setMinimumHeight(220)
+        self._slice_minimap.setFixedWidth(20)
+        self._slice_minimap.levelClicked.connect(self._on_minimap_clicked)
+        slider_row_l.addWidget(self._slice_slider, 0)
+        slider_row_l.addWidget(self._slice_minimap, 0)
+        slider_row_l.addStretch(1)
+        slice_row_v.addWidget(slider_row)
+
+        info_row = QWidget()
+        info_row_l = QHBoxLayout(info_row)
+        info_row_l.setContentsMargins(0, 0, 0, 0)
         self._slice_spin = QSpinBox()
         self._slice_spin.setRange(0, 0)
         self._slice_spin.setMinimumWidth(72)
         self._slice_spin.valueChanged.connect(self._on_slice_spin_changed)
         self._lbl_slice = QLabel("-")
-        self._lbl_slice.setMinimumWidth(160)
-        slice_row_l.addWidget(self._slice_slider, 1)
-        slice_row_l.addWidget(self._slice_spin, 0)
-        slice_row_l.addWidget(self._lbl_slice, 0)
+        self._lbl_slice.setMinimumWidth(140)
+        info_row_l.addWidget(self._slice_spin, 0)
+        info_row_l.addWidget(self._lbl_slice, 1)
+        slice_row_v.addWidget(info_row)
+
+        step_row = QWidget()
+        step_row_l = QHBoxLayout(step_row)
+        step_row_l.setContentsMargins(0, 0, 0, 0)
+        step_row_l.addWidget(QLabel("Passo:"), 0)
+        self._slice_step_spin = QDoubleSpinBox()
+        self._slice_step_spin.setDecimals(2)
+        self._slice_step_spin.setRange(0.01, 20.0)
+        self._slice_step_spin.setSingleStep(0.01)
+        self._slice_step_spin.setValue(0.10)
+        self._slice_step_spin.setSuffix(" m")
+        self._slice_step_spin.setToolTip(
+            "Passo di avanzamento per la rotellina del mouse sulla vista 3D "
+            "e per la minimappa (scelta libera, es. 0.02/0.10/0.20 m)."
+        )
+        step_row_l.addWidget(self._slice_step_spin, 0)
+        step_row_l.addStretch(1)
+        slice_row_v.addWidget(step_row)
+
         form.addRow("Slice index:", slice_row)
 
         self._chk_follow_profile_depth = QCheckBox()
@@ -360,16 +487,6 @@ class Gpr3dViewerDialog(QDialog):
         ch_row_l.addWidget(self._lbl_channel_count, 0)
         ch_row_l.addStretch(1)
         form.addRow("Radargram channel:", ch_row)
-
-        self._profile_color_combo = QComboBox()
-        self._profile_color_combo.addItem("Solid Yellow", "solid_yellow")
-        self._profile_color_combo.addItem("Solid Cyan", "solid_cyan")
-        self._profile_color_combo.addItem("Solid White", "solid_white")
-        self._profile_color_combo.addItem("Palette Turbo", "palette_turbo")
-        self._profile_color_combo.addItem("Palette Viridis", "palette_viridis")
-        self._profile_color_combo.addItem("Palette Plasma", "palette_plasma")
-        self._profile_color_combo.currentIndexChanged.connect(self._on_profile_color_changed)
-        form.addRow("Profiles color:", self._profile_color_combo)
 
         clip_row = QWidget()
         clip_row_l = QHBoxLayout(clip_row)
@@ -448,10 +565,74 @@ class Gpr3dViewerDialog(QDialog):
         self._chk_show_profiles.toggled.connect(self._on_show_profiles_toggled)
         form.addRow("Show profiles:", self._chk_show_profiles)
 
+        variant_row = QWidget()
+        variant_row_l = QHBoxLayout(variant_row)
+        variant_row_l.setContentsMargins(0, 0, 0, 0)
+        self._variant_combo = QComboBox()
+        self._variant_combo.setMinimumWidth(110)
+        self._btn_load_variant = QPushButton("Carica")
+        self._btn_load_variant.setToolTip(
+            "Carica tutti i profili processati della variante selezionata "
+            "(sostituisce i profili attualmente mostrati) e passa alla "
+            "modalita' 'Radargram profile' per scorrerli come le time-slice."
+        )
+        self._btn_load_variant.setEnabled(False)
+        self._btn_load_variant.clicked.connect(self._on_load_variant)
+        self._btn_browse_variant = QPushButton("...")
+        self._btn_browse_variant.setFixedWidth(28)
+        self._btn_browse_variant.setToolTip("Sfoglia una cartella variante non elencata qui")
+        self._btn_browse_variant.clicked.connect(self._on_browse_variant_folder)
+        variant_row_l.addWidget(self._variant_combo, 1)
+        variant_row_l.addWidget(self._btn_load_variant, 0)
+        variant_row_l.addWidget(self._btn_browse_variant, 0)
+        form.addRow("Variante profili:", variant_row)
+
         self._chk_parallel_proj = QCheckBox()
         self._chk_parallel_proj.setChecked(True)
         self._chk_parallel_proj.toggled.connect(self._on_projection_toggled)
         form.addRow("Parallel view:", self._chk_parallel_proj)
+
+        basemap_row = QWidget()
+        basemap_row_l = QHBoxLayout(basemap_row)
+        basemap_row_l.setContentsMargins(0, 0, 0, 0)
+        self._chk_basemap = QCheckBox()
+        self._chk_basemap.setChecked(False)
+        self._chk_basemap.setEnabled(False)
+        self._chk_basemap.toggled.connect(self._on_basemap_toggled)
+        self._basemap_combo = QComboBox()
+        self._basemap_combo.setMinimumWidth(120)
+        self._basemap_combo.currentIndexChanged.connect(self._on_basemap_source_changed)
+        self._btn_basemap_refresh = QPushButton("Aggiorna")
+        self._btn_basemap_refresh.setToolTip(
+            "Ricarica le connessioni XYZ Tiles configurate in QGIS "
+            "(Browser > XYZ Tiles)."
+        )
+        self._btn_basemap_refresh.clicked.connect(self._reload_xyz_connections)
+        basemap_row_l.addWidget(self._chk_basemap, 0)
+        basemap_row_l.addWidget(self._basemap_combo, 1)
+        basemap_row_l.addWidget(self._btn_basemap_refresh, 0)
+        form.addRow("Base satellitare:", basemap_row)
+
+        self._basemap_opacity_spin = QDoubleSpinBox()
+        self._basemap_opacity_spin.setDecimals(2)
+        self._basemap_opacity_spin.setRange(0.05, 1.0)
+        self._basemap_opacity_spin.setSingleStep(0.05)
+        self._basemap_opacity_spin.setValue(0.85)
+        self._basemap_opacity_spin.valueChanged.connect(self._on_basemap_opacity_changed)
+        form.addRow("Opacita' base:", self._basemap_opacity_spin)
+
+        self._basemap_z_spin = QDoubleSpinBox()
+        self._basemap_z_spin.setDecimals(3)
+        self._basemap_z_spin.setRange(-1000.0, 1000.0)
+        self._basemap_z_spin.setSingleStep(0.1)
+        self._basemap_z_spin.setValue(0.0)
+        self._basemap_z_spin.setSuffix(" m")
+        self._basemap_z_spin.setToolTip(
+            "Profondita' (m) a cui posizionare il piano della base satellitare "
+            "(0 = livello del C-scan piu' superficiale)."
+        )
+        self._basemap_z_spin.valueChanged.connect(self._on_basemap_z_changed)
+        form.addRow("Quota base:", self._basemap_z_spin)
 
         right_layout.addLayout(form)
         if _HAS_MPL:
@@ -519,12 +700,14 @@ class Gpr3dViewerDialog(QDialog):
         right_layout.addStretch(1)
 
         splitter.addWidget(left)
-        splitter.addWidget(right)
+        splitter.addWidget(right_scroll)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([980, 300])
+        splitter.setSizes([980, 340])
 
         self._refresh_channel_controls()
+        self._reload_xyz_connections()
+        self._reload_variant_list()
         self._replace_volume(self._volume, self._meta, reset_camera=True)
 
     def _grid_spatial_info(self, vol: np.ndarray, meta: dict) -> dict:
@@ -791,11 +974,6 @@ class Gpr3dViewerDialog(QDialog):
         self._refresh_section_plane()
         self._render_now()
 
-    def _on_profile_color_changed(self, _idx: int):
-        self._profile_color_mode = str(self._profile_color_combo.currentData() or "solid_yellow")
-        self._load_profiles(self._profiles)
-        self._render_now()
-
     def _on_follow_profile_toggled(self, checked: bool):
         if not bool(checked):
             self._remove_actor(self._cursor_slice_name)
@@ -871,10 +1049,12 @@ class Gpr3dViewerDialog(QDialog):
         if raw.ndim != 2 or raw.size <= 0:
             return None
 
+        preprocessed = bool(getattr(prof, "_preprocessed", False))
         params = dict(self._meta.get("pipeline_params") or {})
-        use_proc = bool(self._meta.get("use_processing", False))
+        use_proc = bool(self._meta.get("use_processing", False)) and not preprocessed
         cache_key = (
             str(getattr(prof, "path", "")),
+            int(id(prof)) if preprocessed else 0,
             int(self._profile_channel_index(prof)),
             bool(use_proc),
             repr(sorted(params.items())),
@@ -1371,6 +1551,17 @@ class Gpr3dViewerDialog(QDialog):
         except Exception:
             pass
 
+        if self._z_axis.size:
+            self._updating_controls = True
+            try:
+                self._basemap_z_spin.setValue(float(self._z_axis.min()))
+            finally:
+                self._updating_controls = False
+        try:
+            self._refresh_basemap_plane()
+        except Exception:
+            pass
+
         if reset_camera:
             self._apply_camera_for_mode(self._current_section_mode())
         else:
@@ -1389,6 +1580,23 @@ class Gpr3dViewerDialog(QDialog):
 
     def _current_section_mode(self) -> str:
         return str(self._section_combo.currentData() or "cscan")
+
+    def _current_slice_axis_values(self) -> np.ndarray:
+        """Valori fisici (m) allineati agli indici dello slider per la
+        modalita' di sezione corrente; usati per il passo libero e la
+        minimappa di profondita'."""
+        mode = self._current_section_mode()
+        res = float(self._spatial.get("res", 1.0) or 1.0)
+        if mode == "inline":
+            n_y = max(1, int(self._spatial.get("n_y", 1)))
+            return np.arange(n_y, dtype=np.float64) * res
+        if mode == "crossline":
+            n_x = max(1, int(self._spatial.get("n_x", 1)))
+            return np.arange(n_x, dtype=np.float64) * res
+        if mode == "profile":
+            n = max(1, len(self._profiles))
+            return np.arange(n, dtype=np.float64)
+        return self._z_axis.astype(np.float64) if self._z_axis.size else np.zeros(0, dtype=np.float64)
 
     def _update_slice_slider_range(self):
         mode = self._current_section_mode()
@@ -1409,9 +1617,16 @@ class Gpr3dViewerDialog(QDialog):
             self._slice_spin.setRange(0, n - 1)
             self._slice_slider.setValue(cur)
             self._slice_spin.setValue(cur)
+            self._slice_slider.setEnabled(True)
+            self._slice_spin.setEnabled(True)
         finally:
             self._updating_controls = False
         self._update_slice_label(cur)
+        axis_values = self._current_slice_axis_values()
+        if axis_values.size:
+            self._slice_minimap.set_levels(axis_values, cur)
+        else:
+            self._slice_minimap.set_levels(np.zeros(0, dtype=np.float64), 0)
 
     def _update_slice_label(self, idx: int):
         mode = self._current_section_mode()
@@ -1666,11 +1881,12 @@ class Gpr3dViewerDialog(QDialog):
         self._render_now()
 
     def _on_section_mode_changed(self, _idx: int):
+        mode = self._current_section_mode()
         self._refresh_channel_controls(self._profiles)
         self._update_slice_slider_range()
         self._load_profiles(self._profiles)
         self._refresh_section_plane()
-        self._apply_camera_for_mode(self._current_section_mode())
+        self._apply_camera_for_mode(mode)
 
     def _on_slice_spin_changed(self, idx: int):
         if self._updating_controls:
@@ -1692,12 +1908,51 @@ class Gpr3dViewerDialog(QDialog):
             finally:
                 self._updating_controls = False
         self._update_slice_label(idx_i)
+        self._slice_minimap.set_current(idx_i)
         self._refresh_section_plane()
         if self._current_section_mode() == "cscan" and not self._suppress_depth_emit:
             try:
                 self.depth_changed.emit(float(self._depth_at_index(idx_i)))
             except Exception:
                 pass
+
+    def _on_minimap_clicked(self, idx: int):
+        if not self._slice_slider.isEnabled():
+            return
+        self._slice_slider.setValue(int(idx))
+
+    def _step_slice(self, direction: int):
+        if not self._slice_slider.isEnabled():
+            return
+        values = self._current_slice_axis_values()
+        if values.size <= 1:
+            return
+        idx = int(np.clip(self._slice_slider.value(), 0, values.size - 1))
+        step = float(self._slice_step_spin.value())
+        target = float(values[idx]) + (step if direction > 0 else -step)
+        new_idx = int(np.argmin(np.abs(values - target)))
+        if new_idx == idx:
+            # Passo piu' piccolo dello spacing disponibile: avanza comunque
+            # di un livello nella direzione richiesta.
+            new_idx = idx + (1 if direction > 0 else -1)
+        new_idx = int(np.clip(new_idx, 0, values.size - 1))
+        if new_idx != idx:
+            self._slice_slider.setValue(new_idx)
+
+    def eventFilter(self, obj, event):
+        try:
+            if (
+                event.type() == QEvent.Wheel
+                and hasattr(self._plotter, "interactor")
+                and obj is self._plotter.interactor
+            ):
+                delta = event.angleDelta().y()
+                if delta != 0:
+                    self._step_slice(1 if delta > 0 else -1)
+                    return True
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
 
     def _on_threshold_slider_changed(self, value: int):
         if self._updating_controls:
@@ -2026,6 +2281,295 @@ class Gpr3dViewerDialog(QDialog):
                 pass
         self._profile_actor_count = len(profiles)
 
+    def _reload_variant_list(self):
+        self._variant_combo.blockSignals(True)
+        try:
+            self._variant_combo.clear()
+            self._variant_choices = []
+            if self._processed_root:
+                try:
+                    from .radargram_store import discover_variants
+                    variants = discover_variants(self._processed_root)
+                except Exception:
+                    variants = []
+                for v in variants:
+                    self._variant_combo.addItem(f"{v.name} ({v.n_files})", v.path)
+                    self._variant_choices.append(v)
+        finally:
+            self._variant_combo.blockSignals(False)
+        self._btn_load_variant.setEnabled(self._variant_combo.count() > 0)
+
+    def _on_load_variant(self):
+        path = str(self._variant_combo.currentData() or "")
+        if not path or not os.path.isdir(path):
+            QMessageBox.information(self, "Carica variante", "Seleziona prima una variante valida.")
+            return
+        self._load_profiles_from_variant_dir(path)
+
+    def _on_browse_variant_folder(self):
+        start_dir = self._processed_root or ""
+        path = QFileDialog.getExistingDirectory(self, "Seleziona cartella variante processata", start_dir)
+        if not path:
+            return
+        self._load_profiles_from_variant_dir(path)
+
+    def _load_profiles_from_variant_dir(self, variant_dir: str):
+        try:
+            files = sorted(f for f in os.listdir(variant_dir) if f.lower().endswith(".npz"))
+        except OSError as exc:
+            QMessageBox.warning(self, "Carica variante", f"Impossibile leggere la cartella:\n{exc}")
+            return
+        if not files:
+            QMessageBox.information(self, "Carica variante", "Nessun file .npz trovato in questa cartella.")
+            return
+        try:
+            from .gpr_npz_io import load_processed_profile_npz
+        except Exception as exc:
+            QMessageBox.warning(self, "Carica variante", f"Modulo di caricamento non disponibile:\n{exc}")
+            return
+
+        loaded = []
+        errors = []
+        for fname in files:
+            p = os.path.join(variant_dir, fname)
+            try:
+                prof = load_processed_profile_npz(p)
+            except Exception as exc:
+                errors.append(f"{fname}: {exc}")
+                continue
+            if not getattr(prof, "channels", None):
+                errors.append(f"{fname}: nessun canale valido nel file.")
+                continue
+            prof._preprocessed = True
+            try:
+                self._reproject_profile_if_needed(prof)
+            except Exception:
+                pass
+            loaded.append(prof)
+
+        if not loaded:
+            if errors:
+                QMessageBox.warning(self, "Carica variante", "Nessun profilo caricato:\n" + "\n".join(errors))
+            return
+
+        self._profiles = loaded
+        self._profile_curtain_cache = {}
+        variant_label = os.path.basename(os.path.normpath(variant_dir))
+
+        profile_idx = self._section_combo.findData("profile")
+        if profile_idx >= 0 and self._section_combo.currentIndex() != profile_idx:
+            # Passa a "profile": _on_section_mode_changed ricostruisce gia'
+            # channel controls / slider / curtains / section plane.
+            self._section_combo.setCurrentIndex(profile_idx)
+        else:
+            self._refresh_channel_controls(self._profiles)
+            self._update_slice_slider_range()
+            self._load_profiles(self._profiles)
+            self._refresh_section_plane()
+
+        msg = f"Variante '{variant_label}': {len(loaded)} profilo/i caricato/i."
+        if errors:
+            msg += f" {len(errors)} file scartati."
+        self._status.setText(msg)
+        if errors:
+            QMessageBox.warning(
+                self, "Carica variante", "Alcuni file non sono stati caricati:\n" + "\n".join(errors)
+            )
+
+    def _reproject_profile_if_needed(self, prof):
+        """Riproietta easting/northing del profilo se il suo EPSG differisce
+        da quello del volume corrente (i .npz processati registrano l'EPSG
+        della sorgente al momento del salvataggio)."""
+        try:
+            src_epsg = int(getattr(prof, "epsg", 0) or 0)
+            dst_epsg = int(self._meta.get("epsg", 0) or 0)
+        except Exception:
+            return
+        if src_epsg <= 0 or dst_epsg <= 0 or src_epsg == dst_epsg:
+            return
+        try:
+            from qgis.core import (
+                QgsCoordinateReferenceSystem,
+                QgsCoordinateTransform,
+                QgsPointXY,
+                QgsProject,
+            )
+        except Exception:
+            return
+        src_crs = QgsCoordinateReferenceSystem(f"EPSG:{src_epsg}")
+        dst_crs = QgsCoordinateReferenceSystem(f"EPSG:{dst_epsg}")
+        if not src_crs.isValid() or not dst_crs.isValid():
+            return
+        try:
+            xform = QgsCoordinateTransform(src_crs, dst_crs, QgsProject.instance())
+        except Exception:
+            return
+
+        for ci in range(int(getattr(prof, "n_channels", 0) or 0)):
+            try:
+                ch = prof.channel(ci)
+            except Exception:
+                continue
+            e = np.asarray(getattr(ch, "easting", []), dtype=np.float64)
+            n = np.asarray(getattr(ch, "northing", []), dtype=np.float64)
+            if e.size == 0 or e.size != n.size:
+                continue
+            new_e = np.empty_like(e)
+            new_n = np.empty_like(n)
+            for i in range(e.size):
+                try:
+                    pt = xform.transform(QgsPointXY(float(e[i]), float(n[i])))
+                    new_e[i] = pt.x()
+                    new_n[i] = pt.y()
+                except Exception:
+                    new_e[i] = e[i]
+                    new_n[i] = n[i]
+            ch.easting = new_e
+            ch.northing = new_n
+        prof.epsg = dst_epsg
+
+    def _reload_xyz_connections(self):
+        try:
+            from .gpr_3d_basemap import list_xyz_connections
+            self._xyz_connections = list_xyz_connections()
+        except Exception:
+            self._xyz_connections = {}
+
+        current = str(self._basemap_combo.currentText() or "")
+        self._basemap_combo.blockSignals(True)
+        try:
+            self._basemap_combo.clear()
+            for name in sorted(self._xyz_connections.keys()):
+                self._basemap_combo.addItem(name)
+            if current:
+                i = self._basemap_combo.findText(current)
+                if i >= 0:
+                    self._basemap_combo.setCurrentIndex(i)
+        finally:
+            self._basemap_combo.blockSignals(False)
+
+        has_conn = bool(self._xyz_connections)
+        self._chk_basemap.setEnabled(has_conn)
+        if not has_conn:
+            self._chk_basemap.setChecked(False)
+            self._chk_basemap.setToolTip(
+                "Nessuna connessione XYZ Tiles trovata in QGIS.\n"
+                "Aggiungine una da Browser > XYZ Tiles > Nuova connessione."
+            )
+        else:
+            self._chk_basemap.setToolTip("")
+
+    def _on_basemap_toggled(self, _checked: bool):
+        if self._updating_controls:
+            return
+        self._refresh_basemap_plane()
+
+    def _on_basemap_source_changed(self, _idx: int):
+        if self._updating_controls:
+            return
+        if bool(self._chk_basemap.isChecked()):
+            self._refresh_basemap_plane()
+
+    def _on_basemap_opacity_changed(self, _value: float):
+        if self._updating_controls:
+            return
+        if bool(self._chk_basemap.isChecked()):
+            self._refresh_basemap_plane()
+
+    def _on_basemap_z_changed(self, _value: float):
+        if self._updating_controls:
+            return
+        if bool(self._chk_basemap.isChecked()):
+            self._refresh_basemap_plane()
+
+    def _refresh_basemap_plane(self):
+        self._remove_actor(self._basemap_actor_name)
+        if not bool(self._chk_basemap.isChecked()):
+            self._render_now()
+            return
+
+        name = str(self._basemap_combo.currentText() or "")
+        info = self._xyz_connections.get(name)
+        if not info or not info.get("url"):
+            self._status.setText("Base satellitare: nessuna connessione XYZ selezionata.")
+            self._render_now()
+            return
+
+        try:
+            epsg = int(self._meta.get("epsg", 0) or 0)
+        except Exception:
+            epsg = 0
+        if epsg <= 0:
+            self._status.setText(
+                "Base satellitare: EPSG del volume sconosciuto, impossibile allineare la base."
+            )
+            return
+
+        res = float(self._spatial.get("res", 1.0) or 1.0)
+        n_x = int(self._spatial.get("n_x", 0))
+        n_y = int(self._spatial.get("n_y", 0))
+        real_xmin = float(self._spatial.get("x_min", 0.0) or 0.0)
+        real_ymin = float(self._spatial.get("y_min", 0.0) or 0.0)
+        real_xmax = real_xmin + n_x * res
+        real_ymax = real_ymin + n_y * res
+        if n_x <= 0 or n_y <= 0 or real_xmax <= real_xmin or real_ymax <= real_ymin:
+            return
+
+        try:
+            from .gpr_3d_basemap import fetch_basemap_texture
+        except Exception as exc:
+            self._status.setText(f"Base satellitare non disponibile: {exc}")
+            return
+
+        zmin = int(info.get("zmin", -1) or -1)
+        zmax = int(info.get("zmax", -1) or -1)
+        zmin = zmin if zmin >= 0 else 0
+        zmax = zmax if zmax >= 0 else 19
+
+        self._status.setText("Base satellitare: scaricamento tile in corso...")
+        try:
+            rgb, bbox = fetch_basemap_texture(
+                str(info["url"]),
+                (real_xmin, real_ymin, real_xmax, real_ymax),
+                epsg,
+                max_px=1536,
+                zmin=zmin,
+                zmax=zmax,
+            )
+        except Exception as exc:
+            self._status.setText(f"Base satellitare: errore scaricamento tile ({exc}).")
+            self._updating_controls = True
+            try:
+                self._chk_basemap.setChecked(False)
+            finally:
+                self._updating_controls = False
+            return
+
+        x0_l, y0_l = self._world_to_local_xy(bbox[0], bbox[1])
+        x1_l, y1_l = self._world_to_local_xy(bbox[2], bbox[3])
+        z_local = -float(self._basemap_z_spin.value())
+
+        try:
+            quad = pv.StructuredGrid(
+                np.array([[x0_l, x1_l], [x0_l, x1_l]], dtype=np.float64),
+                np.array([[y0_l, y0_l], [y1_l, y1_l]], dtype=np.float64),
+                np.array([[z_local, z_local], [z_local, z_local]], dtype=np.float64),
+            )
+            quad = quad.texture_map_to_plane(inplace=False)
+            tex = pv.numpy_to_texture(np.ascontiguousarray(rgb[::-1, :, :]))
+            self._plotter.add_mesh(
+                quad,
+                texture=tex,
+                name=self._basemap_actor_name,
+                opacity=float(self._basemap_opacity_spin.value()),
+                lighting=False,
+            )
+        except Exception as exc:
+            self._status.setText(f"Base satellitare: impossibile applicare la texture ({exc}).")
+            return
+        self._render_now()
+        self._status.setText("Base satellitare caricata.")
+
     def update_cursor_position(self, east: float, north: float, depth: float):
         """Update 3D marker and horizontal slice from profile cursor."""
         if self._volume_grid is None:
@@ -2112,6 +2656,11 @@ class Gpr3dViewerDialog(QDialog):
             self._suppress_depth_emit = False
 
     def closeEvent(self, event):
+        try:
+            if self._plotter is not None and hasattr(self._plotter, "interactor"):
+                self._plotter.interactor.removeEventFilter(self)
+        except Exception:
+            pass
         try:
             if self._plotter is not None:
                 self._plotter.close()

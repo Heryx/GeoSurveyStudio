@@ -2344,8 +2344,10 @@ def write_grids_to_tifs(
         iz = item["index"]
         grid = item["grid"]
         _validate_grid_georef_meta(meta, grid=np.asarray(grid))
-        z_label = f"{z_lev:.4f}".replace(".", "_").replace("-", "m")
-        tif_name = f"slice_{iz:04d}_z{z_label}.tif"
+        # La finestra di profondita' sta nel nome: resta leggibile anche dopo
+        # la copia nel progetto e come nome del layer nel canvas.
+        from .slice_manifest import slice_file_name as _slice_file_name
+        tif_name = _slice_file_name(iz, item["z_from"], item["z_to"])
         tif_path = os.path.join(output_dir, tif_name)
 
         _write_tif_singleband(grid, tif_path, x_min, y_min, y_max, res, epsg)

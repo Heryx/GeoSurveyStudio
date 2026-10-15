@@ -85,6 +85,7 @@ class UiLayoutMixin:
         self._locked_group_raster_sources = {}
         self.group_tools_label = None
         self.image_tools_label = None
+        self.group_actions_widget = None
         self.load_groups_button = None
         self.import_las_slice_button = None
         self.import_csv_slice_button = None
@@ -214,16 +215,14 @@ class UiLayoutMixin:
         tabs.setUsesScrollButtons(False)
 
         # ── TAB: Groups ────────────────────────────────────────────────
+        # Frequently-used group actions (Load/Manage/Zoom/Create) live on the
+        # main GeoSurvey Studio page instead (see `_build_group_actions_panel`).
+        # This tab only keeps the heavier, occasional build/import workflows.
         group_tab = QWidget(tabs)
         group_layout = QGridLayout(group_tab)
         group_layout.setContentsMargins(6, 6, 6, 6)
         group_layout.setHorizontalSpacing(8)
         group_layout.setVerticalSpacing(6)
-        if self.load_groups_button is not None:
-            group_layout.addWidget(self.load_groups_button, 0, 0, 1, 1)
-        group_layout.addWidget(self.dlg.zoomSelectedGroupsButton, 0, 1, 1, 1)
-        group_layout.addWidget(self.import_groups_button, 1, 0, 1, 1)
-        group_layout.addWidget(self.dlg.createGroupButton, 1, 1, 1, 1)
         self.import_las_slice_button = QPushButton("Import LAS \u2192 Slice", group_tab)
         self.import_las_slice_button.setObjectName("importLasSliceButton")
         self.import_las_slice_button.setToolTip(
@@ -234,7 +233,7 @@ class UiLayoutMixin:
             "Richiede: PDAL nel PATH + laspy>=2.0"
         )
         self.import_las_slice_button.clicked.connect(self.import_las_as_slices)
-        group_layout.addWidget(self.import_las_slice_button, 2, 0, 1, 1)
+        group_layout.addWidget(self.import_las_slice_button, 0, 0, 1, 1)
         self.import_csv_slice_button = QPushButton("Import CSV -> Slice", group_tab)
         self.import_csv_slice_button.setObjectName("importCsvSliceButton")
         self.import_csv_slice_button.setToolTip(
@@ -243,12 +242,10 @@ class UiLayoutMixin:
             "con opzione banda singola o RGB."
         )
         self.import_csv_slice_button.clicked.connect(self.import_csv_as_slices)
-        group_layout.addWidget(self.import_csv_slice_button, 2, 1, 1, 1)
-        if hasattr(self.dlg, "groupNameEdit"):
-            group_layout.addWidget(self.dlg.groupNameEdit, 3, 0, 1, 2)
+        group_layout.addWidget(self.import_csv_slice_button, 0, 1, 1, 1)
         group_layout.setColumnStretch(0, 1)
         group_layout.setColumnStretch(1, 1)
-        group_layout.setRowStretch(4, 1)
+        group_layout.setRowStretch(1, 1)
 
         # ── TAB: Images ────────────────────────────────────────────────
         image_tab = QWidget(tabs)
@@ -628,6 +625,44 @@ class UiLayoutMixin:
                     self.export_scale_spin.setValue(sc)
         except Exception:
             pass
+
+    def _build_group_actions_panel(self):
+        """Add the core group actions (Load/Manage/Zoom/Create) to the main
+        GeoSurvey Studio page, right under the group list. These are used on
+        every project so they stay on the main page instead of the separate
+        Tools dock; heavier one-off workflows (LAS/CSV import) stay in Tools."""
+        if self.dlg is None or self.group_actions_widget is not None:
+            return
+        if not hasattr(self.dlg, "verticalLayout_3"):
+            return
+
+        panel = QWidget(self.dlg.layoutWidget)
+        panel.setObjectName("groupActionsPanel")
+        layout = QGridLayout(panel)
+        layout.setContentsMargins(0, 2, 0, 4)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(6)
+        if self.load_groups_button is not None:
+            layout.addWidget(self.load_groups_button, 0, 0, 1, 1)
+        if self.import_groups_button is not None:
+            layout.addWidget(self.import_groups_button, 0, 1, 1, 1)
+        layout.addWidget(self.dlg.zoomSelectedGroupsButton, 1, 0, 1, 1)
+        layout.addWidget(self.dlg.createGroupButton, 1, 1, 1, 1)
+        if hasattr(self.dlg, "groupNameEdit"):
+            layout.addWidget(self.dlg.groupNameEdit, 2, 0, 1, 2)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+        self.group_actions_widget = panel
+
+        vl = self.dlg.verticalLayout_3
+        group_list = getattr(self.dlg, "groupListWidget", None)
+        insert_index = vl.count()
+        for idx in range(vl.count()):
+            item = vl.itemAt(idx)
+            if item is not None and item.widget() is group_list:
+                insert_index = idx + 1
+                break
+        vl.insertWidget(insert_index, panel)
 
     def _update_tools_button_text(self, collapsed):
         btn = getattr(self, "tools_collapse_button", None)

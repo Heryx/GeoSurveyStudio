@@ -68,9 +68,15 @@ class ProjectManagerTimesliceImportMixin:
         self.settings.setValue(self.settings_key_default_import_crs, selected.authid())
         self.iface.messageBar().pushInfo("GeoSurvey Studio", f"Default import CRS set to {selected.authid()}")
 
-    def _get_or_create_qgis_group(self, group_name):
+    def _get_or_create_qgis_group_path(self, path_parts):
+        """Naviga/crea un percorso di sottogruppi annidati sotto il gruppo
+        radice "GeoSurvey Studio" (``path_parts`` vuoto ritorna la radice
+        stessa). Usato sia per l'import time-slice "piatto" esistente
+        (un solo livello) sia per l'import cross-progetto (due livelli:
+        "Imported — <progetto>" / "<nome gruppo>"), cosi' due progetti
+        sorgente diversi non si mescolano sotto lo stesso nodo."""
         root = QgsProject.instance().layerTreeRoot()
-        plugin_root = next(
+        current = next(
             (
                 g
                 for g in root.children()
@@ -78,28 +84,28 @@ class ProjectManagerTimesliceImportMixin:
             ),
             None,
         )
-        if plugin_root is None:
-            plugin_root = root.addGroup("GeoSurvey Studio")
+        if current is None:
+            current = root.addGroup("GeoSurvey Studio")
+        for part in path_parts or []:
+            nxt = next(
+                (g for g in current.children() if hasattr(g, "name") and g.name() == part),
+                None,
+            )
+            if nxt is None:
+                nxt = current.addGroup(part)
+            current = nxt
+        return current
 
-        target = next(
-            (
-                g
-                for g in plugin_root.children()
-                if hasattr(g, "name") and g.name() == group_name
-            ),
-            None,
-        )
-        if target is None:
-            target = plugin_root.addGroup(group_name)
-        return target
+    def _get_or_create_qgis_group(self, group_name):
+        return self._get_or_create_qgis_group_path([group_name])
 
-    def _load_timeslice_paths_into_qgis_group(self, paths, group_name):
+    def _load_raster_paths_into_group(self, paths, group, target_crs=None):
         if not paths:
-            return 0
-        target_group = self._get_or_create_qgis_group(group_name)
+            return []
+        if target_crs is None:
+            target_crs = self._get_preferred_import_crs()
         existing_sources = {layer.source() for layer in QgsProject.instance().mapLayers().values()}
-        target_crs = self._get_preferred_import_crs()
-        loaded = 0
+        loaded_layers = []
         for path in paths:
             if not path or not os.path.exists(path) or path in existing_sources:
                 continue
@@ -111,10 +117,88 @@ class ProjectManagerTimesliceImportMixin:
                 raster_layer.setCrs(target_crs)
             apply_embedded_style(raster_layer)
             QgsProject.instance().addMapLayer(raster_layer, False)
-            target_group.addLayer(raster_layer)
+            group.addLayer(raster_layer)
             existing_sources.add(path)
-            loaded += 1
-        return loaded
+            loaded_layers.append(raster_layer)
+        return loaded_layers
+
+    def _load_timeslice_paths_into_qgis_group(self, paths, group_name):
+        target_group = self._get_or_create_qgis_group(group_name)
+        return len(self._load_raster_paths_into_group(paths, target_group))
+
+    def _first_tagged_source_root(self, group, layer_property_utils):
+        for child in group.children():
+            layer_fn = getattr(child, "layer", None)
+            lyr = layer_fn() if callable(layer_fn) else None
+            if lyr is not None:
+                value = layer_property_utils.get_layer_property(lyr, "source_project_root")
+                if value:
+                    return str(value)
+            elif hasattr(child, "children"):
+                found = self._first_tagged_source_root(child, layer_property_utils)
+                if found:
+                    return found
+        return None
+
+    def _cross_project_group_label(self, source_root):
+        """Etichetta del gruppo "Imported — <label>" per ``source_root``: di
+        norma il nome della sua cartella, disambiguato con un suffisso solo
+        se un gruppo con lo stesso nome esiste già ma proviene da un'ALTRA
+        cartella (es. due progetti creati con il nome predefinito
+        "GPR_Project"). Il confronto usa il tag ``source_project_root``
+        scritto sui layer al momento dell'import (vedi
+        ``_import_cross_project_group``), non solo il nome del gruppo."""
+        from . import layer_property_utils
+
+        plugin_root = self._get_or_create_qgis_group_path([])
+        base_label = os.path.basename(os.path.normpath(source_root)) or str(source_root)
+        source_norm = os.path.normcase(os.path.normpath(source_root))
+        label = base_label
+        suffix = 2
+        while True:
+            container_name = f"Imported — {label}"
+            existing = next(
+                (g for g in plugin_root.children() if hasattr(g, "name") and g.name() == container_name),
+                None,
+            )
+            if existing is None:
+                return label
+            tagged = self._first_tagged_source_root(existing, layer_property_utils)
+            if not tagged or os.path.normcase(os.path.normpath(tagged)) == source_norm:
+                return label
+            label = f"{base_label} ({suffix})"
+            suffix += 1
+
+    def _import_cross_project_group(self, source_root, group_record):
+        """Importa nel canvas corrente le time-slice di ``group_record``
+        (una riga ``raster_groups`` del catalogo di un'ALTRA project_root),
+        come riferimenti di sola lettura: non tocca il catalogo del
+        progetto corrente (vedi ``cross_project_import_dialog.py`` sul
+        perché), solo il canvas. I layer caricati vengono taggati con la
+        project_root sorgente cosi' "Chiudi progetto precedente"
+        (``project_layer_cleanup.py``) puo' ripulirli in seguito. Ritorna
+        il numero di layer effettivamente caricati."""
+        from . import layer_property_utils
+        from .project_catalog import load_catalog
+
+        label = self._cross_project_group_label(source_root)
+        group_name = str(group_record.get("name") or "Group")
+        target_group = self._get_or_create_qgis_group_path([f"Imported — {label}", group_name])
+
+        tids = list(dict.fromkeys(group_record.get("timeslice_ids") or []))
+        catalog = load_catalog(source_root)
+        by_id = {r.get("id"): r for r in catalog.get("timeslices", []) if r.get("id")}
+        paths = [
+            by_id[tid].get("project_path")
+            for tid in tids
+            if tid in by_id and by_id[tid].get("project_path")
+        ]
+
+        loaded_layers = self._load_raster_paths_into_group(paths, target_group)
+        for layer in loaded_layers:
+            layer_property_utils.set_layer_property(layer, "source_project_root", source_root)
+            layer_property_utils.set_layer_property(layer, "import_kind", "cross_project_reference")
+        return len(loaded_layers)
 
     def _inspect_timeslice(self, file_path):
         layer = QgsRasterLayer(file_path, os.path.basename(file_path))

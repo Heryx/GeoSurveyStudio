@@ -76,6 +76,7 @@ from .gpr_hyperbola_math import (
 )
 from .gpr_velocity_store import write_velocity_override
 from .gpr_material_presets import MATERIAL_PRESETS, material_preset
+from .gpr_training_export import export_variant_for_training
 
 try:
     from .gpr_viewer_common import (
@@ -475,13 +476,23 @@ class RadargramDock(QDockWidget):
         root.addWidget(ctrl)
 
         self._cb_variant = _combo(14)
-        self._cb_variant.setToolTip("Radargrammi processati salvati nel progetto (GPR_Processing/processed).")
+        self._cb_variant.setToolTip("Radargrammi processati salvati nel progetto (Processing/processed).")
         self._cb_variant.currentIndexChanged.connect(self._on_variant_changed)
         self._btn_refresh = _tool("\u27f3", "Rileggi le varianti e le coordinate (dopo un nuovo posizionamento o salvataggio).")
         self._btn_refresh.clicked.connect(self.refresh)
         self._btn_browse = _tool("\u2026", "Scegli a mano una cartella-variante (.npz).")
         self._btn_browse.clicked.connect(self._browse_variant)
         flow.addWidget(_group(QLabel("Variante"), self._cb_variant, self._btn_refresh, self._btn_browse))
+
+        self._btn_export_training = QPushButton("Esporta per training")
+        self._btn_export_training.setToolTip(
+            "Scrive su disco, in una cartella a scelta, tutti i profili/canali della\n"
+            "variante aperta in un formato semplice per una pipeline di Deep Learning\n"
+            "esterna: un radargramma.npz per canale, la geometria del posizionamento\n"
+            "attuale (geometry.json) e i parametri di processing (meta.json).\n"
+            "Non modifica nulla nel progetto QGIS.")
+        self._btn_export_training.clicked.connect(self._export_training)
+        flow.addWidget(_group(self._btn_export_training))
 
         self._btn_prev_p = _tool("\u25c0", "Profilo precedente (PgSu)")
         self._btn_prev_p.clicked.connect(lambda: self.select_profile(self._pi - 1))
@@ -729,6 +740,30 @@ class RadargramDock(QDockWidget):
         d = QFileDialog.getExistingDirectory(self, "Cartella con i radargrammi processati (.npz)", start)
         if d:
             self.refresh_variants(select=d)
+
+    def _export_training(self) -> None:
+        """Esporta l'intera variante aperta per la pipeline di Deep Learning esterna
+        (vedi gpr_training_export.py)."""
+        if self._store is None or len(self._store) == 0:
+            self._show_message("Nessuna variante aperta da esportare.")
+            return
+        start = str(QSettings().value(_SETTINGS + "training_export_dir", "") or "") or os.path.expanduser("~")
+        out = QFileDialog.getExistingDirectory(self, "Cartella di destinazione per l'export training (DL)", start)
+        if not out:
+            return
+        QSettings().setValue(_SETTINGS + "training_export_dir", out)
+        try:
+            result = export_variant_for_training(self._store, out)
+        except Exception as exc:
+            self._show_message(f"Export training fallito: {exc}")
+            return
+        n_ok, n_stale, n_err = len(result["exported"]), len(result["stale_geometry"]), len(result["errors"])
+        msg = f"Export training: {n_ok} canali scritti in {os.path.join(out, self._store.name)}"
+        if n_stale:
+            msg += f"  |  {n_stale} con geometria non aggiornata (riapri il Profile Viewer per il posizionamento corrente)"
+        if n_err:
+            msg += f"  |  {n_err} falliti"
+        self._show_message(msg)
 
     def _on_variant_changed(self, _i: int) -> None:
         if self._updating:

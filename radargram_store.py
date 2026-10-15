@@ -4,7 +4,7 @@
 Serve al pannello agganciabile di QGIS (`gpr_radargram_dock`), che deve mostrare
 i profili anche a Profile Viewer chiuso: niente Qt, niente QGIS, solo numpy.
 
-- ``VariantStore`` apre una cartella-variante (`GPR_Processing/processed/<nome>`),
+- ``VariantStore`` apre una cartella-variante (`Processing/processed/<nome>`),
   legge subito solo i metadati di ogni profilo e carica un canale alla volta
   (i .npz sono uno zip con un array per canale: un canale = pochi MB).
 - ``VariantStore.nearest`` trova il profilo/canale/traccia piu' vicino a un
@@ -62,13 +62,13 @@ class VariantRef:
 
 
 def processed_dir_for(root: str) -> str:
-    """`processed/` di un progetto: accetta la radice, la cartella GPR_Processing
+    """`processed/` di un progetto: accetta la radice, la cartella Processing
     o la stessa `processed/`. Stringa vuota se non esiste."""
     root = os.path.normpath(str(root or "").strip())
     if not root or root == ".":
         return ""
     for cand in (
-        os.path.join(root, "GPR_Processing", "processed"),
+        os.path.join(root, "Processing", "processed"),
         os.path.join(root, "processed"),
         root,
     ):
@@ -493,7 +493,7 @@ def slice_info_for_path(raster_path: str) -> Optional[dict]:
 
 
 def variant_dir_from_slice_dir(slice_dir: str, variant: str) -> str:
-    """Cartella `processed/<variante>` che corrisponde a `GPR_Processing/timeslices/<gruppo>/`."""
+    """Cartella `processed/<variante>` che corrisponde a `Processing/timeslices/<gruppo>/`."""
     variant = str(variant or "").strip()
     if not variant or variant.lower() == "raw":
         return ""

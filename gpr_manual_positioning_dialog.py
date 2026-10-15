@@ -171,6 +171,44 @@ def compute_positions(
     return east, north, dist, np.asarray(elev, dtype=np.float64)
 
 
+def original_channel_coords(ch) -> tuple[np.ndarray, np.ndarray]:
+    """(easting, northing) ORIGINALI di un canale.
+
+    Dopo un Posizionamento applicato le coordinate del canale sono quelle
+    calcolate (griglia locale); quelle del file restano in ``_geo_orig``.
+    Rilevamento GPS, inferenza dei versi e anteprima devono leggere sempre
+    queste, altrimenti dopo il primo «Applica» il GPS risulta perso.
+    """
+    orig = getattr(ch, "_geo_orig", None)
+    if orig is not None:
+        try:
+            return (np.asarray(orig[0], dtype=np.float64),
+                    np.asarray(orig[1], dtype=np.float64))
+        except Exception:
+            pass
+    return (np.asarray(getattr(ch, "easting", []), dtype=np.float64),
+            np.asarray(getattr(ch, "northing", []), dtype=np.float64))
+
+
+def restore_original_coords(prof) -> bool:
+    """Ripristina easting/northing/distanze/quota originali (file) su tutti i
+    canali del profilo che sono stati sovrascritti. Ritorna True se ha ripristinato."""
+    done = False
+    for ch in getattr(prof, "channels", None) or []:
+        orig = getattr(ch, "_geo_orig", None)
+        if orig is None:
+            continue
+        try:
+            ch.easting = np.array(orig[0], copy=True)
+            ch.northing = np.array(orig[1], copy=True)
+            ch.distances = np.array(orig[2], copy=True)
+            ch.altitude = np.array(orig[3], copy=True)
+            done = True
+        except Exception:
+            pass
+    return done
+
+
 def check_profiles_have_gps(profiles: list) -> bool:
     """Verifica se almeno un canale dei profili caricati possiede coordinate GPS reali plausibili."""
     if not profiles:
@@ -179,8 +217,7 @@ def check_profiles_have_gps(profiles: list) -> bool:
     for prof in profiles:
         channels = getattr(prof, "channels", []) or []
         for ch in channels:
-            e = np.asarray(getattr(ch, "easting", []), dtype=np.float64)
-            n = np.asarray(getattr(ch, "northing", []), dtype=np.float64)
+            e, n = original_channel_coords(ch)
             _dbg.log("GPSCHECK", f"{os.path.basename(str(getattr(prof, 'path', '?')))} "
                      f"ch{getattr(ch, 'channel_idx', '?')}: {_dbg.describe_track(e, n)}")
             if e.size > 1 and n.size > 1:
@@ -204,7 +241,7 @@ class GprManualPositioningDialog(QDialog):
 
     def __init__(self, profiles: list, project_crs=None, canvas=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Posizionamento Manuale Griglia GPR (Profili senza GPS)")
+        self.setWindowTitle("Posizionamento")
         self.resize(1020, 680)
 
         self._profiles = list(profiles or [])
@@ -219,11 +256,16 @@ class GprManualPositioningDialog(QDialog):
         self._mk_data_cache: dict[int, np.ndarray] = {}
 
         self._build_ui()
+        if getattr(self, "_inferred_reverse_anchor", None) == "far":
+            # «baseline di ritorno» richiede la lunghezza reale dei profili
+            self._chk_real_length.setChecked(True)
+            self._chk_reverse_far.setChecked(True)
         self._recalculate_spacing(auto_detect_dims=True)
         self._update_table_from_items()
         self._draw_preview()
         self._on_pos_mode_changed()
         self._draw_marker_preview()
+        self._update_metadata_panel()
 
     def _init_profile_items(self) -> list[dict]:
         items = []
@@ -259,8 +301,7 @@ class GprManualPositioningDialog(QDialog):
     def _profile_track(prof):
         """(easting, northing) finiti del primo canale con coordinate plausibili, o None."""
         for ch in getattr(prof, "channels", None) or []:
-            e = np.asarray(getattr(ch, "easting", []), dtype=np.float64)
-            n = np.asarray(getattr(ch, "northing", []), dtype=np.float64)
+            e, n = original_channel_coords(ch)
             if e.size < 2 or e.size != n.size:
                 continue
             ok = np.isfinite(e) & np.isfinite(n)
@@ -310,6 +351,41 @@ class GprManualPositioningDialog(QDialog):
             if tr is None:
                 _dbg.log("DIALOG-INIT", f"{items[i]['name']}: coordinate NON utilizzabili, "
                          "restano i default (asse X, non invertito)")
+        self._inferred_reverse_anchor = self._infer_reverse_anchor(tracks, info, ref_sign, items)
+        _dbg.log("DIALOG-INIT", f"ancoraggio linee invertite dedotto dal GPS: "
+                 f"{self._inferred_reverse_anchor or 'indeterminato'}")
+
+    @staticmethod
+    def _infer_reverse_anchor(tracks, info, ref_sign, items) -> "str | None":
+        """«near»/«far» dalle tracce GPS reali, o None se non deducibile.
+
+        Ascissa ``u`` lungo il verso "avanti" di ogni asse: le linee dirette
+        partono da ``u`` minimo. Le invertite sono «near» se FINISCONO sulla
+        stessa baseline da cui partono le dirette, «far» se PARTONO dalla
+        baseline opposta comune (il massimo di ``u`` raggiunto dalla griglia).
+        """
+        votes = {"near": 0, "far": 0}
+        for axis in ("X", "Y"):
+            fwd_first, rev_first, rev_last, fwd_last = [], [], [], []
+            for i, ax, sign, _t in info:
+                if ax != axis:
+                    continue
+                e_, n_ = tracks[i]
+                u = (e_ if axis == "X" else n_) * ref_sign[axis]
+                if items[i]["reversed"]:
+                    rev_first.append(float(u[0])); rev_last.append(float(u[-1]))
+                else:
+                    fwd_first.append(float(u[0])); fwd_last.append(float(u[-1]))
+            if not fwd_first or not rev_first:
+                continue
+            fwd_start = float(np.median(fwd_first))
+            u_hi = max(max(fwd_last), max(rev_first))
+            near_err = float(np.median(np.abs(np.asarray(rev_last) - fwd_start)))
+            far_err = float(np.median(np.abs(np.asarray(rev_first) - u_hi)))
+            votes["far" if (far_err < near_err and near_err > 0.2) else "near"] += 1
+        if not (votes["near"] or votes["far"]):
+            return None
+        return "far" if votes["far"] > votes["near"] else "near"
 
     def _build_ui(self):
         root_layout = QVBoxLayout(self)
@@ -328,7 +404,10 @@ class GprManualPositioningDialog(QDialog):
                 f"<b>{n_gps_hdr}/{n_all_hdr} profili hanno coordinate GPS reali.</b><br>"
                 "L'anteprima mostra le tracce vere (Est a destra, Nord in alto, verso di "
                 "percorrenza reale). Con «Mantieni le coordinate GPS originali» attivo, "
-                "«Applica» non le modifica; disattivalo per forzare la griglia locale."
+                "«Applica» non le modifica: la sezione «Dimensioni Griglia di Rilievo» e le "
+                "colonne Asse/Offset/Invertito/Lunghezza qui sotto sono ignorate per quei "
+                "profili (appaiono in grigio) — servono solo come griglia locale di riserva "
+                "per profili senza GPS, o se disattivi «Mantieni le coordinate GPS originali»."
             )
         lbl_info = QLabel(info_html)
         lbl_info.setWordWrap(True)
@@ -344,7 +423,19 @@ class GprManualPositioningDialog(QDialog):
         left_layout.setContentsMargins(0, 0, 0, 0)
 
         # Group Box Griglia Bounding Box
-        grp_grid = QGroupBox("Dimensioni Griglia di Rilievo")
+        n_gps_box = sum(1 for it in self._profile_items if it.get("has_gps"))
+        grp_grid_title = (
+            "Dimensioni Griglia di Rilievo (fallback — solo profili senza GPS)"
+            if n_gps_box > 0 else "Dimensioni Griglia di Rilievo"
+        )
+        grp_grid = QGroupBox(grp_grid_title)
+        self._grp_grid = grp_grid
+        if n_gps_box > 0:
+            grp_grid.setToolTip(
+                "Questi limiti definiscono la griglia LOCALE usata solo per i profili\n"
+                "privi di GPS, o per tutti se disattivi 'Mantieni le coordinate GPS\n"
+                "originali' qui sotto. Per i profili con GPS reale non hanno effetto."
+            )
         grid_form = QGridLayout(grp_grid)
 
         grid_form.addWidget(QLabel("Asse X (Lunghezza): da"), 0, 0)
@@ -458,8 +549,13 @@ class GprManualPositioningDialog(QDialog):
         self._chk_reverse_far.setChecked(False)
         self._chk_reverse_far.setToolTip(
             "Zig-zag: se una linea di ritorno è più corta dello span griglia,\n"
-            "viene allineata al lato OPPOSTO (x1 / y1 — dove l'operatore ha\n"
-            "invertito la marcia) invece che rientrata dal lato di partenza.\n"
+            "viene allineata al lato OPPOSTO (x1 / y1) invece che al lato di\n"
+            "partenza (x0 / y0).\n"
+            "Usalo SOLO se tutte le linee di ritorno partono davvero da una\n"
+            "baseline comune a x1 / y1. Se le linee hanno lunghezze diverse e\n"
+            "condividono la baseline di x0 / y0 (area a cuneo: le linee di ritorno\n"
+            "FINISCONO su di essa), lascialo disattivo: altrimenti le linee\n"
+            "invertite partono da x1 e oltrepassano la fine delle linee dirette.\n"
             "Richiede 'Usa la lunghezza reale del profilo'."
         )
         self._chk_reverse_far.toggled.connect(self._on_nav_changed)
@@ -603,6 +699,7 @@ class GprManualPositioningDialog(QDialog):
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.itemChanged.connect(self._on_table_item_changed)
         self._table.itemSelectionChanged.connect(self._draw_marker_preview)
+        self._table.itemSelectionChanged.connect(self._update_metadata_panel)
         tbl_layout.addWidget(self._table)
 
         left_layout.addWidget(grp_table)
@@ -644,6 +741,40 @@ class GprManualPositioningDialog(QDialog):
             self._ax_mk = None
             mk_layout.addWidget(QLabel("Anteprima non disponibile (matplotlib mancante)."))
         right_layout.addWidget(grp_marker)
+
+        # Metadati del profilo selezionato in tabella
+        grp_meta = QGroupBox("Profilo Selezionato — Metadati")
+        meta_form = QFormLayout(grp_meta)
+        meta_form.setLabelAlignment(Qt.AlignRight)
+        self._lbl_meta_file = QLabel("—")
+        self._lbl_meta_file.setWordWrap(True)
+        meta_form.addRow("File:", self._lbl_meta_file)
+        self._lbl_meta_ids = QLabel("—")
+        meta_form.addRow("Swath / Array ID:", self._lbl_meta_ids)
+        self._lbl_meta_geom = QLabel("—")
+        meta_form.addRow("Canali / campioni / tracce:", self._lbl_meta_geom)
+        self._lbl_meta_sampling = QLabel("—")
+        meta_form.addRow("Passo campionamento:", self._lbl_meta_sampling)
+        self._lbl_meta_antenna = QLabel("—")
+        meta_form.addRow("Antenna:", self._lbl_meta_antenna)
+        self._lbl_meta_velocity = QLabel("—")
+        meta_form.addRow("Velocità radar:", self._lbl_meta_velocity)
+        self._lbl_meta_gps = QLabel("—")
+        meta_form.addRow("Georeferenziazione:", self._lbl_meta_gps)
+        self._lbl_meta_length = QLabel("—")
+        meta_form.addRow("Lunghezza calcolata:", self._lbl_meta_length)
+        self._lbl_meta_warn = QLabel("")
+        self._lbl_meta_warn.setWordWrap(True)
+        self._lbl_meta_warn.setStyleSheet("color: #b36b00;")
+        meta_form.addRow("Avvisi:", self._lbl_meta_warn)
+        lbl_meta_hint = QLabel(
+            "Nome, asse, offset, verso (zig-zag) e lunghezza si modificano "
+            "direttamente sulla riga evidenziata nella tabella a sinistra."
+        )
+        lbl_meta_hint.setWordWrap(True)
+        lbl_meta_hint.setStyleSheet("color: #666; font-style: italic;")
+        meta_form.addRow(lbl_meta_hint)
+        right_layout.addWidget(grp_meta)
 
         splitter.addWidget(right_widget)
 
@@ -778,7 +909,17 @@ class GprManualPositioningDialog(QDialog):
         self._syncing_table = True
         try:
             self._table.setRowCount(len(self._profile_items))
+            keep_gps_on = bool(
+                getattr(self, "_chk_keep_gps", None) and self._chk_keep_gps.isChecked()
+            )
+            gps_ignored_tip = (
+                "Coordinate GPS reali mantenute per questo profilo: campo ignorato\n"
+                "(vale solo per la griglia locale di riserva). Disattiva 'Mantieni le\n"
+                "coordinate GPS originali' per forzarne l'uso."
+            )
             for r, it in enumerate(self._profile_items):
+                gps_locked = keep_gps_on and bool(it.get("has_gps"))
+
                 # # ID
                 item_id = QTableWidgetItem(str(r + 1))
                 item_id.setFlags(item_id.flags() & ~Qt.ItemIsEditable)
@@ -787,6 +928,10 @@ class GprManualPositioningDialog(QDialog):
 
                 # Nome profilo
                 item_name = QTableWidgetItem(str(it["name"]))
+                if it.get("has_gps"):
+                    item_name.setIcon(self.style().standardIcon(
+                        self.style().SP_DialogApplyButton))
+                    item_name.setToolTip("Profilo con coordinate GPS reali")
                 self._table.setItem(r, 1, item_name)
 
                 # Asse combo
@@ -794,6 +939,9 @@ class GprManualPositioningDialog(QDialog):
                 cb_axis.addItems(["X", "Y"])
                 cb_axis.setCurrentText(it["axis"])
                 cb_axis.currentTextChanged.connect(lambda txt, row=r: self._on_axis_changed(row, txt))
+                cb_axis.setEnabled(not gps_locked)
+                if gps_locked:
+                    cb_axis.setToolTip(gps_ignored_tip)
                 self._table.setCellWidget(r, 2, cb_axis)
 
                 # Offset spin
@@ -802,12 +950,18 @@ class GprManualPositioningDialog(QDialog):
                 spin_off.setDecimals(3)
                 spin_off.setValue(float(it["offset"]))
                 spin_off.valueChanged.connect(lambda val, row=r: self._on_offset_changed(row, val))
+                spin_off.setEnabled(not gps_locked)
+                if gps_locked:
+                    spin_off.setToolTip(gps_ignored_tip)
                 self._table.setCellWidget(r, 3, spin_off)
 
                 # Checkbox Reversing
                 chk_rev = QCheckBox()
                 chk_rev.setChecked(bool(it["reversed"]))
                 chk_rev.toggled.connect(lambda chk, row=r: self._on_reversed_changed(row, chk))
+                chk_rev.setEnabled(not gps_locked)
+                if gps_locked:
+                    chk_rev.setToolTip(gps_ignored_tip)
                 chk_container = QWidget()
                 chk_lay = QHBoxLayout(chk_container)
                 chk_lay.addWidget(chk_rev)
@@ -826,11 +980,14 @@ class GprManualPositioningDialog(QDialog):
                 editable = bool(
                     getattr(self, "_chk_real_length", None)
                     and self._chk_real_length.isChecked()
+                    and not gps_locked
                 )
                 if editable:
                     item_len.setFlags(item_len.flags() | Qt.ItemIsEditable)
                 else:
                     item_len.setFlags(item_len.flags() & ~Qt.ItemIsEditable)
+                if gps_locked:
+                    item_len.setToolTip(gps_ignored_tip)
                 item_len.setTextAlignment(Qt.AlignCenter)
                 self._table.setItem(r, 6, item_len)
         finally:
@@ -840,6 +997,7 @@ class GprManualPositioningDialog(QDialog):
         self._update_table_from_items()
         self._draw_preview()
         self._draw_marker_preview()
+        self._update_metadata_panel()
 
     # ------------------------------------------------------------------
     # Modo posizionamento (marker + dead-reckoning) e anteprima radargramma
@@ -973,6 +1131,65 @@ class GprManualPositioningDialog(QDialog):
             pass
         self._canvas_mk.draw_idle()
 
+    def _update_metadata_panel(self, *_a):
+        """Aggiorna il pannello metadati col profilo evidenziato in tabella."""
+        if not hasattr(self, "_lbl_meta_file"):
+            return
+        idx = self._selected_profile_index()
+        it = self._profile_items[idx] if 0 <= idx < len(self._profile_items) else None
+        if it is None:
+            for w in (self._lbl_meta_file, self._lbl_meta_ids, self._lbl_meta_geom,
+                      self._lbl_meta_sampling, self._lbl_meta_antenna,
+                      self._lbl_meta_velocity, self._lbl_meta_gps, self._lbl_meta_length):
+                w.setText("—")
+            self._lbl_meta_warn.setText("")
+            return
+
+        prof = it["prof"]
+        path = str(getattr(prof, "path", "") or "")
+        self._lbl_meta_file.setText(f"<b>{os.path.basename(path) or it['name']}</b>")
+        self._lbl_meta_file.setToolTip(path)
+
+        swath_id = getattr(prof, "swath_id", "") or "—"
+        array_id = getattr(prof, "array_id", None)
+        array_txt = str(array_id) if array_id not in (None, "") else "—"
+        self._lbl_meta_ids.setText(f"{swath_id} / {array_txt}")
+
+        n_ch = getattr(prof, "n_channels", None) or len(getattr(prof, "channels", []) or [])
+        n_samp = getattr(prof, "n_samples", "—")
+        self._lbl_meta_geom.setText(f"{n_ch} ch · {n_samp} campioni · {it['n_traces']} tracce")
+
+        step = getattr(prof, "sampling_step_m", None)
+        t_ns = getattr(prof, "sampling_time_ns", None)
+        step_txt = f"{step:.4f} m" if isinstance(step, (int, float)) else "—"
+        t_txt = f", {t_ns:.3f} ns" if isinstance(t_ns, (int, float)) else ""
+        self._lbl_meta_sampling.setText(step_txt + t_txt)
+
+        freq = getattr(prof, "frequency_mhz", None)
+        polar = getattr(prof, "polarization", "") or ""
+        freq_txt = f"{freq:.0f} MHz" if isinstance(freq, (int, float)) and freq > 0 else "—"
+        self._lbl_meta_antenna.setText(f"{freq_txt}" + (f"  ({polar})" if polar else ""))
+
+        vel = getattr(prof, "velocity_m_s", None)
+        if isinstance(vel, (int, float)) and vel > 0:
+            self._lbl_meta_velocity.setText(f"{vel * 1e-7:.3f} cm/ns  ({vel:.3e} m/s)")
+        else:
+            self._lbl_meta_velocity.setText("—")
+
+        epsg = getattr(prof, "epsg", None)
+        if it.get("has_gps"):
+            gps_txt = "GPS reale presente"
+            if epsg:
+                gps_txt += f"  (EPSG:{epsg})"
+        else:
+            gps_txt = "assente — coordinate da griglia locale"
+        self._lbl_meta_gps.setText(gps_txt)
+
+        self._lbl_meta_length.setText(f"{it.get('length', 0.0):.2f} m")
+
+        warnings = list(getattr(prof, "parse_warnings", None) or [])
+        self._lbl_meta_warn.setText("; ".join(warnings) if warnings else "nessuno")
+
     def _elev_mode(self) -> str:
         cb = getattr(self, "_cb_elev_mode", None)
         return str(cb.currentData()) if cb is not None else "none"
@@ -1038,6 +1255,7 @@ class GprManualPositioningDialog(QDialog):
         if c == 1:
             self._profile_items[r]["name"] = str(item.text()).strip()
             self._draw_preview()
+            self._update_metadata_panel()
         elif c == 6:
             try:
                 val = float(str(item.text()).replace(",", "."))
@@ -1046,6 +1264,7 @@ class GprManualPositioningDialog(QDialog):
             except ValueError:
                 pass
             self._draw_preview()
+            self._update_metadata_panel()
 
     def _on_axis_changed(self, row: int, axis_text: str):
         if 0 <= row < len(self._profile_items):
@@ -1155,6 +1374,7 @@ class GprManualPositioningDialog(QDialog):
         )
 
         # Disegna linee dei profili con frecce direzionali
+        overshoot: list[tuple[int, float]] = []  # (n. linea, metri oltre la griglia)
         for idx, it in enumerate(self._profile_items):
             axis = it["axis"]
             offset = it["offset"]
@@ -1182,6 +1402,10 @@ class GprManualPositioningDialog(QDialog):
             else:
                 p_start_loc = (offset, seg_start)
                 p_end_loc = (offset, seg_end)
+
+            over = max(max(seg_start, seg_end) - max(lo, hi), min(lo, hi) - min(seg_start, seg_end))
+            if over > 1e-6:
+                overshoot.append((idx + 1, over))
 
             ps_disp = _to_display_xy(*p_start_loc)
             pe_disp = _to_display_xy(*p_end_loc)
@@ -1221,6 +1445,21 @@ class GprManualPositioningDialog(QDialog):
             self._ax.set_xlabel("X (m)")
             self._ax.set_ylabel("Y (m)")
             self._ax.set_title("Griglia locale (X0-X1, Y0-Y1)")
+        if rev_far and use_real_len:
+            lens = [float(it.get("length", 0.0) or 0.0) for it in self._profile_items]
+            if lens and max(lens) > 1.2 * max(min(lens), 1e-6):
+                self._ax.set_title(
+                    "Linee invertite ancorate al lato opposto (x1/y1): con linee di lunghezza "
+                    "diversa partono oltre la fine delle dirette",
+                    color="#c0392b", fontsize=8,
+                )
+        if overshoot:
+            worst = max(o for _, o in overshoot)
+            self._ax.set_title(
+                f"{len(overshoot)} linee oltre il limite griglia (max {worst:.2f} m): "
+                f"controlla Stagger ({stagger_m:+.2f} m)",
+                color="#c0392b", fontsize=9,
+            )
 
         self._fig.tight_layout()
         self._canvas_mpl.draw()
@@ -1290,7 +1529,9 @@ class GprManualPositioningDialog(QDialog):
                 and it.get("has_gps")
             )
             if keep_gps:
-                _dbg.log("DIALOG-APPLY", f"{custom_name}: coordinate GPS originali MANTENUTE (non sovrascritte)")
+                restored = restore_original_coords(prof)
+                _dbg.log("DIALOG-APPLY", f"{custom_name}: coordinate GPS originali "
+                         f"{'RIPRISTINATE' if restored else 'MANTENUTE (non sovrascritte)'}")
             if n_t > 0 and not keep_gps:
                 grid_span = (x1 - x0) if axis == "X" else (y1 - y0)
                 markers, _leftover = self._markers_for_item(it)
@@ -1356,6 +1597,9 @@ class GprManualPositioningDialog(QDialog):
                 "pos_mode": pos_mode,
                 "pos_param": pos_param,
                 "reverse_anchor": reverse_anchor,
+                "keep_gps": bool(
+                    getattr(self, "_chk_keep_gps", None) and self._chk_keep_gps.isChecked()
+                ),
             },
             "profiles": configured_records,
         }

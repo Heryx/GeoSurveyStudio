@@ -247,6 +247,7 @@ class AppRuntimeMixin:
             )
             self.dlg.lineEditAreaNames.setAccessibleName("lineEditAreaNames")
             self._build_tools_tabs()
+            self._build_group_actions_panel()
             self._build_bottom_controls_layout()
             self._load_ui_settings()
             if self.internal_grid_checkbox is not None:
@@ -324,6 +325,7 @@ class AppRuntimeMixin:
             self.populate_group_list()
 
     def _on_project_manager_updated(self):
+        self.remember_active_project_in_qgis()
         if self.dlg is not None:
             self.populate_group_list()
             self.populate_raster_list_from_selected_groups()
@@ -335,11 +337,83 @@ class AppRuntimeMixin:
         Groups saved in the .qgs layer tree are restored by QGIS, but raster
         layers inside them may have broken data-source paths (e.g. because QGIS
         stored relative paths that no longer resolve).  This handler:
-          1. Repairs broken raster sources using the plugin catalog as the
+          1. Binds the plugin to the GPR project this QGIS project belongs to
+             (stored in the .qgz, or deduced from the loaded rasters).
+          2. Registers in the catalog the rasters already sitting in the
+             plugin groups but unknown to it.
+          3. Repairs broken raster sources using the plugin catalog as the
              authoritative path database.
-          2. Refreshes the plugin group/raster list widgets.
+          4. Refreshes the plugin group/raster list widgets.
         """
-        QTimer.singleShot(500, self._repair_broken_group_layers_from_catalog)
+        QTimer.singleShot(500, self._bind_project_and_repair)
+
+    def remember_active_project_in_qgis(self):
+        """Writes the active GPR project root into the open QGIS project, so a
+        later reopen finds the right project instead of "the last one used"."""
+        try:
+            from . import project_binding
+            root = self._active_project_root()
+            if root and os.path.isdir(root):
+                project_binding.remember_root(root)
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                f"remember_active_project_in_qgis: {exc}", "GeoSurvey Studio", Qgis.Warning)
+
+    def _apply_active_project_root(self, root):
+        """Makes ``root`` the active GPR project everywhere (settings, Project
+        Manager, open Profile Viewer, radargram dock)."""
+        root = os.path.normpath(str(root or "").strip())
+        if not root or not os.path.isdir(root):
+            return False
+        current = self._active_project_root()
+        if current and os.path.normcase(os.path.normpath(current)) == os.path.normcase(root):
+            return False
+        self.settings.setValue(self.settings_key_active_project, root)
+        pm = self.project_manager_dialog
+        if pm is not None:
+            try:
+                pm.path_edit.setText(root)
+                pm.project_root = root
+            except Exception:
+                pass
+        viewer = getattr(self, "_gpr_profile_viewer", None)
+        if viewer is not None:
+            try:
+                viewer.on_active_project_changed()
+            except Exception:
+                pass
+        dock = getattr(self, "_radargram_dock", None)
+        if dock is not None:
+            try:
+                dock.refresh_variants()
+            except Exception:
+                pass
+        return True
+
+    def _bind_project_and_repair(self):
+        try:
+            from . import project_binding
+            plugin_root = self._find_plugin_root_group()
+            root = project_binding.resolve_root(plugin_root)
+            if root:
+                if self._apply_active_project_root(root):
+                    QgsMessageLog.logMessage(
+                        f"Progetto GPR attivo dal progetto QGIS: {root}",
+                        "GeoSurvey Studio", Qgis.Info)
+                project_binding.remember_root(root)
+                if plugin_root is not None:
+                    adopted = project_binding.adopt_untracked_timeslices(root, plugin_root)
+                    if adopted.get("registered") or adopted.get("assigned"):
+                        QgsMessageLog.logMessage(
+                            "Time-slice del canvas registrate nel catalogo: "
+                            f"{adopted.get('registered', 0)} nuove, "
+                            f"{adopted.get('assigned', 0)} assegnate a "
+                            f"{adopted.get('groups', 0)} gruppo/i.",
+                            "GeoSurvey Studio", Qgis.Info)
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                f"_bind_project_and_repair: {exc}", "GeoSurvey Studio", Qgis.Warning)
+        self._repair_broken_group_layers_from_catalog()
 
     def _repair_broken_group_layers_from_catalog(self):
         """Repair raster layers with broken sources inside plugin layer-tree groups.

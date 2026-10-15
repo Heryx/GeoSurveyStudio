@@ -433,7 +433,7 @@ class GprOgprVolumeMixin:
             else "gpr_slices"
         )
         candidate_dir = os.path.join(
-            project_root, "GPR_Processing", "timeslices", default_group
+            project_root, "Processing", "timeslices", default_group
         )
         saved = load_ogpr_slicer_params(candidate_dir)
         is_reslice = saved is not None
@@ -475,7 +475,7 @@ class GprOgprVolumeMixin:
             dialog_extra_slice_params = dict(params.pop("advanced", {}) or {})
 
         group_name = params["group_name"]
-        output_dir = os.path.join(project_root, "GPR_Processing", "timeslices", group_name)
+        output_dir = os.path.join(project_root, "Processing", "timeslices", group_name)
         out_override = str((slice_params or {}).get("output_dir") or "").strip()
         if out_override:
             if not os.path.isabs(out_override):

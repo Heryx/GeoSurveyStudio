@@ -186,6 +186,60 @@ def slice_catalog_from_sliceset(directory: str) -> list[dict]:
     return rows
 
 
+def format_depth(z: float) -> str:
+    """Profondita' per i nomi file: 2-3 decimali senza zeri inutili (0.30, 0.125, 1.00)."""
+    s = f"{abs(float(z)):.3f}"
+    if s.endswith("0"):
+        s = s[:-1]
+    return ("n" if float(z) < 0 else "") + s
+
+
+def slice_file_name(index: int, z_from: float, z_to: float) -> str:
+    """Nome file di una time-slice con la FINESTRA di profondita' dentro:
+    ``slice_0003_0.30-0.40m.tif``. L'indice davanti tiene l'ordinamento e
+    rende il nome univoco nel set; ``parse_depth_from_filename`` lo legge."""
+    lo, hi = sorted((float(z_from), float(z_to)))
+    return f"slice_{int(index):04d}_{format_depth(lo)}-{format_depth(hi)}m.tif"
+
+
+def depth_window_for_file(path: str):
+    """``(z_from, z_to)`` in metri di una time-slice, o None se non si trova.
+
+    Ordine: ``sliceset.json`` accanto al file, tag GeoTIFF ``GPR_Z_FROM/TO``
+    (viaggiano con la copia del file), poi il nome file."""
+    path = str(path or "").split("|")[0].strip()
+    if not path:
+        return None
+    folder = os.path.dirname(os.path.normpath(path))
+    grid = os.path.basename(path)
+    try:
+        if folder and has_sliceset(folder):
+            with open(sliceset_path(folder), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            for s in data.get("slices") or []:
+                if str(s.get("grid") or "") == grid:
+                    return float(s["z_from"]), float(s["z_to"])
+    except Exception:
+        pass
+    try:
+        from osgeo import gdal
+        ds = gdal.Open(path)
+        if ds is not None:
+            md = ds.GetMetadata() or {}
+            if md.get("GPR_Z_FROM") not in (None, "", "None") and md.get("GPR_Z_TO") not in (None, "", "None"):
+                return float(md["GPR_Z_FROM"]), float(md["GPR_Z_TO"])
+    except Exception:
+        pass
+    try:
+        from .project_catalog import parse_depth_from_filename
+        d = parse_depth_from_filename(grid)
+        if d.get("depth_from") is not None and d.get("depth_to") is not None:
+            return float(d["depth_from"]), float(d["depth_to"])
+    except Exception:
+        pass
+    return None
+
+
 def has_sliceset(output_dir: str) -> bool:
     return os.path.isfile(sliceset_path(output_dir))
 

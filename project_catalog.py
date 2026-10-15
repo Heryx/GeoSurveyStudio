@@ -1181,14 +1181,20 @@ def _copy_raster_sidecars(source_path, destination_path):
             pass
 
 
-def normalize_copy_into_project(project_root, subfolder, source_path):
+def normalize_copy_into_project(project_root, subfolder, source_path, name_prefix=""):
     """
     Copy source file to a canonical project subfolder with sanitized unique name.
+    ``name_prefix`` (es. il nome del gruppo) viene anteposto al nome file, cosi'
+    set diversi con gli stessi ``slice_0003_...`` non si scontrano e il nome del
+    layer dice a quale griglia appartiene.
     Returns (project_path, normalized_name).
     """
     if not os.path.isfile(source_path):
         raise FileNotFoundError(source_path)
     source_name = os.path.basename(source_path)
+    prefix = _slugify_filename(f"{name_prefix}.x")[:-2] if str(name_prefix or "").strip() else ""
+    if prefix and not _slugify_filename(source_name).lower().startswith(prefix.lower() + "_"):
+        source_name = f"{prefix}_{source_name}"
     normalized_name = _slugify_filename(source_name)
     destination_dir = os.path.join(project_root, subfolder)
     destination_path = _unique_destination_path(destination_dir, normalized_name)

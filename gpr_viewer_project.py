@@ -5,6 +5,7 @@ Estratto da gpr_profile_viewer.py senza modifiche ai metodi."""
 
 from __future__ import annotations
 
+from . import project_zones
 from .gpr_viewer_common import (
     Optional,
     QFileDialog,
@@ -76,7 +77,7 @@ class ProjectPersistenceMixin:
         if not start:
             root = self._active_project_root()
             start = (
-                os.path.join(root, "GPR_Processing") if root else os.path.expanduser("~")
+                os.path.join(root, "Processing") if root else os.path.expanduser("~")
             )
         folder = QFileDialog.getExistingDirectory(
             self, "Cartella di lavoro GPR (dove salvare raw/processed/timeslices)", start
@@ -112,7 +113,7 @@ class ProjectPersistenceMixin:
         return os.path.normpath(root) if root and os.path.isdir(root) else ""
 
     def _new_gpr_project(self) -> bool:
-        """Crea un nuovo progetto GPR (struttura completa Project Manager + GPR_Processing).
+        """Crea un nuovo progetto GPR (struttura completa Project Manager + Processing).
 
         Verifica prima se nel Project Manager c'e' gia' un progetto caricato e
         avvisa l'utente; altrimenti propone di registrare il nuovo percorso
@@ -176,9 +177,12 @@ class ProjectPersistenceMixin:
                     f"{enclosing}\n\n"
                     "Creare un progetto qui lo annida dentro quello (di solito e' un "
                     "errore capitato scegliendo per sbaglio la sua cartella "
-                    "'GPR_Processing'). Scegli una cartella fuori da li', oppure usa "
+                    "'Processing'). Scegli una cartella fuori da li', oppure usa "
                     "'Apri progetto GPR' su quella cartella per aggiungere una nuova zona.",
                 )
+            return False
+
+        if not self._maybe_close_previous_project(self._active_project_root(), folder):
             return False
 
         try:
@@ -189,7 +193,6 @@ class ProjectPersistenceMixin:
             return False
         self._set_active_workspace(folder, register_in_project_manager=register_in_pm)
         self._reset_session_state()
-        self._ensure_gpr_processing_layout()
         try:
             self._save_gpr_processing_project_meta()
         except Exception:
@@ -210,17 +213,20 @@ class ProjectPersistenceMixin:
         if not folder:
             return
         folder = os.path.normpath(folder)
-        # Accetta sia la cartella-progetto (contiene GPR_Processing) sia la
-        # cartella GPR_Processing stessa (in tal caso usa la cartella superiore).
-        if (not os.path.isfile(os.path.join(folder, "GPR_Processing", "project.json"))
-                and os.path.isfile(os.path.join(folder, "project.json"))):
+        # Accetta sia la cartella-progetto (contiene metadata/project.json) sia
+        # la cartella Processing stessa (in tal caso usa la cartella superiore).
+        if (not os.path.isfile(os.path.join(folder, "metadata", "project.json"))
+                and os.path.basename(folder) == "Processing"
+                and os.path.isfile(os.path.join(os.path.dirname(folder), "metadata", "project.json"))):
             folder = os.path.dirname(folder)
+        if not self._maybe_close_previous_project(self._active_project_root(), folder):
+            return
         self._set_active_workspace(folder)
         if not self._try_import_saved_gpr_processing_project(force=True):
             QMessageBox.information(
                 self, "Apri progetto GPR",
                 "Nessun profilo trovato nel progetto selezionato.\n"
-                "Verifica che la cartella contenga GPR_Processing/project.json.",
+                "Verifica che la cartella contenga metadata/project.json.",
             )
 
     def _active_project_root(self) -> str:
@@ -235,6 +241,14 @@ class ProjectPersistenceMixin:
                     root = ""
         if root:
             return root
+        # Progetto GPR a cui appartiene il progetto QGIS aperto (scritto nel .qgz).
+        try:
+            from . import project_binding
+            bound = project_binding.recall_root()
+        except Exception:
+            bound = ""
+        if bound:
+            return bound
         # Fallback: directory of current QGIS project file.
         try:
             qgs_file = str(QgsProject.instance().fileName() or "").strip()
@@ -250,11 +264,11 @@ class ProjectPersistenceMixin:
     @staticmethod
     def _find_enclosing_gpr_project(folder: str) -> str:
         """Risale gli antenati di ``folder`` (``folder`` incluso) cercando un
-        progetto GPR gia' esistente (una cartella con ``GPR_Processing/project.json``).
+        progetto GPR gia' esistente (una cartella con ``metadata/project.json``).
 
         Ritorna quella cartella, o '' se non trovata. Usato prima di creare o
         impostare un workspace per evitare di annidare un progetto dentro
-        un altro (es. scegliendo per sbaglio la ``GPR_Processing`` di un
+        un altro (es. scegliendo per sbaglio la ``Processing`` di un
         progetto esistente come "cartella che contiene" un progetto nuovo).
         """
         cur = os.path.normpath(str(folder or "").strip())
@@ -263,7 +277,7 @@ class ProjectPersistenceMixin:
         seen = set()
         while cur and cur not in seen:
             seen.add(cur)
-            if os.path.isfile(os.path.join(cur, "GPR_Processing", "project.json")):
+            if os.path.isfile(os.path.join(cur, "metadata", "project.json")):
                 return cur
             parent = os.path.dirname(cur)
             if parent == cur:
@@ -271,8 +285,97 @@ class ProjectPersistenceMixin:
             cur = parent
         return ""
 
+    def _maybe_close_previous_project(self, old_root: str, new_root: str) -> bool:
+        """Se un progetto GPR diverso da ``new_root`` e' ancora attivo e ha
+        layer nel canvas, chiede se chiuderlo (scaricarli) prima di passare
+        al nuovo, o se tenerli (utile per vedere due zone insieme). Ritorna
+        ``False`` solo se l'utente annulla il cambio di progetto."""
+        old_root = os.path.normpath(str(old_root or "").strip()) if old_root else ""
+        new_root_norm = os.path.normpath(str(new_root or "").strip())
+        if not old_root or os.path.normcase(old_root) == os.path.normcase(new_root_norm):
+            return True
+
+        try:
+            from . import project_layer_cleanup
+            found = project_layer_cleanup.find_layer_ids_under_root(old_root)
+        except Exception:
+            return True
+        if not found["removable"] and not found["skipped_modified"]:
+            return True
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle("Progetto GPR precedente")
+        msg.setText(
+            f"Il progetto GPR precedente ha ancora layer nel canvas:\n{old_root}\n\n"
+            f"Layer da quel progetto: {len(found['removable'])}.\n\n"
+            "Chiuderlo li' rimuove dal canvas (i file su disco non vengono "
+            "toccati). Per vedere piu' zone insieme, scegli 'Mantieni layer aperti'."
+        )
+        close_btn = msg.addButton("Chiudi progetto precedente", QMessageBox.AcceptRole)
+        keep_btn = msg.addButton("Mantieni layer aperti", QMessageBox.NoRole)
+        msg.addButton(QMessageBox.Cancel)
+        msg.setDefaultButton(keep_btn)
+        msg.exec_()
+        clicked = msg.clickedButton()
+
+        if clicked is close_btn:
+            result = project_layer_cleanup.remove_layers_under_root(old_root)
+            if result.get("skipped_modified"):
+                QMessageBox.warning(
+                    self, "Progetto GPR precedente",
+                    "Alcuni layer hanno modifiche non salvate: non sono stati "
+                    "rimossi dal canvas:\n" + "\n".join(result["skipped_modified"]),
+                )
+            return True
+        if clicked is keep_btn:
+            return True
+        return False
+
+    def on_active_project_changed(self) -> None:
+        """Il progetto GPR attivo e' cambiato fuori dal viewer (es. e' stato
+        aperto un altro progetto QGIS): abbandona il workspace locale e
+        rilegge varianti, cartella time-slice e, se il viewer e' vuoto, i
+        profili salvati del nuovo progetto."""
+        self._gpr_workspace_override = ""
+        self._invalidate_zone_context()
+        self._synced_plugin_root = self._active_project_root()
+        self._refresh_zone_combo()
+        if not self._profiles:
+            try:
+                self._try_import_saved_gpr_processing_project()
+            except Exception:
+                pass
+        try:
+            out = self._default_slice_output_dir()
+            if out and self._is_qt_alive(getattr(self, "_le_slice_outdir", None)):
+                self._le_slice_outdir.setText(out)
+        except Exception:
+            pass
+        try:
+            self._refresh_variants_list()
+        except Exception:
+            pass
+        if self._profiles:
+            self._safe_set_text(
+                self._lbl_status,
+                "Progetto GPR attivo cambiato: i profili caricati sono quelli di prima "
+                "(File > Ricarica ultimo progetto GPR per caricare quelli del nuovo).",
+            )
+
+    def sync_with_active_project(self) -> None:
+        """Chiamato quando il viewer viene riaperto: se nel frattempo il
+        progetto attivo del plugin e' cambiato, si riallinea."""
+        now = self._active_project_root()
+        before = getattr(self, "_synced_plugin_root", None)
+        if before is None:
+            self._synced_plugin_root = now
+            return
+        if os.path.normcase(os.path.normpath(now or "")) != os.path.normcase(os.path.normpath(before or "")):
+            self.on_active_project_changed()
+
     def _set_active_workspace(self, root: str, register_in_project_manager: bool = True) -> None:
-        """Imposta la cartella-progetto attiva (dove vive GPR_Processing).
+        """Imposta la cartella-progetto attiva (dove vive Processing).
 
         Aggiorna sia l'override locale del viewer sia il setting del plugin,
         cosi' viewer e plugin (slicer/catalogo) puntano allo stesso progetto.
@@ -282,6 +385,8 @@ class ProjectPersistenceMixin:
         if not root:
             return
         self._gpr_workspace_override = root
+        self._invalidate_zone_context()
+        self._refresh_zone_combo()
         if not register_in_project_manager:
             return
         try:
@@ -289,6 +394,12 @@ class ProjectPersistenceMixin:
             key = getattr(self.plugin, "settings_key_active_project", None)
             if settings is not None and key:
                 settings.setValue(key, root)
+            self._synced_plugin_root = root
+        except Exception:
+            pass
+        try:
+            from . import project_binding
+            project_binding.remember_root(root)
         except Exception:
             pass
 
@@ -299,13 +410,19 @@ class ProjectPersistenceMixin:
             root = self._active_project_root()
         if not root:
             return {}
-        base = os.path.normpath(os.path.join(root, "GPR_Processing"))
+        zone, folder = self._zone_context(root)
+        base = os.path.join(root, "Processing")
+        if folder:
+            base = os.path.join(base, *folder.split("/"))
+        base = os.path.normpath(base)
         return {
+            "root": root,
+            "zone": zone,
             "base": base,
             "raw": os.path.join(base, "raw"),
             "processed": os.path.join(base, "processed"),
             "timeslices": os.path.join(base, "timeslices"),
-            "project_json": os.path.join(base, "project.json"),
+            "project_json": os.path.join(root, "metadata", "project.json"),
         }
 
     def _ensure_gpr_processing_layout(self) -> dict:
@@ -349,14 +466,16 @@ class ProjectPersistenceMixin:
         return os.path.normpath(os.path.join(base, raw))
 
     def _load_gpr_processing_project_meta(self) -> dict:
+        """Stato salvato dell'AREA attiva (le altre aree restano nel file)."""
         paths = self._gpr_processing_paths()
         pj = paths.get("project_json", "")
         if not pj or (not os.path.exists(pj)):
             return {}
         try:
-            with open(pj, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            return data if isinstance(data, dict) else {}
+            state = project_zones.read_state(paths["root"])
+            payload = dict(state["zones"].get(paths["zone"]) or {})
+            payload["created"] = state.get("created")
+            return payload
         except Exception:
             return {}
 
@@ -365,12 +484,14 @@ class ProjectPersistenceMixin:
         last_processing: Optional[str] = None,
         last_timeslice: Optional[str] = None,
     ) -> bool:
-        paths = self._ensure_gpr_processing_layout()
+        paths = self._gpr_processing_paths()
         if not paths:
             return False
-        now_iso = datetime.now().isoformat(timespec="seconds")
+        try:
+            os.makedirs(os.path.dirname(paths["project_json"]), exist_ok=True)
+        except Exception:
+            return False
         meta = self._load_gpr_processing_project_meta()
-        created = str(meta.get("created") or now_iso)
         profiles_payload = []
         for prof in list(getattr(self, "_profiles", []) or []):
             try:
@@ -428,9 +549,6 @@ class ProjectPersistenceMixin:
             if outdir:
                 last_timeslice = self._path_to_gpr_processing_store(os.path.normpath(outdir))
         payload = {
-            "version": "1.0",
-            "created": created,
-            "updated": now_iso,
             "profiles": profiles_payload,
             "last_processing": (
                 last_processing
@@ -454,9 +572,7 @@ class ProjectPersistenceMixin:
             ),
         }
         try:
-            with open(paths["project_json"], "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, ensure_ascii=False, indent=2)
-            return True
+            return bool(project_zones.set_payload(paths["root"], payload, zone=paths["zone"]))
         except Exception:
             return False
 
@@ -681,6 +797,11 @@ class ProjectPersistenceMixin:
                     ts_note = " Cartella time-slice salvata non trovata: ripristinata quella del progetto."
             if target and self._is_qt_alive(getattr(self, "_le_slice_outdir", None)):
                 self._le_slice_outdir.setText(target)
+        except Exception:
+            pass
+        try:
+            self._refresh_variants_list()
+            self._refresh_zone_combo()
         except Exception:
             pass
         self._safe_set_text(
