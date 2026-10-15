@@ -1489,6 +1489,7 @@ class RadargramViewMixin:
             self._rb_line.setVisible(True)
         else:
             self._rb_line.reset(QgsWkbTypes.LineGeometry)
+            self._rb_line.setVisible(True)
         if self._disp_data is not None and np.asarray(self._disp_data).ndim == 2:
             n_t = int(self._disp_data.shape[1])
         else:

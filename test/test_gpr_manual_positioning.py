@@ -485,11 +485,89 @@ class TestInferGeometryFromCoords(unittest.TestCase):
         self.assertEqual([it["reversed"] for it in items], [False, True])
         self.assertAlmostEqual(items[1]["offset"], 1.5, places=6)
 
+    def _anchor(self, specs):
+        """specs = [(e_start, e_end, northing)] per profilo."""
+        profs = [_make_profile(easting=np.linspace(a, b, 50), northing=np.full(50, nn), n_slices=50)
+                 for a, b, nn in specs]
+        items = self._items(profs)
+        self._infer(items)
+        from gpr_manual_positioning_dialog import GprManualPositioningDialog
+        d = GprManualPositioningDialog.__new__(GprManualPositioningDialog)
+        d._infer_geometry_from_coords(items)
+        return d._inferred_reverse_anchor
+
+    def test_anchor_near_for_wedge_with_common_baseline(self):
+        B = 350_000.0  # tutte le linee toccano la baseline a B; lunghezze diverse
+        self.assertEqual(self._anchor([
+            (B, B + 10, 4_500_000.0), (B + 14, B, 4_500_002.0),
+            (B, B + 15, 4_500_004.0), (B + 20, B, 4_500_006.0)]), "near")
+
+    def test_anchor_far_for_rectangle_with_return_baseline(self):
+        B = 350_000.0  # le invertite partono da B+30 (baseline di ritorno) ma sono piu' corte
+        self.assertEqual(self._anchor([
+            (B, B + 30, 4_500_000.0), (B + 30, B + 12, 4_500_002.0),
+            (B, B + 30, 4_500_004.0), (B + 30, B + 14, 4_500_006.0)]), "far")
+
+    def test_anchor_none_without_both_directions(self):
+        self.assertIsNone(self._anchor([(350_000.0, 350_010.0, 4_500_000.0),
+                                        (350_000.0, 350_012.0, 4_500_002.0)]))
+
     def test_profiles_without_coords_keep_defaults(self):
         items = self._items([_make_profile(), _make_profile()])
         self._infer(items)
         self.assertEqual([it["reversed"] for it in items], [False, False])
         self.assertEqual([it["offset"] for it in items], [0.0, 1.0])
+
+
+class TestOriginalGpsRecovery(unittest.TestCase):
+    """Dopo un Posizionamento applicato (coordinate sovrascritte con la griglia
+    locale) il GPS originale deve restare rilevabile e ripristinabile."""
+
+    @staticmethod
+    def _overwrite_like_apply(prof):
+        for ch in prof.channels:
+            ch._geo_orig = (ch.easting.copy(), ch.northing.copy(),
+                            ch.distances.copy(), ch.altitude.copy())
+            n = ch.easting.size
+            ch.easting = np.linspace(0.0, 10.0, n)
+            ch.northing = np.zeros(n)
+            ch.distances = np.linspace(0.0, 10.0, n)
+
+    def _gps_profile(self):
+        return _make_profile(easting=np.linspace(350_000.0, 350_020.0, 50),
+                             northing=np.full(50, 4_500_000.0), n_slices=50)
+
+    def test_gps_still_detected_after_overwrite(self):
+        from gpr_manual_positioning_dialog import check_profiles_have_gps
+        prof = self._gps_profile()
+        self._overwrite_like_apply(prof)
+        self.assertTrue(check_profiles_have_gps([prof]))
+
+    def test_infer_geometry_uses_original_track(self):
+        from gpr_manual_positioning_dialog import GprManualPositioningDialog
+        e = np.linspace(350_000.0, 350_020.0, 50)
+        profs = [_make_profile(easting=e, northing=np.full(50, 4_500_000.0), n_slices=50),
+                 _make_profile(easting=e[::-1], northing=np.full(50, 4_500_001.0), n_slices=50)]
+        for p in profs:
+            self._overwrite_like_apply(p)
+        items = [{"prof": p, "name": f"P{i}", "axis": "X", "offset": float(i),
+                  "reversed": False, "length": 10.0} for i, p in enumerate(profs)]
+        d = GprManualPositioningDialog.__new__(GprManualPositioningDialog)
+        d._infer_geometry_from_coords(items)
+        self.assertEqual([it["reversed"] for it in items], [False, True])
+
+    def test_restore_original_coords(self):
+        from gpr_manual_positioning_dialog import restore_original_coords
+        prof = self._gps_profile()
+        e_orig = prof.channels[0].easting.copy()
+        self._overwrite_like_apply(prof)
+        self.assertTrue(restore_original_coords(prof))
+        np.testing.assert_allclose(prof.channels[0].easting, e_orig)
+        np.testing.assert_allclose(prof.channels[0].northing, 4_500_000.0)
+
+    def test_restore_noop_without_overwrite(self):
+        from gpr_manual_positioning_dialog import restore_original_coords
+        self.assertFalse(restore_original_coords(self._gps_profile()))
 
 
 class TestDebugLog(unittest.TestCase):
