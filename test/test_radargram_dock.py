@@ -3229,6 +3229,88 @@ class FenceDockTest(_DockBase):
         self.assertIn("slice::b.tif", self.fence._shown)
         self.assertIn("0.00\u20130.20 m", self.fence._txt_cross.toPlainText())
 
+    # -- layout e leggibilita' dell'elenco -----------------------------------------------------------
+    def _select_variant(self, name):
+        i = self.fence._cb_variant.findText(name, Qt.MatchStartsWith)
+        self.assertGreaterEqual(i, 0)
+        self.fence._cb_variant.setCurrentIndex(i)
+
+    def test_many_profiles_do_not_push_ert_and_slices_out_of_view(self):
+        _write_variant(self.root, "Molti", [f"P{i:02d}" for i in range(20)])
+        self._slice_group(variant="Molti")
+        self.fence.refresh_variants()
+        self._select_variant("Molti")
+        gpr, ert, slc = (self.fence._tree.topLevelItem(i) for i in range(3))
+        self.assertFalse(gpr.isExpanded())                   # 20 profili: il gruppo parte chiuso
+        self.assertIn("20", gpr.text(0))                      # ma il conteggio si legge
+        self.assertTrue(ert.isExpanded())
+        self.assertTrue(slc.isExpanded())
+
+    def test_few_profiles_stay_expanded(self):
+        self.assertTrue(self.fence._tree.topLevelItem(0).isExpanded())
+
+    def test_group_with_a_checked_profile_stays_open_and_user_choice_is_remembered(self):
+        _write_variant(self.root, "Molti", [f"P{i:02d}" for i in range(20)])
+        self.fence.refresh_variants()
+        self._select_variant("Molti")
+        gpr = self.fence._tree.topLevelItem(0)
+        gpr.setExpanded(True)                                 # l'utente lo apre
+        self.fence.refresh_lists()
+        self.assertTrue(self.fence._tree.topLevelItem(0).isExpanded())
+        self.fence._tree.topLevelItem(0).setExpanded(False)   # e lo richiude
+        self.fence.refresh_lists()
+        self.assertFalse(self.fence._tree.topLevelItem(0).isExpanded())
+
+    def test_side_panel_can_be_hidden_to_give_room_to_the_view(self):
+        self.assertFalse(self.fence._side.isHidden())
+        self.fence._btn_side.setChecked(False)
+        self.assertTrue(self.fence._side.isHidden())
+        self.fence._btn_side.setChecked(True)
+        self.assertFalse(self.fence._side.isHidden())
+
+    def test_side_panel_hides_itself_when_the_window_is_narrow(self):
+        f = self.fence
+        f.setFloating(True)
+        f.resize(420, 500)
+        self._pump(30)
+        self.assertTrue(f._side.isHidden())
+        f.resize(1100, 600)
+        self._pump(30)
+        self.assertFalse(f._side.isHidden())
+
+    def test_manual_choice_beats_the_automatic_one(self):
+        f = self.fence
+        f.setFloating(True)
+        f.resize(1100, 600)
+        self._pump(30)
+        f._btn_side.setChecked(False)                          # l'utente nasconde i comandi
+        f.resize(1200, 600)
+        self._pump(30)
+        self.assertTrue(f._side.isHidden())
+
+    def test_empty_scene_explains_what_to_do(self):
+        self._build()
+        self.assertTrue(self.fence._hint_on)
+        self.assertIn("hint", self.fence._plotter.renderer.actors)
+        self._build(gpr=["Swath2"])
+        self.assertFalse(self.fence._hint_on)
+        self.assertNotIn("hint", self.fence._plotter.renderer.actors)
+
+    def test_docked_in_a_narrow_column_the_view_keeps_the_room(self):
+        """Come nella schermata dell'utente: agganciata a destra in una colonna di ~340 px."""
+        f = self.fence
+        from qgis.PyQt.QtWidgets import QWidget
+        win = self.iface.mainWindow()
+        win.setCentralWidget(QWidget())           # come il canvas: la colonna non prende tutta la finestra
+        win.resize(1600, 900)
+        f.setFloating(False)
+        win.resizeDocks([f], [340], Qt.Horizontal)
+        self._pump(80)
+        self.assertTrue(f._side.isHidden(), f"larghezza={f.width()}")   # i comandi non coprono la vista
+        self.assertGreaterEqual(f._split.sizes()[1], 250)         # e la vista 3D ha spazio
+        f._btn_side.setChecked(True)                              # chi vuole i comandi li riapre a mano
+        self.assertFalse(f._side.isHidden())
+
     def test_screenshot_is_not_blank(self):
         self._build(gpr=["Swath2", "Swath10"], ert=["T"])
         img = self.fence._plotter.screenshot(return_img=True)
@@ -3268,6 +3350,8 @@ class FencePluginWiringTest(unittest.TestCase):
                 self.assertEqual(iface.docks[0][0], Qt.RightDockWidgetArea)
                 self.assertEqual(dock._store.name, "Lavoro")
                 self.assertEqual(dock._tree.topLevelItem(0).childCount(), 2)
+                self.assertTrue(dock.isFloating())                   # si apre mobile, di dimensione utile
+                self.assertGreaterEqual(dock.width(), 1000)
                 self.assertIs(GS.GeoSurveyStudioPlugin.open_fence_dock(fake), dock)     # riusato
                 self.assertEqual(len(iface.docks), 1)
             finally:

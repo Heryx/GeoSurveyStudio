@@ -29,6 +29,7 @@ from qgis.PyQt.QtWidgets import (
     QPushButton,
     QSpinBox,
     QSplitter,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -65,6 +66,8 @@ _SLICE_CMAPS = ("viridis", "gray", "turbo", "RdBu_r", "Spectral_r")
 _CACHE_MAX = 24
 _ERT_CLIM_PERCENTILES = (2.0, 98.0)
 _ROLE = Qt.UserRole
+_SIDE_MIN_TOTAL_WIDTH = 640     # sotto questa larghezza il pannello dei comandi si nasconde da solo
+_GPR_EXPAND_MAX = 15            # oltre questi profili il gruppo GPR parte chiuso (non copre ERT e time-slice)
 
 
 def _load_pyvista():
@@ -102,6 +105,9 @@ class FenceDock(QDockWidget):
         self._slice_cache: dict = {}
         self._slice_info: dict = {}      # percorso raster -> riga del manifest
         self._origin = None
+        self._side = None
+        self._side_user = False           # l'utente ha scelto a mano: niente piu' nascondi/mostra automatico
+        self._hint_on = False
         self._shown: dict = {}            # nome attore -> tipo ("gpr" | "ert" | "x")
         self._first_camera = True
         self._plotter = None
@@ -127,9 +133,12 @@ class FenceDock(QDockWidget):
                                  f"Dettaglio: {qt}\nInstalla con: python -m pip install pyvista pyvistaqt"))
             return
         split = QSplitter(Qt.Horizontal)
+        split.setChildrenCollapsible(False)
         lay.addWidget(split)
 
         side = QWidget()
+        side.setMinimumWidth(240)
+        self._side = side
         sl = QVBoxLayout(side)
         sl.setContentsMargins(0, 0, 0, 0)
         zrow = QHBoxLayout()
@@ -250,6 +259,16 @@ class FenceDock(QDockWidget):
         view = QWidget()
         vl = QVBoxLayout(view)
         vl.setContentsMargins(0, 0, 0, 0)
+        bar = QHBoxLayout()
+        self._btn_side = QToolButton()
+        self._btn_side.setText("\u2630 Comandi")
+        self._btn_side.setCheckable(True)
+        self._btn_side.setChecked(True)
+        self._btn_side.setToolTip("Mostra o nasconde l'elenco dei profili e i comandi, per lasciare tutto lo spazio alla vista 3D.")
+        self._btn_side.toggled.connect(lambda on: self._set_side_visible(on, user=True))
+        bar.addWidget(self._btn_side)
+        bar.addStretch(1)
+        vl.addLayout(bar)
         if self._plotter_factory is not None:
             self._plotter, widget = self._plotter_factory(view)
         else:
@@ -262,6 +281,27 @@ class FenceDock(QDockWidget):
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
         split.setSizes([260, 700])
+        self._split = split
+
+    def _set_side_visible(self, on: bool, user: bool = False) -> None:
+        if self._side is None:
+            return
+        if user:
+            self._side_user = True
+        self._side.setVisible(bool(on))
+        self._btn_side.blockSignals(True)
+        self._btn_side.setChecked(bool(on))
+        self._btn_side.blockSignals(False)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # agganciata in una colonna stretta il pannello dei comandi mangerebbe tutto lo spazio:
+        # finche' l'utente non sceglie, lo si nasconde sotto una larghezza minima
+        if self._side is None or self._side_user:
+            return
+        want = self.width() >= _SIDE_MIN_TOTAL_WIDTH
+        if want == self._side.isHidden():
+            self._set_side_visible(want, user=False)
 
     # --- elenchi -----------------------------------------------------------------------------------
     def _project_root(self) -> str:
@@ -403,17 +443,19 @@ class FenceDock(QDockWidget):
         store = self._store
         self._ert_cache.clear()
         checked = {self._path_key(it) for it in self._iter_items() if it.checkState(0) == Qt.Checked}
+        expanded = {self._path_key(it): it.isExpanded() for it in self._iter_all()}
         self._slice_info.clear()
         self._updating = True
         try:
             self._tree.clear()
-            gpr_title = f"Profili GPR ({getattr(store, 'name', '')})" if store is not None else "Profili GPR"
+            n_gpr = len(store.profiles) if store is not None else 0
+            gpr_title = f"Profili GPR ({store.name}) \u00b7 {n_gpr}" if store is not None else "Profili GPR"
             gpr = QTreeWidgetItem(self._tree, [gpr_title])
             ert = QTreeWidgetItem(self._tree, ["Sezioni ERT"])
             slc = QTreeWidgetItem(self._tree, ["Time-slice"])
             for top in (gpr, ert, slc):
                 top.setFlags(Qt.ItemIsEnabled)
-                top.setExpanded(True)
+                top.setExpanded(expanded.get((top.text(0),), True))
             if store is not None:
                 for pi, p in enumerate(store.profiles):
                     self._add_child(gpr, p.stem, ("gpr", pi), (gpr_title, p.stem) in checked)
@@ -423,13 +465,18 @@ class FenceDock(QDockWidget):
                 title = f"{g['name']}  ({g['variant']})" if g["variant"] else g["name"]
                 gi = QTreeWidgetItem(slc, [title])
                 gi.setFlags(Qt.ItemIsEnabled)
-                gi.setExpanded(store is not None and g["variant"] == getattr(store, "name", None))
+                gi.setExpanded(expanded.get((slc.text(0), title),
+                                            store is not None and g["variant"] == getattr(store, "name", None)))
                 for row in g["slices"]:
                     label = f"{row['z_from']:.2f}–{row['z_to']:.2f} m"
                     self._slice_info[row["path"]] = dict(row, epsg=g["epsg"], group=g["name"])
                     self._add_child(gi, label, ("slice", row["path"]), (slc.text(0), title, label) in checked)
         finally:
             self._updating = False
+        # tanti profili GPR coprirebbero ERT e time-slice sotto la piega dell'elenco: il gruppo parte chiuso
+        # (a meno che l'utente l'abbia gia' aperto o ci sia qualcosa di spuntato)
+        if (gpr_title,) not in expanded:
+            gpr.setExpanded(n_gpr <= _GPR_EXPAND_MAX or any(k[:1] == (gpr_title,) for k in checked))
         self._apply_filter(self._ed_filter.text())
         self._schedule()
 
@@ -447,6 +494,14 @@ class FenceDock(QDockWidget):
             it = stack.pop()
             if it.data(0, _ROLE):
                 yield it
+            stack.extend(it.child(c) for c in range(it.childCount() - 1, -1, -1))
+
+    def _iter_all(self):
+        """Tutte le voci dell'albero, gruppi compresi."""
+        stack = [self._tree.topLevelItem(t) for t in range(self._tree.topLevelItemCount())][::-1]
+        while stack:
+            it = stack.pop()
+            yield it
             stack.extend(it.child(c) for c in range(it.childCount() - 1, -1, -1))
 
     @staticmethod
@@ -605,6 +660,9 @@ class FenceDock(QDockWidget):
         for name in list(self._shown):
             pl.remove_actor(name, render=False)
         self._shown.clear()
+        if self._hint_on:
+            pl.remove_actor("hint", render=False)
+            self._hint_on = False
         dmax = float(self._spin_depth.value())
         gpr_sel = self.checked("gpr") if self._store is not None else []
         ert_sel = self.checked("ert")
@@ -677,6 +735,10 @@ class FenceDock(QDockWidget):
         self._draw_crossings(gprs, erts, dmax)
         if errors:
             self._txt_cross.appendPlainText("\n".join(f"⚠ {e}" for e in errors))
+        if not self._shown:
+            pl.add_text("Spunta profili GPR, sezioni ERT o time-slice nell'elenco (\u2630 Comandi)", name="hint",
+                        position="upper_left", font_size=10, color="gray", render=False)
+            self._hint_on = True
         self._apply_scale()
         if self._shown and self._first_camera:
             self._view_iso()

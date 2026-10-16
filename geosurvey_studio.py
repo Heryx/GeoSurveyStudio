@@ -610,6 +610,15 @@ class GeoSurveyStudioPlugin(
                 plotter_factory=self._fence_plotter_factory,
             )
             self.iface.addDockWidget(Qt.RightDockWidgetArea, dock)
+            # la prima volta si apre come finestra mobile di dimensione utile: agganciata nella colonna di
+            # destra (stretta) la vista 3D resterebbe senza spazio. Si puo' agganciare quando si vuole.
+            dock.setFloating(True)
+            dock.resize(1150, 740)
+            win = self.iface.mainWindow()
+            try:
+                dock.move(win.geometry().center() - dock.rect().center())
+            except Exception:
+                pass
             self._fence_dock = dock
         dock.show()
         dock.raise_()
