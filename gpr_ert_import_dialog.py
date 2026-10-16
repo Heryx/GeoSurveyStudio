@@ -435,3 +435,22 @@ class ErtImportDialog(QDialog):
         """``{"name", "csv", "georef"}`` dopo ``accept``."""
         return {"name": self._ed_name.text().strip(), "csv": self._ed_csv.text().strip(),
                 "georef": self._georef}
+
+
+def import_ert_section(parent, project_root: str, canvas=None):
+    """Chiede file e posizione e salva la sezione nel progetto.
+
+    Ritorna ``(nome, errore)``: ``nome`` e' la sezione salvata, ``None`` se l'utente annulla o se il
+    salvataggio fallisce (allora ``errore`` spiega perche').
+    """
+    from .gpr_ert_store import save_ert
+
+    dlg = ErtImportDialog(QgsProject.instance().crs().authid(), parent, start_dir=project_root, canvas=canvas)
+    if dlg.exec() != dlg.Accepted:
+        return None, None
+    data = dlg.result_data()
+    try:
+        folder = save_ert(project_root, data["name"], data["csv"], data["georef"])
+    except Exception as exc:
+        return None, f"Importazione ERT non riuscita: {exc}"
+    return os.path.basename(folder), None

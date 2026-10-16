@@ -11,6 +11,7 @@ I profili si spuntano in un elenco: quelli del GPR sono i profili della variante
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 
 import numpy as np
@@ -37,7 +38,9 @@ from qgis.core import QgsProject
 
 from .gpr_ert_georef import lonlat_transformer
 from .gpr_ert_import import to_grid as ert_to_grid
+from .gpr_ert_import_dialog import import_ert_section
 from .gpr_ert_store import list_ert, load_ert
+from .radargram_store import VariantStore, discover_variants
 from .gpr_fence_geometry import (
     crossings,
     curtain,
@@ -74,16 +77,22 @@ def _load_pyvista():
 class FenceDock(QDockWidget):
     """Vista 3D dei profili GPR e ERT del progetto."""
 
-    def __init__(self, iface, store_getter, project_root_getter, parent=None, plotter_factory=None):
-        """``plotter_factory(parent_widget) -> (plotter, widget)`` sostituisce il ``QtInteractor``
+    def __init__(self, iface, workspace_provider=None, zones_provider=None, project_root_provider=None,
+                 geometry_provider=None, parent=None, plotter_factory=None):
+        """Provider come per ``RadargramDock`` (aree, cartella di lavoro, radice del progetto, geometria).
+
+        ``plotter_factory(parent_widget) -> (plotter, widget)`` sostituisce il ``QtInteractor``
         (nei test non c'e' un contesto OpenGL nativo: si usa ``pv.Plotter(off_screen=True)``)."""
         super().__init__("Vista 3D profili", parent or (iface.mainWindow() if iface else None))
         self._plotter_factory = plotter_factory
         self.setObjectName("GeoSurveyFenceDock")
         self.setAllowedAreas(Qt.AllDockWidgetAreas)
         self.iface = iface
-        self._store_getter = store_getter
-        self._root_getter = project_root_getter
+        self._workspace_provider = workspace_provider
+        self._zones_provider = zones_provider
+        self._root_getter = project_root_provider
+        self._geometry_provider = geometry_provider
+        self._zones: list = []
         self._store = None
         self._gpr_cache: OrderedDict = OrderedDict()
         self._ert_cache: dict = {}
@@ -99,7 +108,7 @@ class FenceDock(QDockWidget):
         self._timer.timeout.connect(self._rebuild)
         self._build_ui()
         if self._plotter is not None:
-            self.refresh_lists()
+            self.refresh_variants()
 
     # --- interfaccia ---------------------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -118,6 +127,21 @@ class FenceDock(QDockWidget):
         side = QWidget()
         sl = QVBoxLayout(side)
         sl.setContentsMargins(0, 0, 0, 0)
+        zrow = QHBoxLayout()
+        self._lbl_zone = QLabel("Area")
+        self._cb_zone = QComboBox()
+        self._cb_zone.setToolTip("Area indagata del progetto: ognuna ha le sue varianti e i suoi profili.")
+        self._cb_zone.currentIndexChanged.connect(self._on_zone_changed)
+        zrow.addWidget(self._lbl_zone)
+        zrow.addWidget(self._cb_zone, 1)
+        sl.addLayout(zrow)
+        vrow = QHBoxLayout()
+        self._cb_variant = QComboBox()
+        self._cb_variant.setToolTip("Variante processata di cui mostrare i profili GPR.")
+        self._cb_variant.currentIndexChanged.connect(self._on_variant_changed)
+        vrow.addWidget(QLabel("Variante"))
+        vrow.addWidget(self._cb_variant, 1)
+        sl.addLayout(vrow)
         self._ed_filter = QLineEdit()
         self._ed_filter.setPlaceholderText("Filtra i profili…")
         self._ed_filter.textChanged.connect(self._apply_filter)
@@ -129,7 +153,8 @@ class FenceDock(QDockWidget):
         row = QHBoxLayout()
         for text, tip, slot in (("Tutti i GPR", "Spunta tutti i profili GPR visibili nel filtro.", lambda: self._check_group(0, True)),
                                 ("Nessun GPR", "Toglie la spunta a tutti i profili GPR.", lambda: self._check_group(0, False)),
-                                ("↻", "Rilegge profili GPR e sezioni ERT.", self.refresh_lists)):
+                                ("+ ERT", "Importa una sezione ERT invertita (CSV di ResIPY) e georiferiscila.", self._import_ert),
+                                ("↻", "Rilegge aree, varianti, profili GPR e sezioni ERT.", self.refresh_variants)):
             b = QPushButton(text)
             b.setToolTip(tip)
             b.clicked.connect(slot)
@@ -226,19 +251,137 @@ class FenceDock(QDockWidget):
         except Exception:
             return ""
 
-    def refresh_lists(self) -> None:
-        """Ricostruisce l'elenco dei profili GPR (variante aperta) e delle sezioni ERT, mantenendo le spunte."""
+    def _workspace_root(self) -> str:
+        try:
+            return str(self._workspace_provider() or "") if self._workspace_provider else ""
+        except Exception:
+            return ""
+
+    def _zone_list(self) -> list:
+        """Aree del progetto come [{"name", "base", "active"}]; senza project.json, un'area unica senza nome."""
+        zones = []
+        if self._zones_provider is not None:
+            try:
+                for z in (self._zones_provider() or []):
+                    zones.append({"name": str(z.get("name") or ""), "base": str(z.get("base") or ""),
+                                  "active": bool(z.get("active"))})
+            except Exception:
+                zones = []
+        if not zones:
+            return [{"name": "", "base": self._workspace_root(), "active": True}]
+        with_data = [z for z in zones if discover_variants(z["base"])]
+        return with_data or zones
+
+    def _current_zone(self):
+        name = self._cb_zone.currentData()
+        return next((z for z in self._zones if z["name"] == name), self._zones[0] if self._zones else None)
+
+    def refresh_variants(self, *_a) -> None:
+        """Rilegge aree e varianti mantenendo la scelta fatta; apre la variante selezionata."""
         if self._plotter is None:
             return
+        prev_zone = self._cb_zone.currentData()
+        prev_variant = str(self._cb_variant.currentData() or "")
+        self._zones = self._zone_list()
+        self._updating = True
         try:
-            store = self._store_getter() if self._store_getter else None
-        except Exception:
-            store = None
+            self._cb_zone.clear()
+            for z in self._zones:
+                self._cb_zone.addItem(z["name"] or "-", z["name"])
+            idx = next((i for i, z in enumerate(self._zones) if z["name"] == prev_zone), -1)
+            if idx < 0:
+                idx = next((i for i, z in enumerate(self._zones) if z["active"]), 0)
+            self._cb_zone.setCurrentIndex(idx)
+            self._lbl_zone.setVisible(len(self._zones) > 1)
+            self._cb_zone.setVisible(len(self._zones) > 1)
+            self._fill_variants(prev_variant)
+        finally:
+            self._updating = False
+        self._open_selected_variant()
+
+    def _fill_variants(self, keep: str = "") -> None:
+        zone = self._current_zone()
+        refs = discover_variants(zone["base"]) if zone else []
+        self._cb_variant.clear()
+        for r in refs:
+            self._cb_variant.addItem(f"{r.name}  ({r.n_files})", r.path)
+        want = self._cb_variant.findData(keep) if keep else -1
+        if want < 0 and self._cb_variant.count():
+            names = [os.path.basename(str(self._cb_variant.itemData(i))) for i in range(self._cb_variant.count())]
+            want = names.index("Lavoro") if "Lavoro" in names else 0
+        self._cb_variant.setCurrentIndex(want)
+
+    def _on_zone_changed(self, _i: int) -> None:
+        if self._updating:
+            return
+        self._updating = True
+        try:
+            self._fill_variants()
+        finally:
+            self._updating = False
+        self._open_selected_variant()
+
+    def _on_variant_changed(self, _i: int) -> None:
+        if not self._updating:
+            self._open_selected_variant()
+
+    def _make_geometry_provider(self, zone_name: str):
+        """Il Profile Viewer ha in memoria solo i profili dell'area attiva: per le altre la geometria
+        resta quella salvata nei .npz (stessa regola del pannello dei radargrammi)."""
+        if self._geometry_provider is None:
+            return None
+
+        def provider(stem):
+            z = next((z for z in self._zones if z["name"] == zone_name), None)
+            if z is not None and not z["active"]:
+                return None
+            return self._geometry_provider(stem)
+        return provider
+
+    def _open_selected_variant(self) -> None:
+        path = str(self._cb_variant.currentData() or "")
+        cur = self._store
+        if path and cur is not None and os.path.normcase(cur.path) == os.path.normcase(os.path.normpath(path))                 and not cur.is_stale():
+            self.refresh_lists()                      # stessa variante: aggiorna solo gli elenchi (ERT nuove)
+            return
+        zone = self._current_zone()
+        store = VariantStore(path, geometry_provider=self._make_geometry_provider(
+            zone["name"] if zone else "")) if path else None
+        self._set_store(store)
+
+    def _set_store(self, store) -> None:
         if store is not self._store:                  # altra variante: cache e origine non valgono piu'
             self._gpr_cache.clear()
             self._origin = None
             self._first_camera = True
         self._store = store
+        self.refresh_lists()
+
+    def _import_ert(self, *_a) -> None:
+        root = self._project_root()
+        if not root:
+            self._txt_cross.setPlainText("⚠ Apri un progetto di GeoSurvey Studio: la sezione ERT si salva nella "
+                                         "cartella del progetto.")
+            return
+        canvas = self.iface.mapCanvas() if self.iface is not None else None
+        name, error = import_ert_section(self, root, canvas)
+        if error:
+            self._txt_cross.setPlainText(f"⚠ {error}")
+            return
+        if name:
+            self._ert_cache.pop(name, None)
+            self.refresh_lists()
+            self.set_checked("ert", [name] + [t for t, _ in self.checked("ert")])
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.refresh_variants()                       # varianti e sezioni ERT possono essere cambiate nel frattempo
+
+    def refresh_lists(self) -> None:
+        """Ricostruisce l'elenco dei profili GPR (variante aperta) e delle sezioni ERT, mantenendo le spunte."""
+        if self._plotter is None:
+            return
+        store = self._store
         self._ert_cache.clear()
         checked = {(it.parent().text(0), it.text(0)) for it in self._iter_items() if it.checkState(0) == Qt.Checked}
         self._updating = True

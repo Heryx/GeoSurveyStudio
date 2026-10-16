@@ -33,6 +33,12 @@ except Exception:
     _HAS_RADARGRAM_DOCK = False
 
 try:
+    from .gpr_fence_dock import FenceDock
+    _HAS_FENCE_DOCK = True
+except Exception:
+    _HAS_FENCE_DOCK = False
+
+try:
     from .resources import *  # noqa: F401,F403
     _HAS_QT_RESOURCES = True
 except Exception:
@@ -123,6 +129,9 @@ class GeoSurveyStudioPlugin(
         # Pannello agganciabile con i radargrammi processati (vive nel canvas di QGIS,
         # indipendente dal Profile Viewer)
         self._radargram_dock = None
+        # Finestra agganciabile "Vista 3D profili" (GPR + ERT), indipendente dai radargrammi processati
+        self._fence_dock = None
+        self._fence_plotter_factory = None     # solo per i test: al posto del QtInteractor
 
         # Mixin state initialisation – each mixin owns and resets its own attributes.
         self._init_grid_state()
@@ -213,6 +222,22 @@ class GeoSurveyStudioPlugin(
             wave_icon = self._qgis_theme_icon("mActionAddRasterLayer.svg", "mIconRasterLayer.svg")
             if wave_icon is not None and not wave_icon.isNull():
                 self.radargram_dock_action.setIcon(wave_icon)
+
+        # --- Vista 3D profili GPR + ERT (finestra agganciabile) ---
+        if _HAS_FENCE_DOCK:
+            self.fence_dock_action = self.add_action(
+                icon_path,
+                text=self.tr(u'Vista 3D profili'),
+                callback=self.open_fence_dock,
+                parent=self.iface.mainWindow(),
+            )
+            self.fence_dock_action.setToolTip(
+                "Vista 3D dei profili GPR e delle sezioni ERT come tende verticali lungo le loro linee "
+                "reali: i profili che si incrociano si vedono incrociati."
+            )
+            cube_icon = self._qgis_theme_icon("3d.svg", "mActionNew3DMap.svg")
+            if cube_icon is not None and not cube_icon.isNull():
+                self.fence_dock_action.setIcon(cube_icon)
 
         self.check_updates_action = self.add_action(
             icon_path,
@@ -558,6 +583,38 @@ class GeoSurveyStudioPlugin(
             dock.raise_()
         return dock
 
+    def open_fence_dock(self, checked=False):
+        """Mostra (creandola se serve) la finestra "Vista 3D profili" con i profili GPR e le sezioni ERT."""
+        if not _HAS_FENCE_DOCK:
+            QMessageBox.warning(
+                self.iface.mainWindow(), "Vista 3D profili",
+                "Finestra non disponibile (componenti QGIS/matplotlib mancanti).")
+            return None
+        from qgis.PyQt.QtCore import Qt
+        dock = self._fence_dock
+        alive = False
+        if dock is not None:
+            try:
+                dock.objectName()
+                alive = True
+            except RuntimeError:
+                alive = False
+        if not alive:
+            dock = FenceDock(
+                self.iface,
+                workspace_provider=self._radargram_workspace_root,
+                zones_provider=getattr(self, "_radargram_zones", None),
+                project_root_provider=getattr(self, "_radargram_project_root", None),
+                geometry_provider=self._radargram_geometry_provider,
+                parent=self.iface.mainWindow(),
+                plotter_factory=self._fence_plotter_factory,
+            )
+            self.iface.addDockWidget(Qt.RightDockWidgetArea, dock)
+            self._fence_dock = dock
+        dock.show()
+        dock.raise_()
+        return dock
+
     def unload(self):
         """Unload the plugin."""
         try:
@@ -575,6 +632,14 @@ class GeoSurveyStudioPlugin(
             except Exception:
                 pass
             self._radargram_dock = None
+        if self._fence_dock is not None:
+            try:
+                self._fence_dock.cleanup()
+                self.iface.removeDockWidget(self._fence_dock)
+                self._fence_dock.deleteLater()
+            except Exception:
+                pass
+            self._fence_dock = None
         # Chiudi viewer GPR se aperto
         if self._gpr_profile_viewer is not None:
             try:

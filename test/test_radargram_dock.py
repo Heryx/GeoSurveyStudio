@@ -2605,6 +2605,7 @@ if HAS_ENV:
     _G = importlib.import_module("rasterlinker_feature_interpolation.gpr_ert_georef")
     _S = importlib.import_module("rasterlinker_feature_interpolation.gpr_ert_store")
     _D = importlib.import_module("rasterlinker_feature_interpolation.gpr_ert_import_dialog")
+    _FD = importlib.import_module("rasterlinker_feature_interpolation.gpr_fence_dock")
 
 
 def _ert_csv(path, length=10.0):
@@ -2982,7 +2983,6 @@ class FenceDockTest(_DockBase):
 
     def setUp(self):
         super().setUp()
-        self.dock._project_root_provider = lambda: self.root
         csv = os.path.join(self.root, "export.csv")
         _ert_csv(csv, length=40.0)
         # linea ERT ortogonale ai profili GPR: x = 500002, da y = -20 a y = +20
@@ -2993,16 +2993,26 @@ class FenceDockTest(_DockBase):
             from qgis.PyQt.QtWidgets import QLabel
         except ImportError:
             self.skipTest("pyvista non disponibile in questo interprete")
+        self._pv, self._QLabel = pv, QLabel
+        self.fence = self._make_fence()
+
+    def _make_fence(self, **kw):
         # niente QtInteractor: sotto la piattaforma Qt offscreen non esiste un contesto OpenGL e VTK va in crash
-        self.dock._fence_plotter_factory = lambda parent: (pv.Plotter(off_screen=True, window_size=(600, 400)),
-                                                          QLabel("3D", parent))
-        self.dock._act_fence.trigger()
-        self._pump(50)
-        self.fence = self.dock._fence
-        if self.fence is None or self.fence._plotter is None:
-            self.skipTest("pyvista/pyvistaqt non disponibili in questo interprete")
+        pv, QLabel = self._pv, self._QLabel
+        fence = _FD.FenceDock(
+            self.iface, workspace_provider=lambda: self.root, project_root_provider=lambda: self.root,
+            parent=self.iface.mainWindow(),
+            plotter_factory=lambda parent: (pv.Plotter(off_screen=True, window_size=(600, 400)), QLabel("3D", parent)),
+            **kw)
+        self.iface.addDockWidget(Qt.RightDockWidgetArea, fence)
+        fence.show()
+        self._pump(30)
+        return fence
 
     def tearDown(self):
+        fence = getattr(self, "fence", None)
+        if fence is not None:
+            fence.cleanup()
         super().tearDown()
 
     def _build(self, gpr=(), ert=()):
@@ -3060,7 +3070,7 @@ class FenceDockTest(_DockBase):
         csv = os.path.join(self.root, "export.csv")
         g = _G.ErtGeoref.from_endpoints((500003.0, -20.0), (500003.0, 20.0), 40.0, "EPSG:32632")
         _S.save_ert(self.root, "T2", csv, g)
-        self.dock._fence_refresh()
+        self.fence.refresh_variants()
         self.assertEqual(self.fence._tree.topLevelItem(1).childCount(), 2)
 
     def test_checks_survive_a_refresh(self):
@@ -3068,15 +3078,105 @@ class FenceDockTest(_DockBase):
         self.fence.refresh_lists()
         self.assertEqual([t for t, _ in self.fence.checked("gpr")], ["Swath2"])
 
-    def test_dock_cleanup_closes_the_fence(self):
-        self.dock.cleanup()
-        self.assertIsNone(self.dock._fence)
+    def test_cleanup_releases_the_plotter(self):
+        self.fence.cleanup()
         self.assertIsNone(self.fence._plotter)
+        self.fence.refresh_variants()               # dopo la pulizia non deve sollevare
+
+    def test_variant_and_zone_selection(self):
+        self.assertEqual(self.fence._cb_variant.count(), 2)
+        self.assertEqual(self.fence._store.name, "Lavoro")           # "Lavoro" e' la variante di default
+        self.assertTrue(self.fence._cb_zone.isHidden())               # un'area sola: nessun selettore
+        self._build(gpr=["Swath2"])
+        i = self.fence._cb_variant.findText("v3", Qt.MatchStartsWith)
+        self.fence._cb_variant.setCurrentIndex(i)
+        self.assertEqual(self.fence._store.name, "v3")
+        self.assertEqual(self.fence.checked("gpr"), [])               # altra variante: le spunte ripartono
+        self.assertEqual(self.fence._tree.topLevelItem(0).childCount(), 2)
+
+    def test_two_zones_show_the_zone_selector_and_switch_variants(self):
+        other = tempfile.mkdtemp()
+        try:
+            _write_variant(other, "Solo", ["Alfa", "Beta", "Gamma"])
+            zones = [{"name": "Zona1", "base": self.root, "active": True},
+                     {"name": "Zona2", "base": other, "active": False}]
+            fence = self._make_fence(zones_provider=lambda: zones)
+            try:
+                self.assertFalse(fence._cb_zone.isHidden())
+                fence._cb_zone.setCurrentIndex(fence._cb_zone.findData("Zona2"))
+                self.assertEqual(fence._store.name, "Solo")
+                self.assertEqual(fence._tree.topLevelItem(0).childCount(), 3)
+            finally:
+                fence.cleanup()
+        finally:
+            import shutil
+            shutil.rmtree(other, ignore_errors=True)
+
+    def test_import_button_adds_and_checks_the_new_section(self):
+        csv = os.path.join(self.root, "export.csv")
+        g = _G.ErtGeoref.from_endpoints((500003.0, -20.0), (500003.0, 20.0), 40.0, "EPSG:32632")
+        _S.save_ert(self.root, "T3", csv, g)
+        original = _FD.import_ert_section
+        _FD.import_ert_section = lambda *a, **k: ("T3", None)
+        try:
+            self.fence._import_ert()
+        finally:
+            _FD.import_ert_section = original
+        self.assertIn("T3", [t for t, _ in self.fence.checked("ert")])
+
+    def test_import_error_is_reported_in_the_window(self):
+        original = _FD.import_ert_section
+        _FD.import_ert_section = lambda *a, **k: (None, "Importazione ERT non riuscita: prova")
+        try:
+            self.fence._import_ert()
+        finally:
+            _FD.import_ert_section = original
+        self.assertIn("non riuscita", self.fence._txt_cross.toPlainText())
 
     def test_screenshot_is_not_blank(self):
         self._build(gpr=["Swath2", "Swath10"], ert=["T"])
         img = self.fence._plotter.screenshot(return_img=True)
         self.assertGreater(int(np.asarray(img).std()), 5)
+
+
+@unittest.skipUnless(HAS_ENV, "QGIS/matplotlib non disponibili")
+class FencePluginWiringTest(unittest.TestCase):
+    """open_fence_dock del plugin: pulsante proprio, crea una volta sola, si pulisce allo scaricamento."""
+
+    def test_open_fence_dock_creates_once_and_reuses(self):
+        try:
+            import pyvista as pv
+            from qgis.PyQt.QtWidgets import QLabel
+        except ImportError:
+            self.skipTest("pyvista non disponibile in questo interprete")
+        GS = importlib.import_module("rasterlinker_feature_interpolation.geosurvey_studio")
+        if not GS._HAS_FENCE_DOCK:
+            self.skipTest("finestra 3D non importabile")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as root:
+            _write_variant(root, "Lavoro", ["Swath1", "Swath2"])
+            iface = _Iface()
+            fake = types.SimpleNamespace(
+                iface=iface, _fence_dock=None, _gpr_profile_viewer=None, _radargram_dock=None,
+                settings=types.SimpleNamespace(value=lambda *a, **k: root),
+                settings_key_active_project="k",
+                _fence_plotter_factory=lambda parent: (pv.Plotter(off_screen=True, window_size=(400, 300)),
+                                                       QLabel("3D", parent)))
+            fake._radargram_project_root = lambda: GS.GeoSurveyStudioPlugin._radargram_project_root(fake)
+            fake._radargram_workspace_root = lambda: GS.GeoSurveyStudioPlugin._radargram_workspace_root(fake)
+            fake._live_profile_viewer = lambda: GS.GeoSurveyStudioPlugin._live_profile_viewer(fake)
+            fake._radargram_geometry_provider = lambda s: GS.GeoSurveyStudioPlugin._radargram_geometry_provider(fake, s)
+            dock = GS.GeoSurveyStudioPlugin.open_fence_dock(fake)
+            try:
+                self.assertIsNotNone(dock)
+                self.assertEqual(len(iface.docks), 1)
+                self.assertEqual(iface.docks[0][0], Qt.RightDockWidgetArea)
+                self.assertEqual(dock._store.name, "Lavoro")
+                self.assertEqual(dock._tree.topLevelItem(0).childCount(), 2)
+                self.assertIs(GS.GeoSurveyStudioPlugin.open_fence_dock(fake), dock)     # riusato
+                self.assertEqual(len(iface.docks), 1)
+            finally:
+                dock.cleanup()
+                dock.deleteLater()
 
 
 if __name__ == "__main__":
