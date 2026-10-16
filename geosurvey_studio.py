@@ -485,13 +485,23 @@ class GeoSurveyStudioPlugin(
         return None
 
     def _radargram_feature_sink(self, kind, variant_name, profile_stem, channel, epsg, vertices,
-                                 velocity_m_ns=None, rdp=None):
+                                 velocity_m_ns=None, rdp=None, **extra):
         """Ponte verso la pipeline "Line Traces": il RadargramDock non conosce QGIS
-        oltre l'essenziale, tutta la logica di layer/schema vive in TraceCaptureMixin."""
+        oltre l'essenziale, tutta la logica di layer/schema vive in TraceCaptureMixin.
+        `extra` porta classe, affidabilita', attributi e identificativo."""
         return self.capture_radargram_feature(
             kind=kind, variant_name=variant_name, profile_stem=profile_stem,
             channel=channel, epsg=epsg, vertices=vertices,
-            velocity_m_ns=velocity_m_ns, rdp=rdp)
+            velocity_m_ns=velocity_m_ns, rdp=rdp, **extra)
+
+    def _radargram_feature_update(self, trace_id, vertices=None, epsg=None, attributes=None):
+        """Ponte per modificare un'annotazione gia' disegnata (vertici e/o attributi)."""
+        return self.update_radargram_feature(
+            trace_id, vertices=vertices, epsg=epsg, attributes=attributes)
+
+    def _radargram_feature_delete(self, trace_id):
+        """Ponte per eliminare un'annotazione disegnata sul radargramma."""
+        return self.delete_radargram_feature(trace_id)
 
     def _radargram_feature_query(self, variant_name, profile_stem, channel):
         """Ponte verso TraceCaptureMixin per ridisegnare sul radargramma le geometrie
@@ -527,6 +537,8 @@ class GeoSurveyStudioPlugin(
                 geometry_provider=self._radargram_geometry_provider,
                 feature_sink=self._radargram_feature_sink,
                 feature_query=self._radargram_feature_query,
+                feature_update=getattr(self, "_radargram_feature_update", None),
+                feature_delete=getattr(self, "_radargram_feature_delete", None),
                 parent=self.iface.mainWindow(),
             )
             self.iface.addDockWidget(Qt.BottomDockWidgetArea, dock)

@@ -4,6 +4,7 @@
 import json
 import math
 import os
+import uuid
 from functools import partial
 
 from qgis.PyQt.QtCore import Qt, QVariant
@@ -96,11 +97,10 @@ class TraceCaptureCoreMixin:
         self.trace_pending_vertex_clicks = []
         self.trace_canvas_wheel_modifier = "alt"
         self.trace_discard_outside_raster = False
-        # A differenza del flusso di digitalizzazione in pianta (centinaia di
-        # tracce automatiche, dialogo opt-in via trace_prompt_interpretation_popup),
-        # il disegno sul radargramma e' un'azione deliberata e poco frequente:
-        # qui il dialogo per codice anomalia/note e' attivo di default.
-        self.trace_radargram_prompt_after_draw = True
+        # Il codice anomalia/note/interpretazione si compila ora nella scheda del
+        # pannello Radargrammi (non modale, accanto al disegno): il dialogo modale
+        # dopo ogni disegno resta disponibile ma spento di default.
+        self.trace_radargram_prompt_after_draw = False
 
     def _cleanup_trace_capture(self):
         """Teardown trace capture runtime state. Called by plugin unload()."""
@@ -245,6 +245,9 @@ class TraceCaptureCoreMixin:
             ("rdp", QVariant.Double, 0),
             ("source", QVariant.String, 32),
             ("anomaly_id", QVariant.String, 128),
+            ("class_code", QVariant.String, 64),
+            ("class_label", QVariant.String, 128),
+            ("confidence", QVariant.String, 16),
         )
         provider = layer.dataProvider()
         if provider is not None:
@@ -1173,19 +1176,61 @@ class TraceCaptureCoreMixin:
             return QgsGeometry.fromPolygonXY([ring])
         return None
 
+    # Attributi di testo modificabili dopo il disegno (scheda del pannello Radargrammi).
+    _RADARGRAM_EDITABLE_ATTRS = (
+        "class_code", "class_label", "confidence", "anomaly_id", "interpretation", "notes", "comment",
+    )
+
+    def _radargram_vertex_attributes(self, verts):
+        """Attributi che dipendono solo dai vertici (profondita', tempo, ampiezza).
+
+        Ogni vertice porta la profondita' `d` (m) e, se nota, il tempo doppio `t`
+        (ns): la profondita' dipende dalla velocita' scelta, il tempo no, quindi
+        l'annotazione si puo' sempre riancorare al segnale del radargramma.
+        """
+        depths = [float(v.get("depth_m")) for v in verts]
+        amps = [float(v["amp"]) for v in verts if v.get("amp") is not None]
+        vertex_rows = []
+        for i, v in enumerate(verts):
+            row = {"i": i + 1, "d": depths[i], "dmin": depths[i], "dmax": depths[i], "u": "m", "s": "hit"}
+            if v.get("amp") is not None:
+                row["amp"] = float(v["amp"])
+            if v.get("twt_ns") is not None:
+                row["t"] = round(float(v["twt_ns"]), 4)
+            vertex_rows.append(row)
+        depth_from, depth_to = min(depths), max(depths)
+        return {
+            "depth_list": self._format_depth_pair(depth_from, depth_to, "m"),
+            "depth_from": depth_from,
+            "depth_to": depth_to,
+            "z_value": self._depth_value_from_pair(depth_from, depth_to),
+            "vertex_depths": self._serialize_vertex_depths(vertex_rows),
+            "amplitude": (sum(amps) / len(amps)) if amps else None,
+        }
+
+    @staticmethod
+    def _new_radargram_trace_id():
+        # Il secondo non basta (piu' punti in rapida successione): suffisso casuale.
+        return f"tr_{utc_now_iso()}_{uuid.uuid4().hex[:6]}".replace(":", "").replace("+", "_")
+
     def capture_radargram_feature(self, kind, variant_name, profile_stem, channel, epsg, vertices,
-                                   velocity_m_ns=None, rdp=None):
+                                   velocity_m_ns=None, rdp=None, class_code=None, class_label=None,
+                                   confidence=None, attributes=None, trace_id=None):
         """Crea una feature (punto/linea/poligono) disegnata sul radargramma.
 
         Chiamata dal `feature_sink` passato a `RadargramDock`: i vertici arrivano
         gia' in coordinate reali (est, nord, profondita' in m, opzionalmente
-        ampiezza campionata al clic), calcolate dal dock a partire dal clic sul
-        radargramma (vedi `_add_draw_vertex` in gpr_radargram_dock.py). Qui si
-        costruisce solo la geometria/gli attributi e si scrive nel layer, riusando
-        lo stesso schema della linea in pianta. `velocity_m_ns`/`rdp` sono la
-        velocita' di riferimento preimpostata per il profilo al momento del clic
-        (vedi gpr_velocity_store.py) - registrata sulla feature per tracciabilita',
-        non ricalcolata qui.
+        tempo doppio in ns e ampiezza campionata al clic), calcolate dal dock a
+        partire dal clic sul radargramma (vedi `_add_draw_vertex` in
+        gpr_radargram_dock.py). Qui si costruisce solo la geometria/gli attributi e
+        si scrive nel layer, riusando lo stesso schema della linea in pianta.
+        `velocity_m_ns`/`rdp` sono la velocita' di riferimento preimpostata per il
+        profilo al momento del clic (vedi gpr_velocity_store.py) - registrata sulla
+        feature per tracciabilita', non ricalcolata qui. `class_code`/`class_label`/
+        `confidence` dicono che segnale e' (iperbole, riflettore, attenuazione...)
+        e quanto e' sicura l'interpretazione; `attributes` porta gli altri campi di
+        testo (vedi `_RADARGRAM_EDITABLE_ATTRS`) e `trace_id` permette di
+        ricreare una feature cancellata con lo stesso identificativo (annulla).
         """
         geom_kind = str(kind or "").strip().lower()
         if geom_kind not in ("point", "line", "polygon"):
@@ -1204,44 +1249,33 @@ class TraceCaptureCoreMixin:
         if geometry is None or geometry.isEmpty():
             raise RuntimeError("Geometria non valida (vertici insufficienti o coincidenti).")
 
-        depths = [float(v.get("depth_m")) for v in verts]
-        amps = [float(v["amp"]) for v in verts if v.get("amp") is not None]
-        vertex_rows = []
-        for i, v in enumerate(verts):
-            row = {"i": i + 1, "d": depths[i], "dmin": depths[i], "dmax": depths[i], "u": "m", "s": "hit"}
-            if v.get("amp") is not None:
-                row["amp"] = float(v["amp"])
-            vertex_rows.append(row)
-        depth_from, depth_to = min(depths), max(depths)
-        z_value = self._depth_value_from_pair(depth_from, depth_to)
-        amplitude = (sum(amps) / len(amps)) if amps else None
-
         feat = QgsFeature(layer.fields())
         feat.setGeometry(geometry)
-        trace_id = f"tr_{utc_now_iso()}".replace(":", "").replace("+", "_")
+        trace_id = str(trace_id or "").strip() or self._new_radargram_trace_id()
         values = {
             "trace_id": trace_id,
             "ts_id": "",
             "ts_name": "",
             "group_name": str(variant_name or ""),
-            "depth_list": self._format_depth_pair(depth_from, depth_to, "m"),
-            "depth_from": depth_from,
-            "depth_to": depth_to,
             "depth_unit": "m",
             "z_source": "radargram",
             "z_grid_path": "",
             "z_mode": "profile_pick",
-            "z_value": z_value,
             "created_at": utc_now_iso(),
-            "vertex_depths": self._serialize_vertex_depths(vertex_rows),
             "profile_stem": str(profile_stem or ""),
             "channel": int(channel) if channel is not None else None,
-            "amplitude": amplitude,
             "velocity_m_ns": float(velocity_m_ns) if velocity_m_ns is not None else None,
             "rdp": float(rdp) if rdp is not None else None,
             "source": "radargramma",
             "anomaly_id": "",
+            "class_code": str(class_code or ""),
+            "class_label": str(class_label or ""),
+            "confidence": str(confidence or ""),
         }
+        values.update(self._radargram_vertex_attributes(verts))
+        for name, value in (attributes or {}).items():
+            if name in self._RADARGRAM_EDITABLE_ATTRS and value is not None:
+                values[name] = str(value)
         for name, value in values.items():
             idx = layer.fields().indexOf(name)
             if idx >= 0:
@@ -1272,6 +1306,82 @@ class TraceCaptureCoreMixin:
         except Exception:
             pass
         return feat
+
+    def _find_radargram_feature(self, trace_id):
+        """(tipo, layer, feature) della geometria con quel `trace_id`, o None."""
+        trace_id = str(trace_id or "").strip()
+        if not trace_id:
+            return None
+        for geom_kind, layer_name in _RADARGRAM_TRACE_LAYER_NAMES.items():
+            for lyr in QgsProject.instance().mapLayers().values():
+                if not (isinstance(lyr, QgsVectorLayer) and lyr.isValid() and lyr.name() == layer_name):
+                    continue
+                if lyr.fields().indexOf("trace_id") < 0:
+                    break
+                for feat in lyr.getFeatures():
+                    if str(feat.attribute("trace_id") or "") == trace_id:
+                        return geom_kind, lyr, feat
+                break
+        return None
+
+    def _after_radargram_feature_change(self, layer):
+        layer.updateExtents()
+        layer.triggerRepaint()
+        if hasattr(self, "refresh_trace_info_table"):
+            try:
+                self.refresh_trace_info_table()
+            except Exception:
+                pass
+
+    def update_radargram_feature(self, trace_id, vertices=None, epsg=None, attributes=None):
+        """Modifica una geometria gia' disegnata: vertici e/o attributi di testo.
+
+        Con `vertices` (stesso formato di `capture_radargram_feature`, `epsg` del
+        profilo) cambiano geometria, profondita' e tempo; il tipo (punto/linea/
+        poligono) non cambia mai. `attributes` accetta solo i campi in
+        `_RADARGRAM_EDITABLE_ATTRS`.
+        """
+        found = self._find_radargram_feature(trace_id)
+        if found is None:
+            raise KeyError(f"Annotazione non trovata: {trace_id!r}")
+        geom_kind, layer, feat = found
+        provider = layer.dataProvider()
+        fid = feat.id()
+        attr_changes = {}
+        if vertices is not None:
+            verts = list(vertices)
+            min_needed = {"point": 1, "line": 2, "polygon": 3}[geom_kind]
+            if len(verts) < min_needed:
+                raise ValueError(f"Servono almeno {min_needed} vertici per una geometria '{geom_kind}'.")
+            points = self._radargram_points_to_layer_crs(verts, epsg, layer)
+            geometry = self._radargram_geometry_from_points(geom_kind, points)
+            if geometry is None or geometry.isEmpty():
+                raise RuntimeError("Geometria non valida (vertici insufficienti o coincidenti).")
+            for name, value in self._radargram_vertex_attributes(verts).items():
+                idx = layer.fields().indexOf(name)
+                if idx >= 0:
+                    attr_changes[idx] = value
+            if not provider.changeGeometryValues({fid: geometry}):
+                raise RuntimeError("Il layer ha rifiutato la nuova geometria.")
+        for name, value in (attributes or {}).items():
+            idx = layer.fields().indexOf(name)
+            if name in self._RADARGRAM_EDITABLE_ATTRS and idx >= 0:
+                attr_changes[idx] = "" if value is None else str(value)
+        if attr_changes and not provider.changeAttributeValues({fid: attr_changes}):
+            raise RuntimeError("Il layer ha rifiutato i nuovi attributi.")
+        self._after_radargram_feature_change(layer)
+        return True
+
+    def delete_radargram_feature(self, trace_id):
+        """Elimina una geometria disegnata sul radargramma. False se non esiste."""
+        found = self._find_radargram_feature(trace_id)
+        if found is None:
+            return False
+        _geom_kind, layer, feat = found
+        if not layer.dataProvider().deleteFeatures([feat.id()]):
+            raise RuntimeError("Il layer ha rifiutato l'eliminazione.")
+        self._after_radargram_feature_change(layer)
+        return True
 
     @staticmethod
     def _radargram_feature_vertex_points(geom_kind, geometry):
@@ -1311,6 +1421,20 @@ class TraceCaptureCoreMixin:
         stem = str(profile_stem or "")
         variant = str(variant_name or "")
 
+        def text_attr(feat, name):
+            if feat.fields().indexOf(name) < 0:
+                return ""
+            value = feat.attribute(name)
+            return "" if value is None or str(value) == "NULL" else str(value)
+
+        def num_attr(feat, name):
+            if feat.fields().indexOf(name) < 0:
+                return None
+            try:
+                return float(feat.attribute(name))
+            except (TypeError, ValueError):
+                return None
+
         out = []
         for geom_kind, layer_name in _RADARGRAM_TRACE_LAYER_NAMES.items():
             for lyr in QgsProject.instance().mapLayers().values():
@@ -1337,20 +1461,32 @@ class TraceCaptureCoreMixin:
                     if geometry is None or geometry.isEmpty():
                         continue
                     pts = self._radargram_feature_vertex_points(geom_kind, geometry)
-                    depths = []
+                    depths, twts, amps = [], [], []
                     if idx_vd >= 0:
                         try:
-                            rows = json.loads(str(feat.attribute(idx_vd) or "[]"))
-                            depths = [float(r.get("d")) for r in rows if isinstance(r, dict) and r.get("d") is not None]
+                            rows = [r for r in json.loads(str(feat.attribute(idx_vd) or "[]"))
+                                    if isinstance(r, dict) and r.get("d") is not None]
+                            depths = [float(r.get("d")) for r in rows]
+                            twts = [float(r["t"]) if r.get("t") is not None else None for r in rows]
+                            amps = [float(r["amp"]) if r.get("amp") is not None else None for r in rows]
                         except Exception:
-                            depths = []
+                            depths, twts, amps = [], [], []
                     if len(depths) != len(pts):
                         continue    # dato incoerente: meglio non disegnare che disegnare male
                     out.append({
+                        "id": text_attr(feat, "trace_id"),
                         "kind": geom_kind,
+                        "class_code": text_attr(feat, "class_code"),
+                        "class_label": text_attr(feat, "class_label"),
+                        "confidence": text_attr(feat, "confidence"),
+                        "anomaly_id": text_attr(feat, "anomaly_id"),
+                        "interpretation": text_attr(feat, "interpretation"),
+                        "notes": text_attr(feat, "notes"),
+                        "velocity_m_ns": num_attr(feat, "velocity_m_ns"),
+                        "rdp": num_attr(feat, "rdp"),
                         "vertices": [
-                            {"east": float(p.x()), "north": float(p.y()), "depth_m": d}
-                            for p, d in zip(pts, depths)
+                            {"east": float(p.x()), "north": float(p.y()), "depth_m": d, "twt_ns": t, "amp": a}
+                            for p, d, t, a in zip(pts, depths, twts, amps)
                         ],
                     })
                 break   # un solo layer per nome nel progetto

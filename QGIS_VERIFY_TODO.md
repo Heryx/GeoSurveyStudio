@@ -357,3 +357,30 @@ sul progetto SUASA.
    preimpostata come prima (nessuna regressione per chi lo usa solo così). Cambiare
    profilo/canale o attivare "Calcola con iperbole" durante la misura: **atteso**
    l'apice si scarta silenziosamente.
+
+## Annotazioni sul radargramma: classi di segnale, modifica, tempo (Fase 1, 2026-10-15)
+
+Verificato solo offscreen (test automatici): l'aspetto reale dei controlli e la
+fluidità del trascinamento vanno provati in QGIS.
+
+1. **Classi e tasti 1-9**: nel pannello Radargrammi cliccare sul radargramma, premere
+   `1`, `2`, `3`. **Atteso**: il menu "Segnale" cambia classe e si attiva da solo lo
+   strumento giusto (punto per iperbole, linea per riflettore, poligono per
+   attenuazione). Disegnare un'annotazione: compare nel colore della classe e si apre
+   la scheda "Annotazione" sotto i comandi (classe, affidabilità, codice,
+   interpretazione, note), **senza** dialogo modale.
+2. **Modifica**: pulsante "Modifica". Clic su un'annotazione -> si seleziona (vertici
+   come quadratini). Trascinare un vertice: si sposta e si salva al rilascio. Doppio
+   clic su un segmento = nuovo vertice; clic destro su un vertice = lo toglie (mai
+   sotto 1/2/3 vertici); `Canc` elimina; `1`-`9` cambiano la classe; `Esc` deseleziona.
+   **Ctrl+Z / Ctrl+Y** (o i pulsanti ↶ ↷) annullano e ripetono, anche l'eliminazione.
+   In QGIS aprire la tabella attributi di "Radargram Lines/Points/Polygons": le
+   modifiche ci sono (campi nuovi `class_code`, `class_label`, `confidence`).
+3. **Ancoraggio al segnale (tempo ns)**: disegnare una linea su un riflettore, poi
+   cambiare "Velocità" (m/ns). **Atteso**: l'annotazione resta sul riflettore (la
+   scala di profondità cambia, l'annotazione la segue). Le annotazioni fatte prima di
+   questa versione non hanno il tempo e restano alla profondità salvata.
+4. **⚙ Gestisci classi**: aggiungere/rinominare/cambiare colore; chiudere e riaprire il
+   progetto -> le classi restano (`<progetto>/metadata/annotation_classes.json`).
+5. Il vecchio dialogo "codice anomalia/note" dopo ogni disegno è ora spento
+   (`trace_radargram_prompt_after_draw = False`): confermare che la scheda basta.

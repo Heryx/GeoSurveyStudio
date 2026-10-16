@@ -350,6 +350,128 @@ class CaptureRadargramFeatureTest(unittest.TestCase):
         lines_color = lines.renderer().symbol().color().name()
         self.assertNotEqual(points_color, lines_color)   # colori diversi per tipo di geometria
 
+    # -- classi di segnale, tempo doppio, modifica e cancellazione ------------------------
+
+    def _two_vertices(self, **extra):
+        return dict(
+            kind="line", variant_name="Lavoro", profile_stem="Swath2", channel=0, epsg=32632,
+            vertices=[{"east": 500000.0, "north": 10.0, "depth_m": 0.05, "twt_ns": 1.0},
+                      {"east": 500001.0, "north": 10.0, "depth_m": 0.10, "twt_ns": 2.0}],
+            **extra)
+
+    def test_capture_stores_class_confidence_and_two_way_time_per_vertex(self):
+        h = self.harness
+        h.capture_radargram_feature(**self._two_vertices(
+            class_code="riflettore", class_label="Riflettore / interfaccia", confidence="certo",
+            attributes={"anomaly_id": "A7", "notes": "continua sul profilo vicino"}))
+        stored = next(QgsProject.instance().mapLayersByName("Radargram Lines")[0].getFeatures())
+        self.assertEqual(stored.attribute("class_code"), "riflettore")
+        self.assertEqual(stored.attribute("class_label"), "Riflettore / interfaccia")
+        self.assertEqual(stored.attribute("confidence"), "certo")
+        self.assertEqual(stored.attribute("anomaly_id"), "A7")
+        self.assertEqual(stored.attribute("notes"), "continua sul profilo vicino")
+        vd = json.loads(stored.attribute("vertex_depths"))
+        self.assertEqual([row["t"] for row in vd], [1.0, 2.0])
+        self.assertEqual([row["d"] for row in vd], [0.05, 0.10])
+
+    def test_vertices_without_time_still_work(self):
+        h = self.harness
+        h.capture_radargram_feature(
+            kind="point", variant_name="Lavoro", profile_stem="Swath2", channel=0, epsg=32632,
+            vertices=[{"east": 500000.0, "north": 10.0, "depth_m": 0.05}])
+        stored = next(QgsProject.instance().mapLayersByName("Radargram Points")[0].getFeatures())
+        self.assertNotIn("t", json.loads(stored.attribute("vertex_depths"))[0])
+        found = h.query_radargram_features("Lavoro", "Swath2", 0)
+        self.assertIsNone(found[0]["vertices"][0]["twt_ns"])
+
+    def test_trace_ids_are_unique_even_within_the_same_second(self):
+        h = self.harness
+        ids = set()
+        for _ in range(5):
+            feat = h.capture_radargram_feature(
+                kind="point", variant_name="Lavoro", profile_stem="Swath2", channel=0, epsg=32632,
+                vertices=[{"east": 500000.0, "north": 10.0, "depth_m": 0.05}])
+            ids.add(feat.attribute("trace_id"))
+        self.assertEqual(len(ids), 5)
+
+    def test_query_returns_identifier_class_and_texts(self):
+        h = self.harness
+        h.capture_radargram_feature(**self._two_vertices(
+            class_code="riflettore", confidence="possibile", attributes={"interpretation": "piano d'uso"}))
+        found = h.query_radargram_features("Lavoro", "Swath2", 0)
+        self.assertEqual(len(found), 1)
+        feat = found[0]
+        self.assertTrue(feat["id"].startswith("tr_"))
+        self.assertEqual(feat["class_code"], "riflettore")
+        self.assertEqual(feat["confidence"], "possibile")
+        self.assertEqual(feat["interpretation"], "piano d'uso")
+        self.assertEqual(feat["anomaly_id"], "")
+        self.assertEqual([v["twt_ns"] for v in feat["vertices"]], [1.0, 2.0])
+
+    def test_update_moves_vertices_and_recomputes_depth_range(self):
+        h = self.harness
+        feat = h.capture_radargram_feature(**self._two_vertices(class_code="riflettore"))
+        tid = feat.attribute("trace_id")
+        h.update_radargram_feature(tid, epsg=32632, vertices=[
+            {"east": 500000.0, "north": 10.0, "depth_m": 0.20, "twt_ns": 4.0},
+            {"east": 500002.5, "north": 10.0, "depth_m": 0.30, "twt_ns": 6.0},
+            {"east": 500004.0, "north": 10.0, "depth_m": 0.25, "twt_ns": 5.0}])
+        layer = QgsProject.instance().mapLayersByName("Radargram Lines")[0]
+        self.assertEqual(layer.featureCount(), 1)
+        stored = next(layer.getFeatures())
+        self.assertEqual(stored.attribute("trace_id"), tid)               # stesso identificativo
+        self.assertEqual(stored.attribute("class_code"), "riflettore")    # attributi non toccati
+        self.assertEqual(len(stored.geometry().asPolyline()), 3)
+        self.assertAlmostEqual(stored.attribute("depth_from"), 0.20, places=6)
+        self.assertAlmostEqual(stored.attribute("depth_to"), 0.30, places=6)
+        self.assertEqual([r["t"] for r in json.loads(stored.attribute("vertex_depths"))], [4.0, 6.0, 5.0])
+
+    def test_update_changes_only_the_allowed_text_attributes(self):
+        h = self.harness
+        feat = h.capture_radargram_feature(**self._two_vertices(class_code="riflettore"))
+        tid = feat.attribute("trace_id")
+        h.update_radargram_feature(tid, attributes={
+            "class_code": "struttura", "confidence": "certo", "anomaly_id": "M1",
+            "notes": "muro", "trace_id": "hack", "profile_stem": "altro"})
+        stored = next(QgsProject.instance().mapLayersByName("Radargram Lines")[0].getFeatures())
+        self.assertEqual(stored.attribute("class_code"), "struttura")
+        self.assertEqual(stored.attribute("anomaly_id"), "M1")
+        self.assertEqual(stored.attribute("trace_id"), tid)
+        self.assertEqual(stored.attribute("profile_stem"), "Swath2")
+        self.assertEqual(len(stored.geometry().asPolyline()), 2)           # geometria intatta
+
+    def test_update_rejects_unknown_feature_and_too_few_vertices(self):
+        h = self.harness
+        with self.assertRaises(KeyError):
+            h.update_radargram_feature("tr_non_esiste", attributes={"notes": "x"})
+        feat = h.capture_radargram_feature(**self._two_vertices())
+        with self.assertRaises(ValueError):
+            h.update_radargram_feature(
+                feat.attribute("trace_id"), epsg=32632,
+                vertices=[{"east": 500000.0, "north": 10.0, "depth_m": 0.05}])
+
+    def test_delete_removes_the_feature_and_it_can_be_restored_with_the_same_id(self):
+        h = self.harness
+        feat = h.capture_radargram_feature(**self._two_vertices(class_code="riflettore", confidence="certo"))
+        tid = feat.attribute("trace_id")
+        layer = QgsProject.instance().mapLayersByName("Radargram Lines")[0]
+        snapshot = h.query_radargram_features("Lavoro", "Swath2", 0)[0]
+        self.assertTrue(h.delete_radargram_feature(tid))
+        self.assertEqual(layer.featureCount(), 0)
+        self.assertFalse(h.delete_radargram_feature(tid))                 # gia' sparita
+        self.assertEqual(h.query_radargram_features("Lavoro", "Swath2", 0), [])
+        # annulla: si ricrea con lo stesso identificativo e gli stessi dati
+        h.capture_radargram_feature(**self._two_vertices(
+            class_code=snapshot["class_code"], confidence=snapshot["confidence"], trace_id=tid))
+        back = h.query_radargram_features("Lavoro", "Swath2", 0)
+        self.assertEqual([f["id"] for f in back], [tid])
+        self.assertEqual(back[0]["class_code"], "riflettore")
+
+    def test_modal_dialog_is_off_by_default_on_the_plugin(self):
+        h = self.harness
+        h._init_trace_capture()
+        self.assertFalse(h.trace_radargram_prompt_after_draw)
+
 
 if __name__ == "__main__":
     unittest.main()

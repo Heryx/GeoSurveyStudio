@@ -1029,6 +1029,515 @@ class DockTest(_DockBase):
         self.assertEqual(d._persisted_artists, [])
 
 
+class _FakeAnnotationLayer:
+    """Archivio in memoria con la stessa interfaccia dei ponti verso il layer vero
+    (sink / query / update / delete): il layer reale e' coperto da test_radargram_capture."""
+
+    EDITABLE = ("class_code", "class_label", "confidence", "anomaly_id", "interpretation", "notes")
+
+    def __init__(self):
+        self.items = {}
+        self.n = 0
+        self.updates = []
+        self.deletes = []
+
+    def sink(self, **kw):
+        self.n += 1
+        fid = kw.get("trace_id") or f"tr_fake_{self.n}"
+        rec = {"id": fid, "kind": kw["kind"], "variant": kw["variant_name"], "stem": kw["profile_stem"],
+               "channel": kw["channel"], "velocity_m_ns": kw.get("velocity_m_ns"), "rdp": kw.get("rdp"),
+               "class_code": kw.get("class_code") or "", "class_label": kw.get("class_label") or "",
+               "confidence": kw.get("confidence") or "", "anomaly_id": "", "interpretation": "", "notes": "",
+               "vertices": [dict(v) for v in kw["vertices"]]}
+        for k, v in (kw.get("attributes") or {}).items():
+            rec[k] = v
+        self.items[fid] = rec
+        return {"id": fid}
+
+    def query(self, variant, stem, channel):
+        return [dict(r) for r in self.items.values()
+                if (r["stem"], r["channel"]) == (stem, channel)]
+
+    def update(self, trace_id, vertices=None, epsg=None, attributes=None):
+        if trace_id not in self.items:
+            raise KeyError(trace_id)
+        self.updates.append({"id": trace_id, "vertices": vertices, "attributes": attributes})
+        if vertices is not None:
+            self.items[trace_id]["vertices"] = [dict(v) for v in vertices]
+        for k, v in (attributes or {}).items():
+            if k in self.EDITABLE:
+                self.items[trace_id][k] = v
+
+    def delete(self, trace_id):
+        self.deletes.append(trace_id)
+        return self.items.pop(trace_id, None) is not None
+
+
+@unittest.skipUnless(HAS_ENV, "QGIS/matplotlib non disponibili")
+class AnnotationTest(_DockBase):
+    """Classi di segnale, tempo doppio, selezione e modifica sul radargramma."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = _FakeAnnotationLayer()
+        d = self.dock
+        d._feature_sink = self.fake.sink
+        d._feature_query = self.fake.query
+        d._feature_update = self.fake.update
+        d._feature_delete = self.fake.delete
+
+    def _key(self, key):
+        self.dock._on_key(types.SimpleNamespace(key=key))
+
+    def _press(self, x, z, **kw):
+        self.dock._on_mouse_press(self._event("button_press_event", x, z, **kw))
+
+    def _move(self, x, z):
+        self.dock._on_mouse_move(self._event("motion_notify_event", x, z))
+
+    def _release(self, x, z):
+        self.dock._on_mouse_release(self._event("button_release_event", x, z))
+
+    def _draw_line(self, p0=(1.0, 0.05), p1=(2.0, 0.10), key="2"):
+        self._key(key)                              # riflettore: arma lo strumento linea
+        self._press(*p0)
+        self._press(*p1)
+        self._key("enter")
+        return next(iter(self.fake.items.values()))
+
+    def _edit_mode_with_nothing_selected(self):
+        d = self.dock
+        d._btn_edit.setChecked(True)
+        d._select_feature(None)
+
+    # -- classi ---------------------------------------------------------------------
+
+    def test_classes_are_listed_with_colours_and_default_to_the_first(self):
+        d = self.dock
+        self.assertGreaterEqual(d._cb_class.count(), 3)
+        self.assertEqual(d._cb_class.itemData(0), "iperbole")
+        self.assertTrue(d._cb_class.itemText(0).startswith("1 · "))
+        self.assertFalse(d._cb_class.itemIcon(0).isNull())
+        self.assertEqual(d._cur_class, "iperbole")
+
+    def test_number_keys_choose_the_class_and_arm_its_geometry(self):
+        d = self.dock
+        self._key("3")                              # attenuazione -> poligono
+        self.assertEqual(d._cur_class, "attenuazione")
+        self.assertEqual(d._draw_mode, "polygon")
+        self.assertTrue(d._btn_draw_polygon.isChecked())
+        self._key("2")                              # riflettore -> linea
+        self.assertEqual(d._draw_mode, "line")
+        self.assertFalse(d._btn_draw_polygon.isChecked())
+        self._key("1")                              # iperbole -> punto
+        self.assertEqual(d._draw_mode, "point")
+        self._key("9")                              # non esiste: nessun effetto
+        self.assertEqual(d._cur_class, "iperbole")
+
+    def test_changing_class_in_the_middle_of_a_drawing_keeps_the_geometry(self):
+        d = self.dock
+        self._key("2")
+        self._press(1.0, 0.05)
+        self._key("3")                              # a meta' di una linea: cambia solo la classe
+        self.assertEqual(d._draw_mode, "line")
+        self.assertEqual(len(d._draw_vertices), 1)
+        self.assertEqual(d._cur_class, "attenuazione")
+
+    def test_class_menu_arms_the_geometry_too(self):
+        d = self.dock
+        d._cb_class.setCurrentIndex(2)
+        d._on_class_activated(2)
+        self.assertEqual(d._draw_mode, "polygon")
+
+    def test_the_last_class_is_remembered(self):
+        from qgis.PyQt.QtCore import QSettings
+        self._key("2")
+        self.assertEqual(str(QSettings().value("GeoSurveyStudio/radargram_dock/class")), "riflettore")
+
+    def test_classes_come_from_the_project_file_when_there_is_one(self):
+        AC = importlib.import_module("rasterlinker_feature_interpolation.gpr_annotation_classes")
+        AC.save_classes(self.root, [{"code": "vuoto", "label": "Vuoto", "geometry": "polygon", "color": "#123456"}])
+        self.dock._project_root_provider = lambda: self.root
+        self.dock._reload_classes()
+        self.assertEqual(self.dock._cb_class.count(), 1)
+        self.assertEqual(self.dock._cur_class, "vuoto")
+
+    # -- disegno con classe e tempo -----------------------------------------------------
+
+    def test_drawn_feature_carries_class_confidence_and_two_way_time(self):
+        d = self.dock
+        d._cb_conf.setCurrentIndex(d._cb_conf.findData("certo"))
+        d._on_conf_activated(d._cb_conf.currentIndex())
+        rec = self._draw_line()
+        self.assertEqual(rec["class_code"], "riflettore")
+        self.assertEqual(rec["class_label"], "Riflettore / interfaccia")
+        self.assertEqual(rec["confidence"], "certo")
+        dt = d._store.profiles[d._pi].dt_ns
+        for v in rec["vertices"]:
+            self.assertAlmostEqual(v["twt_ns"], v["depth_m"] / d._cur.dz_m * dt, places=6)
+        self.assertLess(rec["vertices"][0]["twt_ns"], rec["vertices"][1]["twt_ns"])
+
+    def test_new_feature_is_selected_shown_in_the_card_and_drawn_in_its_class_colour(self):
+        d = self.dock
+        rec = self._draw_line()
+        self.assertEqual(d._sel_id, rec["id"])
+        self.assertFalse(d._card.isHidden())
+        self.assertEqual(d._cb_card_class.currentData(), "riflettore")
+        self.assertEqual(d._cb_card_conf.currentData(), "probabile")
+        self.assertTrue(d._edit_line.get_visible())
+        self.assertEqual(len(d._edit_handles.get_xdata()), 2)
+        # una volta deselezionata sparisce la scheda e compare l'overlay col colore della classe
+        d._select_feature(None)
+        self.assertTrue(d._card.isHidden())
+        self.assertEqual(len(d._persisted_artists), 1)
+        AC = importlib.import_module("rasterlinker_feature_interpolation.gpr_annotation_classes")
+        want = AC.color_for(d._classes, "riflettore")
+        from matplotlib.colors import to_hex
+        self.assertEqual(to_hex(d._persisted_artists[0].get_color()), want)
+
+    def test_starting_a_new_drawing_closes_the_card_of_the_previous_one(self):
+        d = self.dock
+        self._draw_line()
+        self.assertFalse(d._card.isHidden())
+        self._press(3.0, 0.05)
+        self.assertIsNone(d._sel_id)
+        self.assertTrue(d._card.isHidden())
+
+    def test_annotations_stay_on_the_signal_when_the_velocity_changes(self):
+        d = self.dock
+        rec = self._draw_line()
+        d._select_feature(None)
+        z_before = [p["depth_m"] for p in d._features[0]["pts"]]
+        saved_t = [v["twt_ns"] for v in rec["vertices"]]
+        d._spin_vel_mns.setValue(0.05)              # velocita' diversa: cambia la scala di profondita'
+        dt = d._store.profiles[d._pi].dt_ns
+        z_after = [p["depth_m"] for p in d._features[0]["pts"]]
+        self.assertNotAlmostEqual(z_before[1], z_after[1], places=3)
+        for t, z in zip(saved_t, z_after):
+            self.assertAlmostEqual(z, t / dt * d._cur.dz_m, places=6)   # stesso tempo, nuova profondita'
+
+    def test_annotations_without_time_stay_at_their_saved_depth(self):
+        d = self.dock
+        ch = d._cur
+        p0, p1 = ch.position(ch.trace_at_distance(1.0)), ch.position(ch.trace_at_distance(2.0))
+        self.fake.items["old"] = {
+            "id": "old", "kind": "line", "stem": d._store.profiles[d._pi].stem, "channel": d._ci,
+            "class_code": "", "class_label": "", "confidence": "", "anomaly_id": "", "interpretation": "",
+            "notes": "", "vertices": [{"east": p0[0], "north": p0[1], "depth_m": 0.05, "twt_ns": None},
+                                      {"east": p1[0], "north": p1[1], "depth_m": 0.09, "twt_ns": None}]}
+        d._refresh_persisted_features()
+        self.assertEqual([p["depth_m"] for p in d._features[0]["pts"]], [0.05, 0.09])
+        from matplotlib.colors import to_hex
+        self.assertEqual(to_hex(d._persisted_artists[0].get_color()), "#00e5ff")   # senza classe: colore neutro
+
+    # -- modifica -------------------------------------------------------------------
+
+    def test_edit_tool_is_exclusive_with_the_other_tools(self):
+        d = self.dock
+        d._btn_draw_line.setChecked(True)
+        d._btn_edit.setChecked(True)
+        self.assertIsNone(d._draw_mode)
+        self.assertFalse(d._btn_draw_line.isChecked())
+        d._btn_vel.setChecked(True)
+        self.assertFalse(d._btn_edit.isChecked())
+        d._btn_edit.setChecked(True)
+        self.assertFalse(d._btn_vel.isChecked())
+        d._btn_draw_point.setChecked(True)
+        self.assertFalse(d._btn_edit.isChecked())
+
+    def test_click_selects_an_annotation_and_a_click_elsewhere_deselects(self):
+        d = self.dock
+        rec = self._draw_line()
+        self._edit_mode_with_nothing_selected()
+        self._press(1.5, 0.075)                     # a meta' del segmento
+        self.assertEqual(d._sel_id, rec["id"])
+        self.assertFalse(d._card.isHidden())
+        self._release(1.5, 0.075)
+        self._press(4.0, 0.2)                       # lontano da tutto
+        self.assertIsNone(d._sel_id)
+        self.assertTrue(d._card.isHidden())
+
+    def test_click_inside_a_polygon_selects_it_and_the_smaller_one_wins(self):
+        d = self.dock
+        self._key("3")
+        for x, z in ((1.0, 0.04), (3.0, 0.04), (3.0, 0.14), (1.0, 0.14)):
+            self._press(x, z)
+        self._key("enter")
+        big = next(iter(self.fake.items))
+        for x, z in ((1.8, 0.07), (2.2, 0.07), (2.2, 0.10), (1.8, 0.10)):
+            self._press(x, z)
+        self._key("enter")
+        small = [k for k in self.fake.items if k != big][0]
+        self._edit_mode_with_nothing_selected()
+        self._press(2.0, 0.085)                     # dentro entrambi
+        self.assertEqual(d._sel_id, small)
+        self._release(2.0, 0.085)
+        d._select_feature(None)
+        self._press(1.2, 0.12)                      # solo dentro il grande
+        self.assertEqual(d._sel_id, big)
+
+    def test_features_without_an_identifier_cannot_be_selected(self):
+        d = self.dock
+        ch = d._cur
+        p0, p1 = ch.position(ch.trace_at_distance(1.0)), ch.position(ch.trace_at_distance(2.0))
+        d._feature_query = lambda v, s, c: [{"kind": "line", "vertices": [
+            {"east": p0[0], "north": p0[1], "depth_m": 0.05}, {"east": p1[0], "north": p1[1], "depth_m": 0.09}]}]
+        d._refresh_persisted_features()
+        d._btn_edit.setChecked(True)
+        self._press(1.5, 0.07)
+        self.assertIsNone(d._sel_id)
+
+    def test_dragging_a_vertex_moves_it_and_saves_depth_and_time(self):
+        d = self.dock
+        rec = self._draw_line()
+        old_t = rec["vertices"][1]["twt_ns"]
+        self._edit_mode_with_nothing_selected()
+        self._press(1.5, 0.075)                     # seleziona
+        self._release(1.5, 0.075)
+        self._press(2.0, 0.10)                      # afferra il secondo vertice
+        self.assertIsNotNone(d._edit_drag)
+        self._move(2.5, 0.13)
+        self.assertEqual(self.fake.updates, [])     # durante il trascinamento non si scrive ancora
+        self._release(2.5, 0.13)
+        self.assertEqual(len(self.fake.updates), 1)
+        v = self.fake.items[rec["id"]]["vertices"]
+        self.assertAlmostEqual(v[1]["depth_m"], 0.13, places=2)
+        self.assertGreater(v[1]["twt_ns"], old_t)
+        ch = d._cur
+        self.assertAlmostEqual(v[1]["east"], ch.position(ch.trace_at_distance(2.5))[0], places=3)
+        self.assertAlmostEqual(v[0]["depth_m"], 0.05, places=2)     # l'altro vertice non si muove
+
+    def test_a_click_without_moving_does_not_write_anything(self):
+        d = self.dock
+        self._draw_line()
+        self._edit_mode_with_nothing_selected()
+        self._press(1.5, 0.075)
+        self._release(1.5, 0.075)
+        self._press(2.0, 0.10)
+        self._release(2.0, 0.10)
+        self.assertEqual(self.fake.updates, [])
+
+    def test_undo_and_redo_of_a_vertex_move(self):
+        d = self.dock
+        rec = self._draw_line()
+        before = [dict(v) for v in self.fake.items[rec["id"]]["vertices"]]
+        self._edit_mode_with_nothing_selected()
+        self._press(1.5, 0.075)
+        self._release(1.5, 0.075)
+        self._press(2.0, 0.10)
+        self._move(2.5, 0.13)
+        self._release(2.5, 0.13)
+        moved = self.fake.items[rec["id"]]["vertices"][1]["depth_m"]
+        self._key("ctrl+z")
+        back = self.fake.items[rec["id"]]["vertices"]
+        self.assertAlmostEqual(back[1]["depth_m"], before[1]["depth_m"], places=6)
+        self.assertAlmostEqual(back[1]["twt_ns"], before[1]["twt_ns"], places=6)
+        self._key("ctrl+y")
+        self.assertAlmostEqual(self.fake.items[rec["id"]]["vertices"][1]["depth_m"], moved, places=6)
+
+    def test_double_click_on_a_segment_adds_a_vertex(self):
+        d = self.dock
+        rec = self._draw_line()
+        self._edit_mode_with_nothing_selected()
+        self._press(1.5, 0.075)
+        self._release(1.5, 0.075)
+        self._press(1.5, 0.075, dblclick=True)
+        self.assertEqual(len(self.fake.items[rec["id"]]["vertices"]), 3)
+        self._key("ctrl+z")
+        self.assertEqual(len(self.fake.items[rec["id"]]["vertices"]), 2)
+
+    def test_right_click_on_a_vertex_removes_it_but_never_below_the_minimum(self):
+        d = self.dock
+        self._key("3")
+        for x, z in ((1.0, 0.05), (2.0, 0.05), (2.0, 0.12), (1.0, 0.12)):
+            self._press(x, z)
+        self._key("enter")
+        fid = next(iter(self.fake.items))
+        self._edit_mode_with_nothing_selected()
+        self._press(1.5, 0.085)
+        self._release(1.5, 0.085)
+        self._press(2.0, 0.12, button=3)
+        self.assertEqual(len(self.fake.items[fid]["vertices"]), 3)
+        self._press(1.0, 0.12, button=3)
+        self.assertEqual(len(self.fake.items[fid]["vertices"]), 3)          # un poligono resta di 3 vertici
+        self.assertIn("almeno 3", d._lbl_status.text())
+
+    def test_delete_key_removes_the_annotation_and_undo_brings_it_back_with_the_same_id(self):
+        d = self.dock
+        rec = self._draw_line()
+        fid = rec["id"]
+        saved = dict(self.fake.items[fid])
+        self._edit_mode_with_nothing_selected()
+        self._press(1.5, 0.075)
+        self._release(1.5, 0.075)
+        self._key("delete")
+        self.assertEqual(self.fake.items, {})
+        self.assertIsNone(d._sel_id)
+        self._key("ctrl+z")
+        self.assertIn(fid, self.fake.items)
+        back = self.fake.items[fid]
+        self.assertEqual(back["class_code"], saved["class_code"])
+        self.assertEqual(len(back["vertices"]), 2)
+        self.assertAlmostEqual(back["vertices"][1]["twt_ns"], saved["vertices"][1]["twt_ns"], places=6)
+        self._key("ctrl+y")
+        self.assertEqual(self.fake.items, {})
+
+    def test_undo_of_a_new_annotation_removes_it(self):
+        self._draw_line()
+        self._key("ctrl+z")
+        self.assertEqual(self.fake.items, {})
+        self.assertEqual(self.dock._features, [])
+        self._key("ctrl+y")
+        self.assertEqual(len(self.fake.items), 1)
+
+    def test_number_keys_reclassify_the_selected_annotation_in_edit_mode(self):
+        d = self.dock
+        rec = self._draw_line()
+        self._edit_mode_with_nothing_selected()
+        self._press(1.5, 0.075)
+        self._release(1.5, 0.075)
+        self._key("3")
+        self.assertEqual(self.fake.items[rec["id"]]["class_code"], "attenuazione")
+        self.assertEqual(self.fake.items[rec["id"]]["class_label"], "Attenuazione / perdita di segnale")
+        self.assertEqual(d._cur_class, "riflettore")            # la classe con cui si disegna non cambia
+        self.assertEqual(d._cb_card_class.currentData(), "attenuazione")
+        self._key("ctrl+z")
+        self.assertEqual(self.fake.items[rec["id"]]["class_code"], "riflettore")
+
+    def test_card_fields_are_saved_and_undoable(self):
+        d = self.dock
+        rec = self._draw_line()
+        d._ed_code.setText("M12")
+        d._ed_notes.setText("continua verso nord")
+        d._on_card_text_finished()
+        item = self.fake.items[rec["id"]]
+        self.assertEqual((item["anomaly_id"], item["notes"]), ("M12", "continua verso nord"))
+        d._cb_card_conf.setCurrentIndex(d._cb_card_conf.findData("certo"))
+        d._on_card_conf(d._cb_card_conf.currentIndex())
+        self.assertEqual(item["confidence"], "certo")
+        d._on_card_text_finished()                  # niente di nuovo: nessuna scrittura in piu'
+        self.assertEqual(len(self.fake.updates), 2)
+        self._key("ctrl+z")
+        self.assertEqual(item["confidence"], "probabile")
+
+    def test_escape_in_edit_mode_deselects(self):
+        d = self.dock
+        self._draw_line()
+        d._btn_edit.setChecked(True)
+        d._select_feature(next(iter(self.fake.items)))
+        self._key("escape")
+        self.assertIsNone(d._sel_id)
+
+    def test_leaving_edit_mode_deselects(self):
+        d = self.dock
+        self._draw_line()
+        d._btn_edit.setChecked(True)
+        d._select_feature(next(iter(self.fake.items)))
+        d._btn_edit.setChecked(False)
+        self.assertIsNone(d._sel_id)
+        self.assertTrue(d._card.isHidden())
+
+    def test_changing_profile_drops_the_selection(self):
+        d = self.dock
+        self._draw_line()
+        self.assertIsNotNone(d._sel_id)
+        d.select_profile(d._pi + 1)
+        self.assertIsNone(d._sel_id)
+        self.assertTrue(d._card.isHidden())
+
+    def test_failed_save_reverts_the_vertex_and_says_so(self):
+        d = self.dock
+        rec = self._draw_line()
+        self._edit_mode_with_nothing_selected()
+        self._press(1.5, 0.075)
+        self._release(1.5, 0.075)
+
+        def boom(*a, **kw):
+            raise RuntimeError("layer bloccato")
+        d._feature_update = boom
+        self._press(2.0, 0.10)
+        self._move(2.5, 0.13)
+        self._release(2.5, 0.13)
+        self.assertIn("layer bloccato", d._lbl_status.text())
+        self.assertAlmostEqual(d._selected_rec()["pts"][1]["depth_m"], 0.10, places=2)
+        self.assertEqual(d._undo_stack[-1]["label"], "Nuova annotazione")   # niente da annullare in piu'
+
+    def test_without_update_callbacks_edits_say_so_and_change_nothing(self):
+        d = self.dock
+        self._draw_line()
+        d._feature_update = None
+        d._feature_delete = None
+        d._btn_edit.setChecked(True)
+        d._select_feature(next(iter(self.fake.items)))
+        self._key("delete")
+        self.assertEqual(len(self.fake.items), 1)
+        self.assertIn("non disponibile", d._lbl_status.text())
+
+    def test_undo_buttons_follow_the_stacks(self):
+        d = self.dock
+        self.assertFalse(d._btn_undo.isEnabled())
+        self.assertFalse(d._btn_redo.isEnabled())
+        self._draw_line()
+        self.assertTrue(d._btn_undo.isEnabled())
+        self._key("ctrl+z")
+        self.assertFalse(d._btn_undo.isEnabled())
+        self.assertTrue(d._btn_redo.isEnabled())
+
+    def test_new_annotation_bridge_result_can_be_a_qgs_feature_like_object(self):
+        d = self.dock
+        fake_feat = types.SimpleNamespace(attribute=lambda name: "tr_x" if name == "trace_id" else None)
+        self.assertEqual(d._result_feature_id(fake_feat), "tr_x")
+        self.assertEqual(d._result_feature_id({"id": "tr_y"}), "tr_y")
+        self.assertEqual(d._result_feature_id(None), "")
+
+
+@unittest.skipUnless(HAS_ENV, "QGIS/matplotlib non disponibili")
+class ClassesDialogTest(_DockBase):
+    def test_dialog_returns_the_same_classes_untouched(self):
+        AC = importlib.import_module("rasterlinker_feature_interpolation.gpr_annotation_classes")
+        DLG = importlib.import_module("rasterlinker_feature_interpolation.gpr_annotation_classes_dialog")
+        classes = AC.default_classes()
+        dlg = DLG.AnnotationClassesDialog(classes)
+        self.assertEqual(dlg.classes(), classes)
+
+    def test_new_and_renamed_classes_keep_stable_codes(self):
+        AC = importlib.import_module("rasterlinker_feature_interpolation.gpr_annotation_classes")
+        DLG = importlib.import_module("rasterlinker_feature_interpolation.gpr_annotation_classes_dialog")
+        dlg = DLG.AnnotationClassesDialog(AC.default_classes())
+        dlg._table.cellWidget(0, 0).setText("Iperbole (rinominata)")
+        dlg._add()
+        out = dlg.classes()
+        self.assertEqual(out[0]["code"], "iperbole")
+        self.assertEqual(out[0]["label"], "Iperbole (rinominata)")
+        self.assertEqual(out[-1]["label"], "Nuova classe")
+        self.assertEqual(out[-1]["code"], "nuova_classe")
+
+    def test_blank_rows_are_dropped_and_the_last_class_cannot_be_removed(self):
+        AC = importlib.import_module("rasterlinker_feature_interpolation.gpr_annotation_classes")
+        DLG = importlib.import_module("rasterlinker_feature_interpolation.gpr_annotation_classes_dialog")
+        dlg = DLG.AnnotationClassesDialog(AC.default_classes()[:2])
+        dlg._table.cellWidget(1, 0).setText("   ")
+        self.assertEqual(len(dlg.classes()), 1)
+        dlg._table.setCurrentCell(0, 0)
+        dlg._remove()
+        dlg._table.setCurrentCell(0, 0)
+        dlg._remove()
+        self.assertGreaterEqual(dlg._table.rowCount(), 1)
+
+    def test_add_stops_at_the_maximum_and_move_reorders(self):
+        AC = importlib.import_module("rasterlinker_feature_interpolation.gpr_annotation_classes")
+        DLG = importlib.import_module("rasterlinker_feature_interpolation.gpr_annotation_classes_dialog")
+        dlg = DLG.AnnotationClassesDialog(AC.default_classes())
+        for _ in range(AC.MAX_CLASSES + 3):
+            dlg._add()
+        self.assertEqual(dlg._table.rowCount(), AC.MAX_CLASSES)
+        self.assertFalse(dlg._btn_add.isEnabled())
+        dlg._table.setCurrentCell(1, 0)
+        first_two = [c["code"] for c in dlg.classes()[:2]]
+        dlg._move(-1)
+        self.assertEqual([c["code"] for c in dlg.classes()[:2]], first_two[::-1])
+
+
 @unittest.skipUnless(HAS_ENV, "QGIS/matplotlib non disponibili")
 class FlowLayoutTest(_DockBase):
     """I controlli vanno a capo: il pannello si aggancia anche a un lato, stretto."""

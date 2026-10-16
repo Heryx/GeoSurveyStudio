@@ -28,6 +28,8 @@ confronta con la finestra della time-slice selezionata nel pannello Livelli.
 
 from __future__ import annotations
 
+import copy
+import math
 import os
 
 from qgis.PyQt.QtCore import QObject, QPoint, QRect, QSettings, QSize, Qt, QTimer, pyqtSignal
@@ -42,6 +44,7 @@ from qgis.PyQt.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLayout,
+    QLineEdit,
     QMenu,
     QPushButton,
     QSizePolicy,
@@ -78,6 +81,17 @@ from .gpr_hyperbola_math import (
     velocity_to_rdp,
 )
 from .gpr_velocity_store import write_velocity_override
+from .gpr_annotation_classes import (
+    CONFIDENCE_LEVELS,
+    DEFAULT_CONFIDENCE,
+    GEOMETRY_LABELS,
+    class_by_code,
+    color_for,
+    label_for,
+    load_classes,
+    save_classes,
+)
+from .gpr_annotation_classes_dialog import AnnotationClassesDialog, color_icon
 from .gpr_material_presets import material_preset
 from .gpr_training_export import export_variant_for_training
 
@@ -92,10 +106,14 @@ try:
     )
     from .gpr_viewer_radargram import RadargramViewMixin
     from matplotlib.patches import Polygon
+    from matplotlib.path import Path as MplPath
 except Exception:                                    # matplotlib/scipy mancanti
     HAS_MPL = False
 
 _SETTINGS = "GeoSurveyStudio/radargram_dock/"
+_HIT_PX = 9                     # raggio (pixel) entro cui un clic "prende" un vertice o una linea
+_MIN_VERTICES = {"point": 1, "line": 2, "polygon": 3}
+_UNDO_LIMIT = 100
 _MAX_DISPLAY_COLS = 6000        # oltre, il radargramma si mostra decimato (media a blocchi)
 _CURSOR_MAP_DELAY_MS = 50
 _HYPER_VEL_STEP_MNS = 0.002     # passo per tacca di rotellina nello strumento "Calcola con iperbole"
@@ -382,7 +400,7 @@ class RadargramDock(QDockWidget):
 
     def __init__(self, iface, workspace_provider=None, geometry_provider=None,
                  feature_sink=None, feature_query=None, parent=None, zones_provider=None,
-                 project_root_provider=None):
+                 project_root_provider=None, feature_update=None, feature_delete=None):
         super().__init__("Radargrammi processati", parent or (iface.mainWindow() if iface else None))
         self.setObjectName("GeoSurveyRadargramDock")
         self.setAllowedAreas(Qt.AllDockWidgetAreas)
@@ -402,6 +420,8 @@ class RadargramDock(QDockWidget):
         self._geometry_provider = geometry_provider
         self._feature_sink = feature_sink
         self._feature_query = feature_query
+        self._feature_update = feature_update      # (trace_id, vertices=None, epsg=None, attributes=None)
+        self._feature_delete = feature_delete      # (trace_id)
         self._store: VariantStore | None = None
         self._pi = 0
         self._ci = 0
@@ -431,6 +451,22 @@ class RadargramDock(QDockWidget):
         # Geometrie gia' salvate su questo profilo/canale, ridisegnate come overlay
         # persistente (non solo durante il disegno attivo) - vedi _refresh_persisted_features.
         self._persisted_artists: list = []
+        self._features: list = []          # record delle annotazioni mostrate (vedi _load_features)
+
+        # Classi di segnale (iperbole, riflettore, attenuazione...): scelte prima di
+        # disegnare, con i tasti 1-9; ognuna ha colore e geometria di default.
+        self._classes: list = []
+        self._cur_class: str = ""
+        self._cur_conf: str = DEFAULT_CONFIDENCE
+        self._card_updating = False
+
+        # Selezione e modifica delle annotazioni gia' salvate.
+        self._edit_mode = False
+        self._sel_id: str | None = None
+        self._edit_drag: dict | None = None            # {"index", "moved"} durante il trascinamento di un vertice
+        self._edit_line = self._edit_fill = self._edit_handles = None
+        self._undo_stack: list = []
+        self._redo_stack: list = []
 
         # "Misura velocita'": senza apice, popup informativo col valore preimpostato
         # del profilo (sola lettura). Un clic fissa l'apice di un'iperbole/anomalia:
@@ -457,6 +493,7 @@ class RadargramDock(QDockWidget):
         self._map_timer.setInterval(_CURSOR_MAP_DELAY_MS)
         self._map_timer.timeout.connect(self._flush_map_point)
 
+        self._reload_classes()
         self._build_ui()
         if self._map is not None:
             self._map.picked.connect(self._on_map_picked)
@@ -617,10 +654,42 @@ class RadargramDock(QDockWidget):
         self._btn_draw_finish.clicked.connect(self._finalize_drawn_feature)
         self._btn_draw_cancel = _tool("✕", "Annulla il disegno in corso (Esc)")
         self._btn_draw_cancel.clicked.connect(self._cancel_draw)
+        # Che segnale si sta segnando: la classe si sceglie PRIMA di disegnare (menu o
+        # tasti 1-9) e porta con se' colore e geometria di default.
+        self._cb_class = _combo(14)
+        self._cb_class.setToolTip(
+            "Che segnale stai annotando (tasti 1-9). Scegliere una classe attiva lo strumento\n"
+            "di disegno adatto (punto per le iperboli, linea per i riflettori, poligono per\n"
+            "le zone di attenuazione...). Il colore la distingue sul radargramma.")
+        self._cb_class.activated.connect(self._on_class_activated)
+        self._btn_classes = _tool("⚙", "Gestisci le classi di segnale (nome, geometria, colore)")
+        self._btn_classes.clicked.connect(self._edit_classes)
+        self._cb_conf = _combo(8)
+        for code, label in CONFIDENCE_LEVELS:
+            self._cb_conf.addItem(label, code)
+        self._cb_conf.setCurrentIndex(max(0, self._cb_conf.findData(DEFAULT_CONFIDENCE)))
+        self._cb_conf.setToolTip("Quanto sei sicuro dell'interpretazione: viene salvata con l'annotazione.")
+        self._cb_conf.activated.connect(self._on_conf_activated)
+        tools.addWidget(_group(QLabel("Segnale"), self._cb_class, self._btn_classes,
+                               QLabel("Affidabilità"), self._cb_conf))
         tools.addWidget(_group(
             QLabel("Disegna"), self._btn_draw_point, self._btn_draw_line, self._btn_draw_polygon))
         self._grp_draw_ctx = _group(self._btn_draw_undo, self._btn_draw_finish, self._btn_draw_cancel)
         tools.addWidget(self._grp_draw_ctx)
+        self._btn_edit = QPushButton("Modifica")
+        self._btn_edit.setCheckable(True)
+        self._btn_edit.setToolTip(
+            "Seleziona e correggi le annotazioni già salvate: clic su un'annotazione per\n"
+            "sceglierla, trascina i vertici per spostarli, doppio clic su un segmento per\n"
+            "aggiungere un vertice, clic destro su un vertice per toglierlo, Canc per\n"
+            "eliminarla, tasti 1-9 per cambiarne la classe. Ctrl+Z / Ctrl+Y annullano e ripetono.")
+        self._btn_edit.toggled.connect(self._on_edit_toggled)
+        self._btn_edit.toggled.connect(self._update_tool_context)
+        self._btn_undo = _tool("↶", "Annulla l'ultima modifica alle annotazioni (Ctrl+Z)")
+        self._btn_undo.clicked.connect(self._undo_annotation)
+        self._btn_redo = _tool("↷", "Ripeti la modifica annullata (Ctrl+Y)")
+        self._btn_redo.clicked.connect(self._redo_annotation)
+        tools.addWidget(_group(self._btn_edit, self._btn_undo, self._btn_redo))
         tools.addWidget(_sep())
 
         self._spin_vel_mns = QDoubleSpinBox()
@@ -663,6 +732,39 @@ class RadargramDock(QDockWidget):
         self._grp_hyper_ctx = _group(self._btn_hyper_save, self._btn_vel_clear, self._lbl_vel)
         tools.addWidget(self._grp_hyper_ctx)
 
+        # Riga 3: scheda dell'annotazione selezionata (visibile solo con una selezione).
+        self._card = QWidget()
+        card_flow = _FlowLayout(self._card, hspacing=6)
+        self._cb_card_class = _combo(12)
+        self._cb_card_class.setToolTip("Classe di segnale dell'annotazione selezionata.")
+        self._cb_card_class.activated.connect(self._on_card_class)
+        self._cb_card_conf = _combo(8)
+        for code, label in CONFIDENCE_LEVELS:
+            self._cb_card_conf.addItem(label, code)
+        self._cb_card_conf.activated.connect(self._on_card_conf)
+
+        def _edit(placeholder, tip, width):
+            e = QLineEdit()
+            e.setPlaceholderText(placeholder)
+            e.setToolTip(tip)
+            e.setMinimumWidth(width)
+            e.setMaximumWidth(width + 140)
+            e.editingFinished.connect(self._on_card_text_finished)
+            return e
+
+        self._ed_code = _edit("Codice", "Codice anomalia: lo stesso codice su più profili indica lo stesso oggetto.", 60)
+        self._ed_interp = _edit("Interpretazione", "Che cos'è (muro, fossa, sottoservizio...).", 110)
+        self._ed_notes = _edit("Note", "Note libere.", 110)
+        self._lbl_card_info = QLabel("")
+        self._btn_card_delete = _tool("🗑", "Elimina l'annotazione selezionata (Canc). Si può annullare con Ctrl+Z.")
+        self._btn_card_delete.clicked.connect(self._delete_selected)
+        card_flow.addWidget(_group(QLabel("Annotazione"), self._cb_card_class, self._cb_card_conf))
+        card_flow.addWidget(_group(self._ed_code, self._ed_interp, self._ed_notes))
+        card_flow.addWidget(_group(self._lbl_card_info, self._btn_card_delete))
+        root.addWidget(self._card)
+        self._card.setVisible(False)
+        self._fill_class_combos()
+
         self._fig = Figure(figsize=(8, 2.6))
         self._ax = self._fig.add_axes([0.06, 0.17, 0.92, 0.80])
         self._canvas = FigureCanvasQTAgg(self._fig)
@@ -700,6 +802,7 @@ class RadargramDock(QDockWidget):
         root.addLayout(status_row)
         self.setWidget(host)
         self._update_tool_context()
+        self._sync_undo_buttons()
         self._show_message("Nessuna variante processata: salva una variante dal Profile Viewer "
                            "oppure scegli una cartella con …")
 
@@ -846,6 +949,7 @@ class RadargramDock(QDockWidget):
 
     def refresh(self) -> None:
         """Rilegge varianti e coordinate (dopo un nuovo posizionamento o un nuovo salvataggio)."""
+        self._reload_classes()
         if self._store is not None:
             self._store.invalidate_geometry()
         self.refresh_variants(select=self._store.path if self._store is not None else None, force=True)
@@ -1033,6 +1137,9 @@ class RadargramDock(QDockWidget):
         self._hyper_locked = False
         self._btn_hyper_save.setEnabled(False)
         self._vel_apex = None
+        self._sel_id = None              # la selezione e il trascinamento valgono per il canale mostrato
+        self._edit_drag = None
+        self._update_tool_context()      # chiude la scheda dell'annotazione
         self._cur = ch
         self._prepare_display(ch)
         self._spin_depth.blockSignals(True)
@@ -1090,6 +1197,7 @@ class RadargramDock(QDockWidget):
         self._vline = self._hline = self._ref_line = self._band_patch = None
         self._draw_preview_line = self._vel_curve_line = self._vel_apex_marker = None
         self._draw_preview_fill = None
+        self._edit_line = self._edit_fill = self._edit_handles = None
         self._vel_popup = None
         self._draw_vertices = []
         self._hyper_apex = None
@@ -1097,6 +1205,10 @@ class RadargramDock(QDockWidget):
         self._hyper_locked = False
         self._vel_apex = None
         self._persisted_artists = []
+        self._features = []
+        self._sel_id = None
+        self._edit_drag = None
+        self._card.setVisible(False)
         if getattr(self, "_btn_hyper_save", None) is not None:
             self._btn_hyper_save.setEnabled(False)
         self._blit.set_artists([])
@@ -1148,6 +1260,17 @@ class RadargramDock(QDockWidget):
         (self._draw_preview_line,) = ax.plot(
             [], [], color="#ff3d81", lw=1.6, marker="o", ms=3.5,
             mfc="#ff3d81", mec="#1f1f1f", mew=0.4, visible=False, zorder=6)
+        # annotazione selezionata (colore della sua classe + vertici trascinabili): animata,
+        # cosi' spostare un vertice non rifa' l'immagine del radargramma
+        self._edit_fill = Polygon(
+            [[0, 0], [0, 0], [0, 0]], closed=True, facecolor="#ffffff", edgecolor="none",
+            alpha=0.25, visible=False, zorder=9)
+        ax.add_patch(self._edit_fill)
+        (self._edit_line,) = ax.plot(
+            [], [], color="#ffffff", lw=2.4, solid_capstyle="round", visible=False, zorder=9)
+        (self._edit_handles,) = ax.plot(
+            [], [], ls="none", marker="s", ms=6.5, mfc="#ffffff", mec="#111111", mew=1.0,
+            visible=False, zorder=10)
         (self._vel_curve_line,) = ax.plot(
             [], [], color="#ffd000", lw=1.4, alpha=0.95, visible=False, zorder=6)
         self._vel_apex_marker = ax.scatter(
@@ -1160,6 +1283,7 @@ class RadargramDock(QDockWidget):
         self._blit.set_artists([
             self._band_patch, self._ref_line, self._vline, self._hline,
             self._draw_preview_fill, self._draw_preview_line,
+            self._edit_fill, self._edit_line, self._edit_handles,
             self._vel_curve_line, self._vel_apex_marker, self._vel_popup,
         ])
         self._apply_reference()
@@ -1167,6 +1291,7 @@ class RadargramDock(QDockWidget):
         self._refresh_hyper_overlay(blit=False)
         self._refresh_vel_popup(blit=False)
         self._refresh_persisted_features()
+        self._refresh_edit_artists(blit=False)
         self._blit.invalidate()
         self._canvas.draw_idle()
 
@@ -1436,6 +1561,8 @@ class RadargramDock(QDockWidget):
             return
         if event.inaxes is not self._ax or self._cur is None or event.xdata is None:
             return
+        if self._edit_drag is not None:
+            self._edit_drag_to(event)
         self._cursor_x, self._cursor_z = float(event.xdata), float(event.ydata)
         self._vline.set_xdata([self._cursor_x, self._cursor_x])
         self._vline.set_visible(True)
@@ -1464,6 +1591,8 @@ class RadargramDock(QDockWidget):
         if event.button == 1:
             if self._draw_mode is not None:
                 self._add_draw_vertex(float(event.xdata), float(event.ydata))
+            elif self._edit_mode:
+                self._edit_press(event)
             elif self._hyper_mode_active:
                 self._set_hyper_apex(float(event.xdata), float(event.ydata))
             elif self._vel_mode_active:
@@ -1479,11 +1608,15 @@ class RadargramDock(QDockWidget):
         elif event.button == 3 and self._hyper_mode_active and self._hyper_apex is not None:
             self._hyper_locked = not self._hyper_locked
             self._refresh_hyper_overlay(blit=True)
+        elif event.button == 3 and self._edit_mode and self._edit_remove_vertex_at(event):
+            pass                                    # clic destro su un vertice: tolto
         elif event.button in (2, 3):
             self._pan = (event.x, event.y, self._ax.get_xlim(), self._ax.get_ylim())
 
     def _on_mouse_release(self, _event) -> None:
         self._pan = None
+        if self._edit_drag is not None:
+            self._edit_finish_drag()
 
     def _do_pan(self, event) -> None:
         x0, y0, xl, yl = self._pan
@@ -1524,6 +1657,22 @@ class RadargramDock(QDockWidget):
 
     def _on_key(self, event) -> None:
         key = str(getattr(event, "key", "") or "")
+        if key == "ctrl+z":
+            self._undo_annotation()
+            return
+        if key in ("ctrl+y", "ctrl+shift+z"):
+            self._redo_annotation()
+            return
+        if len(key) == 1 and key in "123456789":
+            self._on_class_key(int(key) - 1)
+            return
+        if self._edit_mode:
+            if key in ("delete", "backspace") and self._sel_id is not None:
+                self._delete_selected()
+                return
+            if key == "escape" and self._sel_id is not None:
+                self._select_feature(None)
+                return
         if self._draw_mode is not None:
             if key in ("enter", "return"):
                 self._finalize_drawn_feature()
@@ -1570,6 +1719,8 @@ class RadargramDock(QDockWidget):
         if self._updating:
             return
         if on:
+            if self._btn_edit.isChecked():
+                self._btn_edit.setChecked(False)     # esclusivo con la modifica delle annotazioni
             if self._btn_vel.isChecked():
                 self._btn_vel.setChecked(False)      # esclusivo col puntatore di velocita'
             if self._btn_hyper.isChecked():
@@ -1592,6 +1743,7 @@ class RadargramDock(QDockWidget):
         draw_on = any(b.isChecked() for b in self._draw_mode_buttons.values())
         self._grp_draw_ctx.setVisible(draw_on)
         self._grp_hyper_ctx.setVisible(self._btn_hyper.isChecked())
+        self._card.setVisible(self._sel_id is not None)
 
     def _set_draw_mode(self, mode: str | None) -> None:
         self._draw_mode = mode
@@ -1611,10 +1763,13 @@ class RadargramDock(QDockWidget):
         depth = float(np.clip(z_m, 0.0, ch.depth_max_m))
         row = ch.row_at_depth(depth)
         amp = ch.amplitude_at(trace, row)
+        if not self._draw_vertices and self._sel_id is not None:
+            self._select_feature(None)         # si comincia una nuova annotazione: la scheda precedente si chiude
         self._draw_vertices.append({
             "x_m": float(x_m), "depth_m": depth, "trace": int(trace),
             "east": float(east), "north": float(north),
             "amp": amp if np.isfinite(amp) else None,
+            "twt_ns": self._depth_to_twt(depth),
         })
         self._refresh_draw_preview(blit=True)
         if self._draw_mode == "point":
@@ -1682,30 +1837,58 @@ class RadargramDock(QDockWidget):
         if mode is None or len(verts) < min_needed:
             self._show_message(f"Servono almeno {min_needed} vertici per completare la geometria.")
             return
+        new_id = None
         if self._feature_sink is None:
             self._show_message("Salvataggio non disponibile: apri questo pannello da GeoSurvey Studio.")
         else:
             info = self._store.profiles[self._pi]
             preset = self._current_preset_velocity()
+            cls = class_by_code(self._classes, self._cur_class)
             try:
-                self._feature_sink(
+                result = self._feature_sink(
                     kind=mode,
                     variant_name=self._store.name,
                     profile_stem=info.stem,
                     channel=int(self._ci),
                     epsg=int(info.epsg or 0),
-                    vertices=[
-                        {"east": v["east"], "north": v["north"], "depth_m": v["depth_m"], "amp": v.get("amp")}
-                        for v in verts
-                    ],
+                    vertices=self._vertices_payload(verts),
                     velocity_m_ns=preset["velocity_m_ns"],
                     rdp=preset["rdp"],
+                    class_code=cls["code"] if cls else "",
+                    class_label=cls["label"] if cls else "",
+                    confidence=self._cur_conf,
                 )
-                self._show_message(f"{mode}: {len(verts)} vertici salvati nel layer.")
+                new_id = self._result_feature_id(result)
+                what = cls["label"] if cls else mode
+                self._show_message(f"{what}: {len(verts)} vertici salvati nel layer.")
             except Exception as exc:
                 self._show_message(f"Errore nel salvataggio della geometria: {exc}")
         self._draw_vertices = []
         self._refresh_draw_preview(blit=True)
+        if new_id:
+            self._after_feature_created(new_id)
+
+    @staticmethod
+    def _result_feature_id(result) -> str:
+        """Identificativo della feature appena creata, dal ritorno del `feature_sink`."""
+        try:
+            if isinstance(result, dict):
+                return str(result.get("id") or "")
+            if result is not None and hasattr(result, "attribute"):
+                return str(result.attribute("trace_id") or "")
+            if isinstance(result, str):
+                return result
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _vertices_payload(verts) -> list:
+        return [
+            {"east": v["east"], "north": v["north"], "depth_m": v["depth_m"],
+             "amp": v.get("amp"), "twt_ns": v.get("twt_ns")}
+            for v in verts
+        ]
 
     # ------------------------------------------------------------------
     # Velocita' preimpostata: popup informativo ("Misura velocita'", sola lettura)
@@ -1760,6 +1943,8 @@ class RadargramDock(QDockWidget):
     def _on_vel_toggled(self, on: bool) -> None:
         self._vel_mode_active = bool(on)
         if on:
+            if self._btn_edit.isChecked():
+                self._btn_edit.setChecked(False)      # esclusivo con la modifica delle annotazioni
             if self._btn_hyper.isChecked():
                 self._btn_hyper.setChecked(False)     # esclusivo col fit iperbole
             for btn in self._draw_mode_buttons.values():
@@ -1861,6 +2046,8 @@ class RadargramDock(QDockWidget):
     def _on_hyper_toggled(self, on: bool) -> None:
         self._hyper_mode_active = bool(on)
         if on:
+            if self._btn_edit.isChecked():
+                self._btn_edit.setChecked(False)       # esclusivo con la modifica delle annotazioni
             if self._btn_vel.isChecked():
                 self._btn_vel.setChecked(False)        # esclusivo con "Misura velocita'"
             for btn in self._draw_mode_buttons.values():
@@ -1948,21 +2135,19 @@ class RadargramDock(QDockWidget):
     # Geometrie gia' disegnate: overlay persistente sul radargramma
     # ------------------------------------------------------------------
 
-    def _refresh_persisted_features(self) -> None:
-        """Ridisegna come overlay statico (non blit-managed: si ricostruisce a ogni
-        _redraw) le geometrie gia' salvate su questo profilo/canale, cosi' restano
-        visibili anche fuori da una sessione di disegno attiva. Le coordinate reali
-        (est/nord) di ogni vertice sono riproiettate sullo schermo trovando la
-        traccia piu' vicina nel canale corrente - mai ricalcolate dalla geometria,
-        la profondita' resta quella salvata al momento del disegno."""
-        for artist in self._persisted_artists:
-            try:
-                artist.remove()
-            except Exception:
-                pass
-        self._persisted_artists = []
+    def _load_features(self) -> None:
+        """Rilegge le annotazioni di questo profilo/canale in `self._features`.
+
+        Le coordinate reali (est/nord) di ogni vertice sono riproiettate sullo schermo
+        trovando la traccia piu' vicina nel canale corrente. L'altezza e' ancorata al
+        segnale: se il vertice ha il tempo doppio (ns), la profondita' mostrata e'
+        quella che quel tempo ha con la velocita' attuale del radargramma (cambiare la
+        velocita' non fa scivolare le annotazioni via dal segnale); le annotazioni
+        senza tempo (fatte prima) restano alla profondita' salvata.
+        """
+        self._features = []
         ch = self._cur
-        if ch is None or self._ax is None or self._feature_query is None or self._store is None:
+        if ch is None or self._feature_query is None or self._store is None:
             return
         if not (0 <= self._pi < len(self._store)):
             return
@@ -1973,33 +2158,667 @@ class RadargramDock(QDockWidget):
             features = []
         if ch.east.size == 0:
             return
+        ctx = {"variant_name": self._store.name, "profile_stem": info.stem,
+               "channel": int(self._ci), "epsg": int(info.epsg or 0)}
         for feat in features:
-            kind = feat.get("kind")
             verts = feat.get("vertices") or []
             if not verts:
                 continue
-            xs, zs = [], []
+            pts = []
             for v in verts:
                 e, n = float(v.get("east", np.nan)), float(v.get("north", np.nan))
                 d2 = (ch.east - e) ** 2 + (ch.north - n) ** 2
                 if not np.isfinite(d2).any():
                     continue
                 trace = int(np.nanargmin(d2))
-                xs.append(float(ch.dist[trace]))
-                zs.append(float(v.get("depth_m", 0.0)))
-            if len(xs) != len(verts) or not xs:
+                twt = v.get("twt_ns")
+                twt = None if twt is None else float(twt)
+                depth = self._twt_to_depth(twt) if twt is not None else None
+                if depth is None:
+                    depth = float(v.get("depth_m", 0.0))
+                pos = ch.position(trace) or (e, n)
+                pts.append({
+                    "x_m": float(ch.dist[trace]), "depth_m": float(depth), "twt_ns": twt,
+                    "trace": trace, "east": float(pos[0]), "north": float(pos[1]),
+                    "amp": v.get("amp"),
+                })
+            if len(pts) != len(verts) or not pts:
                 continue
+            self._features.append({
+                "id": str(feat.get("id") or ""),
+                "kind": feat.get("kind"),
+                "class_code": str(feat.get("class_code") or ""),
+                "class_label": str(feat.get("class_label") or ""),
+                "confidence": str(feat.get("confidence") or ""),
+                "anomaly_id": str(feat.get("anomaly_id") or ""),
+                "interpretation": str(feat.get("interpretation") or ""),
+                "notes": str(feat.get("notes") or ""),
+                "velocity_m_ns": feat.get("velocity_m_ns"),
+                "rdp": feat.get("rdp"),
+                "pts": pts,
+                "ctx": dict(ctx),
+            })
+
+    def _draw_persisted(self) -> None:
+        """Disegna come overlay statico (non blit-managed: si ricostruisce a ogni
+        _redraw) le annotazioni gia' salvate, ognuna col colore della sua classe.
+        L'annotazione selezionata si disegna a parte, con gli artisti animati."""
+        for artist in self._persisted_artists:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self._persisted_artists = []
+        if self._ax is None or self._cur is None:
+            return
+        for rec in self._features:
+            if self._sel_id is not None and rec["id"] == self._sel_id:
+                continue
+            color = color_for(self._classes, rec["class_code"])
+            xs = [p["x_m"] for p in rec["pts"]]
+            zs = [p["depth_m"] for p in rec["pts"]]
+            kind = rec["kind"]
             if kind == "point":
                 artist = self._ax.scatter(
-                    xs, zs, s=26, color="#00e5ff", edgecolor="#1f1f1f", linewidths=0.4, zorder=5)
+                    xs, zs, s=34, color=color, edgecolor="#1f1f1f", linewidths=0.6, zorder=5)
             elif kind == "polygon":
                 artist = Polygon(
-                    list(zip(xs, zs)), closed=True, facecolor="#00e5ff", edgecolor="#00e5ff",
-                    alpha=0.22, linewidth=1.3, zorder=4)
+                    list(zip(xs, zs)), closed=True, facecolor=color, edgecolor=color,
+                    alpha=0.26, linewidth=1.4, zorder=4)
                 self._ax.add_patch(artist)
             else:   # "line"
-                (artist,) = self._ax.plot(xs, zs, color="#00e5ff", lw=1.4, alpha=0.9, zorder=5)
+                (artist,) = self._ax.plot(xs, zs, color=color, lw=1.6, alpha=0.95, zorder=5)
             self._persisted_artists.append(artist)
+
+    def _refresh_persisted_features(self) -> None:
+        """Rilegge dal layer e ridisegna le annotazioni (vedi `_load_features`)."""
+        self._load_features()
+        self._draw_persisted()
+
+    # ------------------------------------------------------------------
+    # Tempo doppio <-> profondita'
+    #
+    # La profondita' dipende dalla velocita' scelta, il tempo no: salvando anche il
+    # tempo (ns) di ogni vertice, l'annotazione resta sul suo segnale anche se poi
+    # si rivede la velocita' del profilo.
+    # ------------------------------------------------------------------
+
+    def _dt_ns(self) -> float:
+        try:
+            return float(self._store.profiles[self._pi].dt_ns)
+        except Exception:
+            return 0.0
+
+    def _depth_to_twt(self, depth_m: float):
+        ch, dt = self._cur, self._dt_ns()
+        if ch is None or ch.dz_m <= 0 or dt <= 0:
+            return None
+        return float(depth_m) / float(ch.dz_m) * dt
+
+    def _twt_to_depth(self, twt_ns: float):
+        ch, dt = self._cur, self._dt_ns()
+        if ch is None or ch.dz_m <= 0 or dt <= 0:
+            return None
+        return float(twt_ns) / dt * float(ch.dz_m)
+
+    # ------------------------------------------------------------------
+    # Classi di segnale (iperbole, riflettore, attenuazione...)
+    # ------------------------------------------------------------------
+
+    def _project_root(self) -> str:
+        try:
+            return str(self._project_root_provider() or "") if self._project_root_provider else ""
+        except Exception:
+            return ""
+
+    def _reload_classes(self) -> None:
+        self._classes = load_classes(self._project_root() or None)
+        codes = [c["code"] for c in self._classes]
+        if self._cur_class not in codes:
+            try:
+                saved = str(QSettings().value(_SETTINGS + "class", "") or "")
+            except Exception:
+                saved = ""
+            self._cur_class = saved if saved in codes else (codes[0] if codes else "")
+        self._fill_class_combos()
+
+    def _fill_class_combos(self) -> None:
+        cb = getattr(self, "_cb_class", None)
+        card = getattr(self, "_cb_card_class", None)
+        if cb is None or card is None:
+            return
+        cb.blockSignals(True)
+        cb.clear()
+        for n, cls in enumerate(self._classes, start=1):
+            cb.addItem(color_icon(cls["color"]), f"{n} · {cls['label']}", cls["code"])
+        cb.setCurrentIndex(max(0, cb.findData(self._cur_class)))
+        cb.blockSignals(False)
+        card.blockSignals(True)
+        card.clear()
+        card.addItem("— non classificato —", "")
+        for cls in self._classes:
+            card.addItem(color_icon(cls["color"]), cls["label"], cls["code"])
+        card.blockSignals(False)
+
+    def _on_class_activated(self, i: int) -> None:
+        code = self._cb_class.itemData(i)
+        if code:
+            self._set_current_class(str(code), arm=True)
+
+    def _on_conf_activated(self, i: int) -> None:
+        self._cur_conf = str(self._cb_conf.itemData(i) or DEFAULT_CONFIDENCE)
+
+    def _on_class_key(self, index: int) -> None:
+        if not (0 <= index < len(self._classes)):
+            return
+        cls = self._classes[index]
+        rec = self._selected_rec()
+        if self._edit_mode and rec is not None:
+            self._change_attrs(rec, {"class_code": cls["code"], "class_label": cls["label"]})
+        else:
+            self._set_current_class(cls["code"], arm=True)
+
+    def _set_current_class(self, code: str, arm: bool = True) -> None:
+        """Classe con cui si annota. Con `arm` attiva anche lo strumento di disegno
+        della sua geometria (punto, linea o poligono), a meno che non ci sia gia'
+        un disegno a meta': in quel caso cambia solo la classe."""
+        cls = class_by_code(self._classes, code)
+        if cls is None:
+            return
+        self._cur_class = cls["code"]
+        self._cb_class.blockSignals(True)
+        self._cb_class.setCurrentIndex(max(0, self._cb_class.findData(cls["code"])))
+        self._cb_class.blockSignals(False)
+        try:
+            QSettings().setValue(_SETTINGS + "class", cls["code"])
+        except Exception:
+            pass
+        if arm and not self._draw_vertices:
+            btn = self._draw_mode_buttons.get(cls["geometry"])
+            if btn is not None and not btn.isChecked():
+                btn.setChecked(True)
+        self._show_message(f"Segnale: {cls['label']}")
+
+    def _edit_classes(self) -> None:
+        root = self._project_root()
+        if not root:
+            self._show_message("Apri un progetto GeoSurvey Studio per personalizzare le classi.")
+            return
+        dlg = AnnotationClassesDialog(self._classes, self)
+        if dlg.exec() != dlg.Accepted:
+            return
+        try:
+            save_classes(root, dlg.classes())
+        except OSError as exc:
+            self._show_message(f"Classi non salvate: {exc}")
+            return
+        self._reload_classes()
+        self._reload_overlay()
+
+    # ------------------------------------------------------------------
+    # Selezione e modifica delle annotazioni gia' salvate
+    # ------------------------------------------------------------------
+
+    def _selected_rec(self):
+        if self._sel_id is None:
+            return None
+        for rec in self._features:
+            if rec["id"] == self._sel_id:
+                return rec
+        return None
+
+    def _on_edit_toggled(self, on: bool) -> None:
+        self._edit_mode = bool(on)
+        if on:
+            for other in (self._btn_vel, self._btn_hyper, *self._draw_mode_buttons.values()):
+                if other.isChecked():
+                    other.setChecked(False)         # esclusivo con gli altri strumenti
+            if self._canvas is not None:
+                self._canvas.unsetCursor()
+            self._show_message("Modifica: clic su un'annotazione per sceglierla, trascina i vertici.")
+        else:
+            self._edit_drag = None
+            self._select_feature(None)
+
+    def _reload_overlay(self) -> None:
+        """Rilegge le annotazioni dal layer e ridisegna overlay, selezione e scheda."""
+        self._load_features()
+        if self._sel_id is not None and self._selected_rec() is None:
+            self._sel_id = None
+            self._edit_drag = None
+        self._draw_persisted()
+        self._refresh_edit_artists(blit=False)
+        self._populate_card()
+        self._update_tool_context()
+        if self._blit is not None:
+            self._blit.invalidate()
+        if self._canvas is not None:
+            self._canvas.draw_idle()
+
+    def _select_feature(self, fid) -> None:
+        fid = fid or None
+        if fid == self._sel_id:
+            return
+        self._sel_id = fid
+        self._edit_drag = None
+        self._populate_card()
+        self._update_tool_context()
+        self._draw_persisted()
+        self._refresh_edit_artists(blit=False)
+        if self._blit is not None:
+            self._blit.invalidate()
+        if self._canvas is not None:
+            self._canvas.draw_idle()
+
+    def _refresh_edit_artists(self, blit: bool = True) -> None:
+        """Annotazione selezionata: colore della classe, vertici come quadratini."""
+        line, fill, handles = self._edit_line, self._edit_fill, self._edit_handles
+        if line is None or fill is None or handles is None:
+            return
+        rec = self._selected_rec()
+        if rec is None:
+            for art in (line, fill, handles):
+                art.set_visible(False)
+        else:
+            color = color_for(self._classes, rec["class_code"])
+            xs = [p["x_m"] for p in rec["pts"]]
+            zs = [p["depth_m"] for p in rec["pts"]]
+            kind = rec["kind"]
+            handles.set_data(xs, zs)
+            handles.set_visible(True)
+            line.set_color(color)
+            fill.set_facecolor(color)
+            if kind == "point":
+                line.set_visible(False)
+                fill.set_visible(False)
+            else:
+                lx, lz = (xs + xs[:1], zs + zs[:1]) if kind == "polygon" else (xs, zs)
+                line.set_data(lx, lz)
+                line.set_visible(len(xs) >= 2)
+                if kind == "polygon" and len(xs) >= 3:
+                    fill.set_xy(list(zip(xs, zs)))
+                    fill.set_visible(True)
+                else:
+                    fill.set_visible(False)
+        if blit and self._blit is not None:
+            self._blit.update()
+
+    # -- ricerca sotto il puntatore (in pixel: la tolleranza non dipende dallo zoom) ----------
+
+    def _rec_px(self, rec):
+        return self._ax.transData.transform([(p["x_m"], p["depth_m"]) for p in rec["pts"]])
+
+    def _hit_vertex(self, rec, ex: float, ey: float):
+        px = self._rec_px(rec)
+        d = np.hypot(px[:, 0] - ex, px[:, 1] - ey)
+        i = int(np.argmin(d))
+        return i if d[i] <= _HIT_PX else None
+
+    @staticmethod
+    def _point_segment_px(ex, ey, a, b) -> float:
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        l2 = dx * dx + dy * dy
+        t = 0.0 if l2 <= 0 else max(0.0, min(1.0, ((ex - a[0]) * dx + (ey - a[1]) * dy) / l2))
+        return math.hypot(ex - (a[0] + t * dx), ey - (a[1] + t * dy))
+
+    def _hit_segment(self, rec, ex: float, ey: float):
+        """(indice del segmento, distanza in pixel) piu' vicino; il poligono ha anche il lato di chiusura."""
+        n = len(rec["pts"])
+        if n < 2 or rec["kind"] == "point":
+            return None
+        px = self._rec_px(rec)
+        last = n if rec["kind"] == "polygon" else n - 1
+        best = None
+        for s in range(last):
+            d = self._point_segment_px(ex, ey, px[s], px[(s + 1) % n])
+            if best is None or d < best[1]:
+                best = (s, d)
+        return best
+
+    def _feature_hit(self, rec, ex: float, ey: float):
+        """(distanza px, area px) di un clic dall'annotazione, None se troppo lontano.
+        Dentro un poligono la distanza e' 0; a parita' vince il piu' piccolo (poligoni annidati)."""
+        px = self._rec_px(rec)
+        d = float(np.min(np.hypot(px[:, 0] - ex, px[:, 1] - ey)))
+        seg = self._hit_segment(rec, ex, ey)
+        if seg is not None:
+            d = min(d, seg[1])
+        area = 0.0
+        if rec["kind"] == "polygon" and len(px) >= 3:
+            x, y = px[:, 0], px[:, 1]
+            area = 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+            if MplPath(px).contains_point((ex, ey)):
+                d = 0.0
+        return (d, area) if d <= _HIT_PX else None
+
+    def _hit_feature(self, ex: float, ey: float):
+        best = None
+        for rec in self._features:
+            if not rec["id"]:
+                continue
+            hit = self._feature_hit(rec, ex, ey)
+            if hit is not None and (best is None or hit < best[0]):
+                best = (hit, rec["id"])
+        return best[1] if best else None
+
+    # -- mouse in modalita' "Modifica" ----------------------------------------------------
+
+    def _edit_press(self, event) -> None:
+        ex, ey = float(event.x), float(event.y)
+        rec = self._selected_rec()
+        if rec is not None:
+            if getattr(event, "dblclick", False) and self._edit_insert_vertex(rec, event):
+                return
+            idx = self._hit_vertex(rec, ex, ey)
+            if idx is not None:
+                self._edit_begin_drag(rec, idx, event)
+                return
+        self._select_feature(self._hit_feature(ex, ey))
+        rec = self._selected_rec()
+        if rec is not None:
+            idx = self._hit_vertex(rec, ex, ey)
+            if idx is not None:
+                self._edit_begin_drag(rec, idx, event)
+
+    def _edit_begin_drag(self, rec, index: int, event) -> None:
+        self._edit_drag = {"index": int(index), "before": copy.deepcopy(rec["pts"]),
+                           "start": (float(event.x), float(event.y)), "moved": False}
+
+    def _edit_drag_to(self, event) -> None:
+        drag, rec, ch = self._edit_drag, self._selected_rec(), self._cur
+        if drag is None or rec is None or ch is None:
+            self._edit_drag = None
+            return
+        if not drag["moved"]:
+            if math.hypot(float(event.x) - drag["start"][0], float(event.y) - drag["start"][1]) < 3.0:
+                return                              # un clic con la mano tremante non sposta nulla
+            drag["moved"] = True
+        p = rec["pts"][drag["index"]]
+        p["x_m"] = float(np.clip(event.xdata, 0.0, max(ch.length_m, 1e-6)))
+        p["depth_m"] = float(np.clip(event.ydata, 0.0, ch.depth_max_m))
+        self._refresh_edit_artists(blit=False)
+
+    def _edit_finish_drag(self) -> None:
+        drag, rec = self._edit_drag, self._selected_rec()
+        self._edit_drag = None
+        if drag is None or rec is None or not drag["moved"]:
+            return
+        self._commit_geometry(rec, drag["before"], "Sposta vertice")
+
+    def _edit_insert_vertex(self, rec, event) -> bool:
+        hit = self._hit_segment(rec, float(event.x), float(event.y))
+        ch = self._cur
+        if hit is None or hit[1] > _HIT_PX or ch is None:
+            return False
+        before = copy.deepcopy(rec["pts"])
+        rec["pts"].insert(hit[0] + 1, {
+            "x_m": float(np.clip(event.xdata, 0.0, max(ch.length_m, 1e-6))),
+            "depth_m": float(np.clip(event.ydata, 0.0, ch.depth_max_m))})
+        self._commit_geometry(rec, before, "Aggiungi vertice")
+        return True
+
+    def _edit_remove_vertex_at(self, event) -> bool:
+        rec = self._selected_rec()
+        if rec is None:
+            return False
+        idx = self._hit_vertex(rec, float(event.x), float(event.y))
+        if idx is None:
+            return False
+        need = _MIN_VERTICES.get(rec["kind"], 2)
+        if len(rec["pts"]) <= need:
+            self._show_message(f"Servono almeno {need} vertici: per toglierla usa Canc.")
+            return True
+        before = copy.deepcopy(rec["pts"])
+        del rec["pts"][idx]
+        self._commit_geometry(rec, before, "Togli vertice")
+        return True
+
+    # -- scrittura sul layer, con annulla/ripeti ------------------------------------------
+
+    def _resolve_points(self, pts) -> None:
+        """Riporta ogni vertice sulla traccia piu' vicina: coordinate reali, ampiezza e tempo."""
+        ch = self._cur
+        for p in pts:
+            trace = ch.trace_at_distance(p["x_m"])
+            pos = ch.position(trace)
+            if pos is None:
+                raise ValueError("Geometria non disponibile per questo punto del profilo.")
+            depth = float(np.clip(p["depth_m"], 0.0, ch.depth_max_m))
+            amp = ch.amplitude_at(trace, ch.row_at_depth(depth))
+            p.update({"x_m": float(ch.dist[trace]), "depth_m": depth, "trace": int(trace),
+                      "east": float(pos[0]), "north": float(pos[1]),
+                      "amp": float(amp) if np.isfinite(amp) else None,
+                      "twt_ns": self._depth_to_twt(depth)})
+
+    def _send_geometry(self, fid: str, pts, ctx: dict) -> bool:
+        if self._feature_update is None:
+            self._show_message("Modifica non disponibile: apri questo pannello da GeoSurvey Studio.")
+            return False
+        try:
+            self._feature_update(fid, vertices=self._vertices_payload(pts), epsg=ctx["epsg"])
+            return True
+        except Exception as exc:
+            self._show_message(f"Errore nella modifica: {exc}")
+            return False
+
+    def _commit_geometry(self, rec, before, label: str) -> bool:
+        try:
+            self._resolve_points(rec["pts"])
+        except ValueError as exc:
+            rec["pts"] = before
+            self._show_message(str(exc))
+            self._refresh_edit_artists(blit=True)
+            return False
+        after = copy.deepcopy(rec["pts"])
+        if not self._send_geometry(rec["id"], after, rec["ctx"]):
+            rec["pts"] = before
+            self._refresh_edit_artists(blit=True)
+            return False
+        fid, ctx = rec["id"], dict(rec["ctx"])
+        before = copy.deepcopy(before)
+        self._push_undo(label,
+                        lambda: self._restore_geometry(fid, before, ctx),
+                        lambda: self._restore_geometry(fid, after, ctx))
+        self._populate_card()
+        self._refresh_edit_artists(blit=True)
+        self._show_message(f"{label}: salvato.")
+        return True
+
+    def _restore_geometry(self, fid: str, pts, ctx: dict) -> bool:
+        ok = self._send_geometry(fid, copy.deepcopy(pts), ctx)
+        self._reload_overlay()
+        return ok
+
+    def _change_attrs(self, rec, new: dict) -> bool:
+        """Cambia classe/affidabilita'/codice/interpretazione/note di un'annotazione."""
+        before = {k: rec.get(k, "") for k in new}
+        if before == new:
+            return True
+        if self._feature_update is None:
+            self._show_message("Modifica non disponibile: apri questo pannello da GeoSurvey Studio.")
+            self._populate_card()
+            return False
+        try:
+            self._feature_update(rec["id"], attributes=new)
+        except Exception as exc:
+            self._show_message(f"Errore nella modifica: {exc}")
+            self._populate_card()
+            return False
+        rec.update(new)
+        fid = rec["id"]
+        self._push_undo("Cambia dati",
+                        lambda: self._restore_attrs(fid, before),
+                        lambda: self._restore_attrs(fid, dict(new)))
+        self._populate_card()
+        self._refresh_edit_artists(blit=True)
+        if "class_code" in new:
+            self._draw_persisted()
+            if self._blit is not None:
+                self._blit.invalidate()
+            self._canvas.draw_idle()
+        return True
+
+    def _restore_attrs(self, fid: str, attrs: dict) -> bool:
+        try:
+            self._feature_update(fid, attributes=attrs)
+            ok = True
+        except Exception as exc:
+            self._show_message(f"Errore nella modifica: {exc}")
+            ok = False
+        self._reload_overlay()
+        return ok
+
+    def _snapshot(self, rec) -> dict:
+        """Copia dell'annotazione che permette di ricrearla identica (annulla l'eliminazione)."""
+        snap = copy.deepcopy(rec)
+        for p in snap["pts"]:
+            if p.get("twt_ns") is None:
+                p["twt_ns"] = self._depth_to_twt(p["depth_m"])
+        return snap
+
+    def _recreate(self, snap: dict) -> bool:
+        ctx = snap["ctx"]
+        if self._feature_sink is None:
+            return False
+        try:
+            self._feature_sink(
+                kind=snap["kind"], variant_name=ctx["variant_name"], profile_stem=ctx["profile_stem"],
+                channel=ctx["channel"], epsg=ctx["epsg"], vertices=self._vertices_payload(snap["pts"]),
+                velocity_m_ns=snap.get("velocity_m_ns"), rdp=snap.get("rdp"),
+                class_code=snap["class_code"], class_label=snap["class_label"],
+                confidence=snap["confidence"], trace_id=snap["id"],
+                attributes={k: snap[k] for k in ("anomaly_id", "interpretation", "notes")})
+            ok = True
+        except Exception as exc:
+            self._show_message(f"Errore nel ripristino: {exc}")
+            ok = False
+        self._reload_overlay()
+        return ok
+
+    def _delete_id(self, fid: str) -> bool:
+        if self._feature_delete is None:
+            return False
+        try:
+            self._feature_delete(fid)
+            ok = True
+        except Exception as exc:
+            self._show_message(f"Errore nell'eliminazione: {exc}")
+            ok = False
+        if self._sel_id == fid:
+            self._sel_id = None
+        self._reload_overlay()
+        return ok
+
+    def _delete_selected(self) -> None:
+        rec = self._selected_rec()
+        if rec is None:
+            return
+        if self._feature_delete is None:
+            self._show_message("Eliminazione non disponibile: apri questo pannello da GeoSurvey Studio.")
+            return
+        snap = self._snapshot(rec)
+        fid = rec["id"]
+        if not self._delete_id(fid):
+            return
+        self._push_undo("Elimina annotazione",
+                        lambda: self._recreate(snap),
+                        lambda: self._delete_id(fid))
+        self._show_message("Annotazione eliminata (Ctrl+Z per annullare).")
+
+    def _after_feature_created(self, new_id: str) -> None:
+        """Appena salvata: la nuova annotazione si seleziona (la scheda e' pronta per
+        codice/interpretazione/note) e l'operazione si puo' annullare."""
+        self._load_features()
+        rec = next((r for r in self._features if r["id"] == new_id), None)
+        if rec is not None:
+            self._sel_id = new_id
+            snap = self._snapshot(rec)
+            self._push_undo("Nuova annotazione",
+                            lambda: self._delete_id(new_id),
+                            lambda: self._recreate(snap))
+        self._reload_overlay()
+
+    def _push_undo(self, label: str, undo, redo) -> None:
+        self._undo_stack.append({"label": label, "undo": undo, "redo": redo})
+        del self._undo_stack[:-_UNDO_LIMIT]
+        self._redo_stack = []
+        self._sync_undo_buttons()
+
+    def _sync_undo_buttons(self) -> None:
+        if getattr(self, "_btn_undo", None) is not None:
+            self._btn_undo.setEnabled(bool(self._undo_stack))
+            self._btn_redo.setEnabled(bool(self._redo_stack))
+
+    def _undo_annotation(self) -> None:
+        if not self._undo_stack:
+            self._show_message("Niente da annullare.")
+            return
+        op = self._undo_stack.pop()
+        ok = op["undo"]()
+        if ok:
+            self._redo_stack.append(op)
+            self._show_message(f"Annullato: {op['label']}.")
+        self._sync_undo_buttons()
+
+    def _redo_annotation(self) -> None:
+        if not self._redo_stack:
+            self._show_message("Niente da ripetere.")
+            return
+        op = self._redo_stack.pop()
+        ok = op["redo"]()
+        if ok:
+            self._undo_stack.append(op)
+            self._show_message(f"Ripetuto: {op['label']}.")
+        self._sync_undo_buttons()
+
+    # -- scheda dell'annotazione selezionata ---------------------------------------------
+
+    def _populate_card(self) -> None:
+        rec = self._selected_rec()
+        if rec is None:
+            return
+        self._card_updating = True
+        try:
+            card = self._cb_card_class
+            idx = card.findData(rec["class_code"])
+            if idx < 0:      # classe non piu' nell'elenco: la mostro comunque, non la perdo
+                card.addItem(label_for(self._classes, rec["class_code"]), rec["class_code"])
+                idx = card.count() - 1
+            card.setCurrentIndex(idx)
+            self._cb_card_conf.setCurrentIndex(max(0, self._cb_card_conf.findData(rec["confidence"])))
+            self._ed_code.setText(rec["anomaly_id"])
+            self._ed_interp.setText(rec["interpretation"])
+            self._ed_notes.setText(rec["notes"])
+            zs = [p["depth_m"] for p in rec["pts"]]
+            self._lbl_card_info.setText(
+                f"{GEOMETRY_LABELS.get(rec['kind'], rec['kind'])} · {len(rec['pts'])} vert. · "
+                f"{min(zs):.2f}–{max(zs):.2f} m")
+        finally:
+            self._card_updating = False
+
+    def _on_card_class(self, i: int) -> None:
+        rec = self._selected_rec()
+        if rec is None or self._card_updating:
+            return
+        code = str(self._cb_card_class.itemData(i) or "")
+        self._change_attrs(rec, {"class_code": code, "class_label": label_for(self._classes, code) if code else ""})
+
+    def _on_card_conf(self, i: int) -> None:
+        rec = self._selected_rec()
+        if rec is None or self._card_updating:
+            return
+        self._change_attrs(rec, {"confidence": str(self._cb_card_conf.itemData(i) or "")})
+
+    def _on_card_text_finished(self) -> None:
+        rec = self._selected_rec()
+        if rec is None or self._card_updating:
+            return
+        new = {"anomaly_id": self._ed_code.text().strip(),
+               "interpretation": self._ed_interp.text().strip(),
+               "notes": self._ed_notes.text().strip()}
+        changed = {k: v for k, v in new.items() if v != rec.get(k, "")}
+        if changed:
+            self._change_attrs(rec, changed)
 
     # ------------------------------------------------------------------
     # Lettura del cursore

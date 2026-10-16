@@ -849,6 +849,12 @@ class TraceCaptureSnappingMixin:
             amp_val = self._safe_float(row.get("amp"))
             if amp_val is not None:
                 entry["amp"] = amp_val
+            # Tempo doppio (ns) del vertice sul radargramma: come l'ampiezza, solo
+            # per le annotazioni disegnate li' (la profondita' dipende dalla velocita',
+            # il tempo no).
+            twt_val = self._safe_float(row.get("t"))
+            if twt_val is not None:
+                entry["t"] = twt_val
             clean.append(entry)
         try:
             return json.dumps(clean, ensure_ascii=True, separators=(",", ":"))
