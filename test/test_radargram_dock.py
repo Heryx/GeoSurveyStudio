@@ -2996,7 +2996,7 @@ class FenceDockTest(_DockBase):
         self._pv, self._QLabel = pv, QLabel
         self.fence = self._make_fence()
 
-    def _make_fence(self, **kw):
+    def _make_fence(self, scrub=False, **kw):
         # niente QtInteractor: sotto la piattaforma Qt offscreen non esiste un contesto OpenGL e VTK va in crash
         pv, QLabel = self._pv, self._QLabel
         fence = _FD.FenceDock(
@@ -3006,6 +3006,9 @@ class FenceDockTest(_DockBase):
             **kw)
         self.iface.addDockWidget(Qt.RightDockWidgetArea, fence)
         fence.show()
+        if not scrub:
+            for sc in fence._scrub.values():
+                sc.set_active(False)
         self._pump(30)
         return fence
 
@@ -3304,12 +3307,193 @@ class FenceDockTest(_DockBase):
         win.setCentralWidget(QWidget())           # come il canvas: la colonna non prende tutta la finestra
         win.resize(1600, 900)
         f.setFloating(False)
-        win.resizeDocks([f], [340], Qt.Horizontal)
-        self._pump(80)
+        for _ in range(8):                                        # il layout dei dock a volte ignora il primo tentativo
+            win.resizeDocks([f], [340], Qt.Horizontal)
+            self._pump(120)
+            if f.width() <= 500:
+                break
+        self.assertLessEqual(f.width(), 500)                       # la colonna e' davvero stretta
         self.assertTrue(f._side.isHidden(), f"larghezza={f.width()}")   # i comandi non coprono la vista
         self.assertGreaterEqual(f._split.sizes()[1], 250)         # e la vista 3D ha spazio
         f._btn_side.setChecked(True)                              # chi vuole i comandi li riapre a mano
         self.assertFalse(f._side.isHidden())
+
+    # -- cursori ------------------------------------------------------------------------------------------
+    def _scrubbing(self, **kw):
+        """Finestra con i cursori attivi (lo stato di default) e il gruppo di time-slice di prova."""
+        self._slice_group()
+        self.fence.cleanup()
+        self.fence = self._make_fence(scrub=True, **kw)
+        return self.fence
+
+    def _settle(self):
+        self.fence._timer.stop()
+        self.fence._rebuild()
+
+    def test_scrubbers_are_active_by_default_and_show_one_item_each(self):
+        f = self._scrubbing()
+        self._settle()
+        shown = sorted(f._shown)
+        self.assertIn("gpr::Swath2", shown)                       # il primo profilo nell'ordine dell'elenco
+        self.assertEqual(sum(1 for k in shown if k.startswith("gpr::")), 1)
+        self.assertEqual([k for k in shown if k.startswith("ert::")], ["ert::T"])
+        self.assertEqual([k for k in shown if k.startswith("slice::")], ["slice::a.tif"])
+
+    def test_moving_the_gpr_slider_changes_the_profile(self):
+        f = self._scrubbing()
+        f._scrub["gpr"].slider.setValue(1)
+        self._settle()
+        self.assertIn("gpr::Swath10", f._shown)
+        self.assertNotIn("gpr::Swath2", f._shown)
+        self.assertIn("(2/2)", f._scrub["gpr"].lbl.text())
+        self.assertIn("Swath10", f._scrub["gpr"].lbl.text())
+
+    def test_next_and_previous_buttons_step_and_stop_at_the_ends(self):
+        f = self._scrubbing()
+        sc = f._scrub["gpr"]
+        sc.btn_next.click()
+        sc.btn_next.click()                                        # oltre la fine: resta sull'ultimo
+        self.assertEqual(sc.index(), 1)
+        sc.btn_prev.click()
+        sc.btn_prev.click()
+        self.assertEqual(sc.index(), 0)
+
+    def test_slice_slider_goes_from_shallow_to_deep_and_names_the_group(self):
+        f = self._scrubbing()
+        sc = f._scrub["slice"]
+        self.assertIn("0.00\u20130.20 m", sc.lbl.text())
+        self.assertIn("gpr_slices", sc.lbl.text())
+        sc.slider.setValue(1)
+        self._settle()
+        self.assertIn("slice::b.tif", f._shown)
+        self.assertNotIn("slice::a.tif", f._shown)
+        self.assertIn("0.20\u20130.40 m", sc.lbl.text())
+
+    def test_categories_are_independent(self):
+        f = self._scrubbing()
+        f._scrub["gpr"].slider.setValue(1)
+        f._scrub["slice"].slider.setValue(1)
+        self._settle()
+        self.assertEqual(sorted(k for k in f._shown if "::" in k and not k.startswith("x::")),
+                         ["ert::T", "gpr::Swath10", "slice::b.tif"])
+
+    def test_ticking_the_tree_turns_that_slider_off_only(self):
+        f = self._scrubbing()
+        gpr = f._tree.topLevelItem(0)
+        gpr.child(1).setCheckState(0, Qt.Checked)                  # a mano: voglio proprio questo
+        self.assertFalse(f._scrub["gpr"].is_active())
+        self.assertTrue(f._scrub["ert"].is_active())
+        self.assertTrue(f._scrub["slice"].is_active())
+        self._settle()
+        self.assertIn("gpr::Swath10", f._shown)
+        self.assertNotIn("gpr::Swath2", f._shown)
+
+    def test_switching_the_slider_off_returns_to_the_ticked_items(self):
+        f = self._scrubbing()
+        f.set_checked("gpr", ["Swath10"])                          # spegne anche il cursore
+        f._scrub["gpr"].set_active(True)
+        f._scrub["gpr"].set_active(False)
+        self._settle()
+        self.assertEqual([k for k in f._shown if k.startswith("gpr::")], ["gpr::Swath10"])
+
+    def test_crossings_follow_the_scrubbed_items(self):
+        f = self._scrubbing()
+        f._scrub["gpr"].slider.setValue(1)                         # Swath10 e' a nord = 0, attraversato dalla linea ERT
+        self._settle()
+        self.assertIn("T \u00d7 Swath10", f._txt_cross.toPlainText())
+
+    def test_empty_categories_disable_their_slider(self):
+        import shutil
+        shutil.rmtree(os.path.join(self.root, "ERT"))
+        self.fence.cleanup()
+        self.fence = self._make_fence(scrub=True)
+        sc = self.fence._scrub["ert"]
+        self.assertFalse(sc.slider.isEnabled())
+        self.assertFalse(sc.is_active())
+        self.assertIn("nessun elemento", sc.lbl.text())
+        self.assertTrue(self.fence._scrub["gpr"].slider.isEnabled())
+
+    def test_a_section_imported_later_is_picked_up_by_its_slider(self):
+        import shutil
+        shutil.rmtree(os.path.join(self.root, "ERT"))
+        self.fence.cleanup()
+        self.fence = self._make_fence(scrub=True)
+        csv = os.path.join(self.root, "export.csv")
+        g = _G.ErtGeoref.from_endpoints((500002.0, -20.0), (500002.0, 20.0), 40.0, "EPSG:32632")
+        _S.save_ert(self.root, "T9", csv, g)
+        self.fence.refresh_variants()
+        self.assertTrue(self.fence._scrub["ert"].is_active())
+        self._settle()
+        self.assertIn("ert::T9", self.fence._shown)
+
+    # -- time-slice fuori dalla cartella dell'area --------------------------------------------------------
+    def _external_group(self, name="esterno"):
+        """Time-slice in un albero separato da quello dell'area (il caso reale del progetto)."""
+        base = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(base, ignore_errors=True))
+        folder = os.path.join(base, "RadarDataExport", name)
+        os.makedirs(folder)
+        rows = []
+        for i, (fn, z0, z1) in enumerate((("e1.tif", 0.0, 0.3), ("e2.tif", 0.3, 0.6))):
+            grid = np.add.outer(np.arange(8, dtype=np.float32), np.arange(10, dtype=np.float32)) + i
+            _RIO.write_tif_singleband(grid, os.path.join(folder, fn), 500000.0, -2.0, 12.0, 2.0, 32632)
+            rows.append({"index": i, "z_from": z0, "z_to": z1, "grid": fn})
+        _SM.write_sliceset(folder, _SS.SliceSpec(), rows, {"kind": "ogpr", "variant_id": "Lavoro"}, crs_epsg=32632)
+        return folder
+
+    def test_slices_loaded_in_qgis_are_found_even_outside_the_area_folder(self):
+        folder = self._external_group()
+        self.assertEqual(self._slice_group_item().childCount(), 0)             # cartella dell'area: nulla
+        lyr = QgsRasterLayer(os.path.join(folder, "e1.tif"), "e1")
+        self.assertTrue(lyr.isValid())
+        QgsProject.instance().addMapLayer(lyr)
+        self.addCleanup(lambda: QgsProject.instance().removeMapLayers([lyr.id()]))
+        self.fence.refresh_variants()
+        top = self._slice_group_item()
+        self.assertEqual(top.childCount(), 1)
+        self.assertEqual(top.child(0).text(0).split("  (")[0], "esterno")
+        self.assertEqual(top.child(0).childCount(), 1)                          # solo il layer caricato
+
+    def test_slices_in_the_project_catalog_are_found_and_unassigned_ones_skipped(self):
+        from importlib import import_module
+        pc = import_module("rasterlinker_feature_interpolation.project_catalog")
+        folder = self._external_group("da_catalogo")
+        pc.ensure_project_structure(self.root)
+        for fn, z0, z1 in (("e1.tif", 0.0, 0.3), ("e2.tif", None, None)):
+            pc.register_timeslice(self.root, {"project_path": os.path.join(folder, fn), "name": fn,
+                                              "depth_from": z0, "depth_to": z1})
+        os.remove(os.path.join(folder, "sliceset.json"))                       # solo il catalogo la conosce
+        self.fence.refresh_variants()
+        top = self._slice_group_item()
+        self.assertEqual(top.childCount(), 1)
+        group = top.child(0)
+        self.assertEqual(group.childCount(), 1)                                 # la slice senza profondita' non si colloca
+        self.assertEqual(group.child(0).text(0), "0.00\u20130.30 m")
+
+    def test_the_same_slice_from_two_sources_appears_once(self):
+        folder = self._external_group()
+        lyr = QgsRasterLayer(os.path.join(folder, "e1.tif"), "e1")
+        QgsProject.instance().addMapLayer(lyr)
+        self.addCleanup(lambda: QgsProject.instance().removeMapLayers([lyr.id()]))
+        from importlib import import_module
+        pc = import_module("rasterlinker_feature_interpolation.project_catalog")
+        pc.ensure_project_structure(self.root)
+        pc.register_timeslice(self.root, {"project_path": os.path.join(folder, "e1.tif"), "name": "e1",
+                                          "depth_from": 0.0, "depth_to": 0.3})
+        self.fence.refresh_variants()
+        group = self._slice_group_item().child(0)
+        self.assertEqual(group.childCount(), 1)
+
+    def test_an_external_slice_is_drawn(self):
+        folder = self._external_group()
+        lyr = QgsRasterLayer(os.path.join(folder, "e2.tif"), "e2")
+        QgsProject.instance().addMapLayer(lyr)
+        self.addCleanup(lambda: QgsProject.instance().removeMapLayers([lyr.id()]))
+        self.fence.refresh_variants()
+        self.fence.set_checked("slice", ["e2.tif"])
+        self.fence._timer.stop()
+        self.fence._rebuild()
+        self.assertIn("slice::e2.tif", self.fence._shown)
 
     def test_screenshot_is_not_blank(self):
         self._build(gpr=["Swath2", "Swath10"], ert=["T"])

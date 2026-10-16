@@ -15,18 +15,21 @@ import os
 from collections import OrderedDict
 
 import numpy as np
-from qgis.PyQt.QtCore import QTimer, Qt
+from qgis.PyQt.QtCore import QTimer, Qt, pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDockWidget,
     QDoubleSpinBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
+    QSlider,
     QSpinBox,
     QSplitter,
     QToolButton,
@@ -35,13 +38,13 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qgis.core import QgsProject
+from qgis.core import QgsProject, QgsRasterLayer
 
 from .gpr_ert_georef import lonlat_transformer
 from .gpr_ert_import import to_grid as ert_to_grid
 from .gpr_ert_import_dialog import import_ert_section
 from .gpr_ert_store import list_ert, load_ert
-from .gpr_fence_slices import colormap_from_hex, discover_slice_groups, load_slice
+from .gpr_fence_slices import colormap_from_hex, load_slice, project_slice_groups
 from .radargram_store import VariantStore, discover_variants
 from .gpr_fence_geometry import (
     crossings,
@@ -80,6 +83,77 @@ def _load_pyvista():
     return v3d.pv, v3d.QtInteractor
 
 
+class _Scrubber(QWidget):
+    """Una riga: [x] titolo  ◀ cursore ▶  nome dell'elemento corrente (n/N).
+
+    Spuntata, la categoria mostra soltanto l'elemento sotto il cursore; non spuntata, quelli spuntati
+    nell'elenco. Il cursore percorre gli elementi dell'elenco nell'ordine in cui compaiono.
+    """
+
+    changed = pyqtSignal()
+
+    def __init__(self, title: str, tip: str, parent=None):
+        super().__init__(parent)
+        lay = QGridLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setHorizontalSpacing(4)
+        lay.setVerticalSpacing(0)
+        self.chk = QCheckBox(title)
+        self.chk.setToolTip(tip)
+        self.btn_prev = QToolButton()
+        self.btn_prev.setText("\u25c0")
+        self.btn_prev.setAutoRaise(True)
+        self.btn_next = QToolButton()
+        self.btn_next.setText("\u25b6")
+        self.btn_next.setAutoRaise(True)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 0)
+        self.slider.setTracking(True)
+        self.slider.setMinimumWidth(60)
+        self.lbl = QLabel("")
+        self.lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)   # il testo lungo si taglia, non allarga la finestra
+        # due righe: [x] titolo  nome (n/N)  /  ◀ cursore ▶ : stretta, la finestra puo' restare sottile
+        lay.addWidget(self.chk, 0, 0, 1, 2)
+        lay.addWidget(self.lbl, 0, 2)
+        lay.addWidget(self.btn_prev, 1, 0)
+        lay.addWidget(self.slider, 1, 1, 1, 2)
+        lay.addWidget(self.btn_next, 1, 3)
+        lay.setColumnStretch(2, 1)
+        self.chk.toggled.connect(lambda _on: self.changed.emit())
+        self.slider.valueChanged.connect(lambda _v: self.changed.emit())
+        self.btn_prev.clicked.connect(lambda: self.slider.setValue(self.slider.value() - 1))
+        self.btn_next.clicked.connect(lambda: self.slider.setValue(self.slider.value() + 1))
+        self.set_count(0)
+
+    def set_count(self, n: int) -> None:
+        self.slider.blockSignals(True)
+        self.slider.setRange(0, max(0, n - 1))
+        self.slider.setValue(min(self.slider.value(), max(0, n - 1)))
+        self.slider.blockSignals(False)
+        for w in (self.chk, self.btn_prev, self.slider, self.btn_next):
+            w.setEnabled(n > 0)
+        if n == 0:
+            self.lbl.setText("nessun elemento")
+
+    def count(self) -> int:
+        return self.slider.maximum() + 1 if self.slider.isEnabled() else 0
+
+    def index(self) -> int:
+        return self.slider.value()
+
+    def is_active(self) -> bool:
+        return self.chk.isChecked() and self.count() > 0
+
+    def set_active(self, on: bool) -> None:
+        self.chk.blockSignals(True)
+        self.chk.setChecked(bool(on))
+        self.chk.blockSignals(False)
+
+    def set_info(self, text: str) -> None:
+        self.lbl.setText(text)
+        self.lbl.setToolTip(text)
+
+
 class FenceDock(QDockWidget):
     """Vista 3D dei profili GPR e ERT del progetto."""
 
@@ -106,6 +180,7 @@ class FenceDock(QDockWidget):
         self._slice_info: dict = {}      # percorso raster -> riga del manifest
         self._origin = None
         self._side = None
+        self._scrub: dict = {}
         self._side_user = False           # l'utente ha scelto a mano: niente piu' nascondi/mostra automatico
         self._hint_on = False
         self._shown: dict = {}            # nome attore -> tipo ("gpr" | "ert" | "x")
@@ -137,7 +212,7 @@ class FenceDock(QDockWidget):
         lay.addWidget(split)
 
         side = QWidget()
-        side.setMinimumWidth(240)
+        side.setMinimumWidth(180)
         self._side = side
         sl = QVBoxLayout(side)
         sl.setContentsMargins(0, 0, 0, 0)
@@ -274,7 +349,17 @@ class FenceDock(QDockWidget):
         else:
             self._plotter = qt(view)
             widget = self._plotter.interactor if hasattr(self._plotter, "interactor") else self._plotter
-        vl.addWidget(widget)
+        widget.setMinimumSize(120, 120)
+        vl.addWidget(widget, 1)
+        for kind, title, tip in (
+                ("gpr", "Profili GPR", "Spuntata: mostra solo il profilo GPR sotto il cursore, passando in rassegna la lista."),
+                ("ert", "Sezioni ERT", "Spuntata: mostra solo la sezione ERT sotto il cursore."),
+                ("slice", "Time-slice", "Spuntata: mostra solo la time-slice sotto il cursore, dalla più superficiale alla più profonda.")):
+            sc = _Scrubber(title, tip)
+            sc.set_active(True)
+            sc.changed.connect(self._on_scrub_changed)
+            self._scrub[kind] = sc
+            vl.addWidget(sc)
         self._plotter.set_background("white")
         self._plotter.add_axes()
         split.addWidget(view)
@@ -461,7 +546,7 @@ class FenceDock(QDockWidget):
                     self._add_child(gpr, p.stem, ("gpr", pi), (gpr_title, p.stem) in checked)
             for name in list_ert(self._project_root()):
                 self._add_child(ert, name, ("ert", name), (ert.text(0), name) in checked)
-            for g in discover_slice_groups(self._slice_root()):
+            for g in project_slice_groups(self._slice_roots(), self._project_raster_paths()):
                 title = f"{g['name']}  ({g['variant']})" if g["variant"] else g["name"]
                 gi = QTreeWidgetItem(slc, [title])
                 gi.setFlags(Qt.ItemIsEnabled)
@@ -478,6 +563,7 @@ class FenceDock(QDockWidget):
         if (gpr_title,) not in expanded:
             gpr.setExpanded(n_gpr <= _GPR_EXPAND_MAX or any(k[:1] == (gpr_title,) for k in checked))
         self._apply_filter(self._ed_filter.text())
+        self._update_scrub()
         self._schedule()
 
     @staticmethod
@@ -513,9 +599,20 @@ class FenceDock(QDockWidget):
             item = item.parent()
         return tuple(reversed(parts))
 
-    def _slice_root(self) -> str:
+    def _slice_roots(self) -> list:
+        """Radici in cui cercare le cartelle delle time-slice: area, progetto e cartella di lavoro."""
         zone = self._current_zone()
-        return str(zone["base"]) if zone else self._workspace_root()
+        out = []
+        for r in (zone["base"] if zone else "", self._project_root(), self._workspace_root()):
+            if r and r not in out:
+                out.append(str(r))
+        return out
+
+    @staticmethod
+    def _project_raster_paths() -> list:
+        """Raster del progetto QGIS: le time-slice si riconoscono dal sliceset.json accanto al file."""
+        return [lyr.source().split("|")[0] for lyr in QgsProject.instance().mapLayers().values()
+                if isinstance(lyr, QgsRasterLayer)]
 
     def _check_group(self, group: int, on: bool) -> None:
         self._updating = True
@@ -534,9 +631,43 @@ class FenceDock(QDockWidget):
         for it in self._iter_items():
             it.setHidden(bool(needle) and needle not in it.text(0).lower())
 
-    def _on_item_changed(self, _item, _col) -> None:
-        if not self._updating:
-            self._schedule()
+    def _on_item_changed(self, item, _col) -> None:
+        if self._updating:
+            return
+        data = item.data(0, _ROLE)
+        if data and data[0] in self._scrub:          # spuntare a mano vuol dire "voglio questi": il cursore si spegne
+            self._scrub[data[0]].set_active(False)
+        self._schedule()
+
+    # --- cursori -------------------------------------------------------------------------------------------------
+    def _leaves(self, kind: str) -> list:
+        return [it for it in self._iter_items() if it.data(0, _ROLE)[0] == kind]
+
+    def _selected(self, kind: str) -> list:
+        """Elementi da mostrare per una categoria: quello sotto il cursore, se attivo, o i spuntati."""
+        sc = self._scrub.get(kind)
+        if sc is not None and sc.is_active():
+            leaves = self._leaves(kind)
+            if leaves:
+                it = leaves[min(sc.index(), len(leaves) - 1)]
+                return [(it.text(0), it.data(0, _ROLE)[1])]
+        return self.checked(kind)
+
+    def _update_scrub(self) -> None:
+        for kind, sc in self._scrub.items():
+            leaves = self._leaves(kind)
+            sc.set_count(len(leaves))
+            if not leaves:
+                continue
+            it = leaves[min(sc.index(), len(leaves) - 1)]
+            name = it.text(0)
+            if kind == "slice" and it.parent() is not None:
+                name = f"{it.parent().text(0).split('  (')[0]} \u00b7 {name}"
+            sc.set_info(f"{name}   ({min(sc.index(), len(leaves) - 1) + 1}/{len(leaves)})")
+
+    def _on_scrub_changed(self) -> None:
+        self._update_scrub()
+        self._schedule()
 
     def checked(self, kind: str) -> list:
         """Payload (indice profilo GPR o nome ERT) degli elementi spuntati di un tipo."""
@@ -550,6 +681,8 @@ class FenceDock(QDockWidget):
     def set_checked(self, kind: str, names) -> None:
         """Spunta solo i profili con questi nomi (per uso programmatico e test)."""
         wanted = set(names)
+        if kind in self._scrub:
+            self._scrub[kind].set_active(False)
         self._updating = True
         try:
             for it in self._iter_items():
@@ -664,8 +797,8 @@ class FenceDock(QDockWidget):
             pl.remove_actor("hint", render=False)
             self._hint_on = False
         dmax = float(self._spin_depth.value())
-        gpr_sel = self.checked("gpr") if self._store is not None else []
-        ert_sel = self.checked("ert")
+        gpr_sel = self._selected("gpr") if self._store is not None else []
+        ert_sel = self._selected("ert")
         errors, label_pts, label_txt = [], [], []
 
         gprs, erts = [], []
@@ -680,7 +813,7 @@ class FenceDock(QDockWidget):
             except Exception as exc:
                 errors.append(f"{text}: {exc}")
         slices = []
-        for text, path in self.checked("slice"):
+        for text, path in self._selected("slice"):
             try:
                 slices.append(self._slice_item(str(path)))
             except Exception as exc:
