@@ -104,6 +104,25 @@ class AlignmentTest(unittest.TestCase):
         al = _S.align_to_channel(self.georef, east, self.north, self.gx)
         self.assertAlmostEqual(al.overlap_m, 20.0, delta=0.6)
 
+    def test_parallel_and_orthogonal_profiles_are_told_apart(self):
+        al = _S.align_to_channel(self.georef, self.east, self.north, self.gx)
+        self.assertAlmostEqual(al.angle_deg, 0.0, places=6)
+        self.assertTrue(al.is_parallel())
+        # profilo GPR lungo y: perpendicolare alla linea ERT (lungo x)
+        ortho = _S.align_to_channel(self.georef, np.full_like(self.gx, 130.0), 0.0 + self.gx, self.gx)
+        self.assertAlmostEqual(ortho.angle_deg, 90.0, places=6)
+        self.assertFalse(ortho.is_parallel())
+
+    def test_opposite_direction_counts_as_parallel(self):
+        al = _S.align_to_channel(self.georef, self.east[::-1], self.north, self.gx)
+        self.assertAlmostEqual(al.angle_deg, 0.0, places=6)
+
+    def test_slightly_skewed_profile_is_still_parallel(self):
+        skew = self.north + self.gx * np.tan(np.radians(10.0))
+        al = _S.align_to_channel(self.georef, self.east, skew, self.gx)
+        self.assertAlmostEqual(al.angle_deg, 10.0, delta=0.5)
+        self.assertTrue(al.is_parallel())
+
     def test_no_valid_coordinates(self):
         nan = np.full(5, np.nan)
         self.assertIsNone(_S.align_to_channel(self.georef, nan, nan, np.arange(5.0)))

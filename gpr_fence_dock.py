@@ -1,0 +1,500 @@
+# -*- coding: utf-8 -*-
+"""Finestra agganciabile "Vista 3D profili": radargrammi GPR e sezioni ERT come tende verticali.
+
+Ogni profilo si disegna lungo la sua linea reale sulla mappa (coordinate per traccia del GPR,
+georiferimento per l'ERT), quindi due profili che si incrociano si incrociano anche qui, nel punto
+giusto. Profondita' sempre in verticale dal piano z = 0 (modalita' piana, come nel pannello 2D).
+
+I profili si spuntano in un elenco: quelli del GPR sono i profili della variante aperta nel pannello
+"Radargrammi processati", quelli ERT sono le sezioni importate nel progetto.
+"""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+
+import numpy as np
+from qgis.PyQt.QtCore import QTimer, Qt
+from qgis.PyQt.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDockWidget,
+    QDoubleSpinBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPlainTextEdit,
+    QPushButton,
+    QSpinBox,
+    QSplitter,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+from qgis.core import QgsProject
+
+from .gpr_ert_georef import lonlat_transformer
+from .gpr_ert_import import to_grid as ert_to_grid
+from .gpr_ert_store import list_ert, load_ert
+from .gpr_fence_geometry import (
+    crossings,
+    curtain,
+    downsample,
+    polyline_vertices,
+    rgba_from_array,
+    track_vertices,
+)
+
+try:
+    from .gpr_viewer_common import normalize_display
+    from .gpr_viewer_radargram import RadargramViewMixin
+    _HAS_DISPLAY = True
+except Exception:                                    # matplotlib/scipy mancanti
+    _HAS_DISPLAY = False
+
+_GPR_CMAPS = ("gray", "RdBu_r", "seismic", "bone")
+_ERT_CMAPS = ("viridis", "turbo", "Spectral_r", "jet", "plasma")
+_CACHE_MAX = 24
+_ERT_CLIM_PERCENTILES = (2.0, 98.0)
+_ROLE = Qt.UserRole
+
+
+def _load_pyvista():
+    """(pv, QtInteractor) o (None, motivo) se pyvista/pyvistaqt non sono disponibili."""
+    from . import gpr_3d_viewer_dialog as v3d
+
+    if not v3d._bootstrap_pyvista_runtime():
+        err = v3d._PYVISTA_IMPORT_ERROR or v3d._QTINTERACTOR_IMPORT_ERROR or "pyvista/pyvistaqt non trovati"
+        return None, str(err)
+    return v3d.pv, v3d.QtInteractor
+
+
+class FenceDock(QDockWidget):
+    """Vista 3D dei profili GPR e ERT del progetto."""
+
+    def __init__(self, iface, store_getter, project_root_getter, parent=None, plotter_factory=None):
+        """``plotter_factory(parent_widget) -> (plotter, widget)`` sostituisce il ``QtInteractor``
+        (nei test non c'e' un contesto OpenGL nativo: si usa ``pv.Plotter(off_screen=True)``)."""
+        super().__init__("Vista 3D profili", parent or (iface.mainWindow() if iface else None))
+        self._plotter_factory = plotter_factory
+        self.setObjectName("GeoSurveyFenceDock")
+        self.setAllowedAreas(Qt.AllDockWidgetAreas)
+        self.iface = iface
+        self._store_getter = store_getter
+        self._root_getter = project_root_getter
+        self._store = None
+        self._gpr_cache: OrderedDict = OrderedDict()
+        self._ert_cache: dict = {}
+        self._origin = None
+        self._shown: dict = {}            # nome attore -> tipo ("gpr" | "ert" | "x")
+        self._first_camera = True
+        self._plotter = None
+        self._pv = None
+        self._updating = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(150)
+        self._timer.timeout.connect(self._rebuild)
+        self._build_ui()
+        if self._plotter is not None:
+            self.refresh_lists()
+
+    # --- interfaccia ---------------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        host = QWidget(self)
+        lay = QHBoxLayout(host)
+        lay.setContentsMargins(2, 2, 2, 2)
+        self.setWidget(host)
+        self._pv, qt = _load_pyvista()
+        if self._pv is None:
+            lay.addWidget(QLabel("La vista 3D richiede pyvista e pyvistaqt nel Python di QGIS.\n"
+                                 f"Dettaglio: {qt}\nInstalla con: python -m pip install pyvista pyvistaqt"))
+            return
+        split = QSplitter(Qt.Horizontal)
+        lay.addWidget(split)
+
+        side = QWidget()
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(0, 0, 0, 0)
+        self._ed_filter = QLineEdit()
+        self._ed_filter.setPlaceholderText("Filtra i profili…")
+        self._ed_filter.textChanged.connect(self._apply_filter)
+        sl.addWidget(self._ed_filter)
+        self._tree = QTreeWidget()
+        self._tree.setHeaderHidden(True)
+        self._tree.itemChanged.connect(self._on_item_changed)
+        sl.addWidget(self._tree, 1)
+        row = QHBoxLayout()
+        for text, tip, slot in (("Tutti i GPR", "Spunta tutti i profili GPR visibili nel filtro.", lambda: self._check_group(0, True)),
+                                ("Nessun GPR", "Toglie la spunta a tutti i profili GPR.", lambda: self._check_group(0, False)),
+                                ("↻", "Rilegge profili GPR e sezioni ERT.", self.refresh_lists)):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        sl.addLayout(row)
+
+        form = QWidget()
+        fl = QVBoxLayout(form)
+        fl.setContentsMargins(0, 0, 0, 0)
+
+        def _line(label, widget):
+            r = QHBoxLayout()
+            r.addWidget(QLabel(label))
+            r.addWidget(widget, 1)
+            fl.addLayout(r)
+
+        self._spin_ch = QSpinBox()
+        self._spin_ch.setRange(0, 63)
+        self._spin_ch.setToolTip("Canale del profilo GPR mostrato (uno per profilo).")
+        self._spin_ch.valueChanged.connect(self._schedule)
+        _line("Canale GPR", self._spin_ch)
+        self._spin_gain = QDoubleSpinBox()
+        self._spin_gain.setRange(0.2, 30.0)
+        self._spin_gain.setSingleStep(0.5)
+        self._spin_gain.setValue(1.7)
+        self._spin_gain.valueChanged.connect(self._schedule)
+        _line("Gain GPR", self._spin_gain)
+        self._cb_gpr = QComboBox()
+        self._cb_gpr.addItems(_GPR_CMAPS)
+        self._cb_gpr.currentIndexChanged.connect(self._schedule)
+        _line("Palette GPR", self._cb_gpr)
+        self._cb_ert = QComboBox()
+        self._cb_ert.addItems(_ERT_CMAPS)
+        self._cb_ert.currentIndexChanged.connect(self._schedule)
+        _line("Palette ERT", self._cb_ert)
+        self._spin_depth = QDoubleSpinBox()
+        self._spin_depth.setRange(0.0, 100.0)
+        self._spin_depth.setSpecialValueText("tutta")
+        self._spin_depth.setSuffix(" m")
+        self._spin_depth.setSingleStep(0.5)
+        self._spin_depth.setValue(0.0)
+        self._spin_depth.setToolTip("Profondità massima mostrata, uguale per GPR ed ERT (0 = tutta).")
+        self._spin_depth.valueChanged.connect(self._schedule)
+        _line("Profondità max", self._spin_depth)
+        self._spin_ve = QDoubleSpinBox()
+        self._spin_ve.setRange(0.5, 20.0)
+        self._spin_ve.setSingleStep(0.5)
+        self._spin_ve.setValue(2.0)
+        self._spin_ve.setToolTip("Esagerazione verticale: le profondità sono piccole rispetto alla lunghezza dei profili.")
+        self._spin_ve.valueChanged.connect(self._apply_scale)
+        _line("Esagerazione Z", self._spin_ve)
+        self._chk_labels = QCheckBox("Nomi dei profili")
+        self._chk_labels.setChecked(True)
+        self._chk_labels.toggled.connect(self._schedule)
+        fl.addWidget(self._chk_labels)
+        self._chk_cross = QCheckBox("Incroci GPR × ERT")
+        self._chk_cross.setChecked(True)
+        self._chk_cross.toggled.connect(self._schedule)
+        fl.addWidget(self._chk_cross)
+        vrow = QHBoxLayout()
+        for text, slot in (("Dall'alto", self._view_top), ("Reimposta", self._view_iso)):
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            vrow.addWidget(b)
+        fl.addLayout(vrow)
+        self._txt_cross = QPlainTextEdit()
+        self._txt_cross.setReadOnly(True)
+        self._txt_cross.setMaximumHeight(110)
+        self._txt_cross.setPlaceholderText("Gli incroci tra profili GPR ed ERT spuntati compaiono qui.")
+        fl.addWidget(self._txt_cross)
+        sl.addWidget(form)
+        split.addWidget(side)
+
+        view = QWidget()
+        vl = QVBoxLayout(view)
+        vl.setContentsMargins(0, 0, 0, 0)
+        if self._plotter_factory is not None:
+            self._plotter, widget = self._plotter_factory(view)
+        else:
+            self._plotter = qt(view)
+            widget = self._plotter.interactor if hasattr(self._plotter, "interactor") else self._plotter
+        vl.addWidget(widget)
+        self._plotter.set_background("white")
+        self._plotter.add_axes()
+        split.addWidget(view)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([260, 700])
+
+    # --- elenchi -----------------------------------------------------------------------------------
+    def _project_root(self) -> str:
+        try:
+            return str(self._root_getter() or "") if self._root_getter else ""
+        except Exception:
+            return ""
+
+    def refresh_lists(self) -> None:
+        """Ricostruisce l'elenco dei profili GPR (variante aperta) e delle sezioni ERT, mantenendo le spunte."""
+        if self._plotter is None:
+            return
+        try:
+            store = self._store_getter() if self._store_getter else None
+        except Exception:
+            store = None
+        if store is not self._store:                  # altra variante: cache e origine non valgono piu'
+            self._gpr_cache.clear()
+            self._origin = None
+            self._first_camera = True
+        self._store = store
+        self._ert_cache.clear()
+        checked = {(it.parent().text(0), it.text(0)) for it in self._iter_items() if it.checkState(0) == Qt.Checked}
+        self._updating = True
+        try:
+            self._tree.clear()
+            gpr_title = f"Profili GPR ({getattr(store, 'name', '')})" if store is not None else "Profili GPR"
+            gpr = QTreeWidgetItem(self._tree, [gpr_title])
+            ert = QTreeWidgetItem(self._tree, ["Sezioni ERT"])
+            for top in (gpr, ert):
+                top.setFlags(Qt.ItemIsEnabled)
+                top.setExpanded(True)
+            if store is not None:
+                for pi, p in enumerate(store.profiles):
+                    self._add_child(gpr, p.stem, ("gpr", pi), (gpr_title, p.stem) in checked)
+            for name in list_ert(self._project_root()):
+                self._add_child(ert, name, ("ert", name), (ert.text(0), name) in checked)
+        finally:
+            self._updating = False
+        self._apply_filter(self._ed_filter.text())
+        self._schedule()
+
+    @staticmethod
+    def _add_child(parent, text, payload, checked: bool) -> None:
+        it = QTreeWidgetItem(parent, [text])
+        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
+        it.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+        it.setData(0, _ROLE, payload)
+
+    def _iter_items(self):
+        for t in range(self._tree.topLevelItemCount()):
+            top = self._tree.topLevelItem(t)
+            for c in range(top.childCount()):
+                yield top.child(c)
+
+    def _check_group(self, group: int, on: bool) -> None:
+        self._updating = True
+        try:
+            top = self._tree.topLevelItem(group)
+            for c in range(top.childCount()):
+                it = top.child(c)
+                if not it.isHidden():
+                    it.setCheckState(0, Qt.Checked if on else Qt.Unchecked)
+        finally:
+            self._updating = False
+        self._schedule()
+
+    def _apply_filter(self, text: str) -> None:
+        needle = str(text or "").strip().lower()
+        for it in self._iter_items():
+            it.setHidden(bool(needle) and needle not in it.text(0).lower())
+
+    def _on_item_changed(self, _item, _col) -> None:
+        if not self._updating:
+            self._schedule()
+
+    def checked(self, kind: str) -> list:
+        """Payload (indice profilo GPR o nome ERT) degli elementi spuntati di un tipo."""
+        out = []
+        for it in self._iter_items():
+            data = it.data(0, _ROLE)
+            if data and data[0] == kind and it.checkState(0) == Qt.Checked:
+                out.append((it.text(0), data[1]))
+        return out
+
+    def set_checked(self, kind: str, names) -> None:
+        """Spunta solo i profili con questi nomi (per uso programmatico e test)."""
+        wanted = set(names)
+        self._updating = True
+        try:
+            for it in self._iter_items():
+                data = it.data(0, _ROLE)
+                if data and data[0] == kind:
+                    it.setCheckState(0, Qt.Checked if it.text(0) in wanted else Qt.Unchecked)
+        finally:
+            self._updating = False
+        self._schedule()
+
+    # --- coordinate -----------------------------------------------------------------------------------
+    @staticmethod
+    def _common_crs() -> str:
+        return QgsProject.instance().crs().authid() or ""
+
+    def _to_common(self, xy, src_authid: str):
+        dst = self._common_crs()
+        if not dst or not src_authid or src_authid.upper() == dst.upper():
+            return xy
+        tr = lonlat_transformer(dst, src_authid)
+        return np.asarray([tr(x, y) for x, y in xy], dtype=np.float64)
+
+    def _set_origin_from(self, xy) -> None:
+        if self._origin is None:
+            self._origin = (float(xy[0][0]), float(xy[0][1]))
+
+    # --- dati dei profili ------------------------------------------------------------------------------
+    def _gpr_item(self, pi: int, ci: int):
+        key = (id(self._store), pi, ci)
+        hit = self._gpr_cache.get(key)
+        if hit is not None:
+            self._gpr_cache.move_to_end(key)
+            return hit
+        prof = self._store.profiles[pi]
+        ci = int(min(ci, prof.n_channels - 1))
+        ch = self._store.channel(pi, ci)
+        base = normalize_display(ch.data).astype(np.float32, copy=False)
+        base = RadargramViewMixin._resample_disp_to_uniform_grid(base, ch.dist)
+        xy, d = track_vertices(ch.east, ch.north, ch.dist)
+        epsg = int(getattr(prof, "epsg", 0) or 0)
+        item = {"name": prof.stem, "base": downsample(base), "xy": self._to_common(xy, f"EPSG:{epsg}" if epsg else ""),
+                "d": d, "span": (float(ch.dist[0]), float(ch.dist[-1])), "depth": float(ch.depth_max_m)}
+        self._gpr_cache[key] = item
+        while len(self._gpr_cache) > _CACHE_MAX:
+            self._gpr_cache.popitem(last=False)
+        return item
+
+    def _ert_item(self, name: str):
+        hit = self._ert_cache.get(name)
+        if hit is None:
+            entry = load_ert(self._project_root(), name)
+            grid = ert_to_grid(entry.section)
+            x0, x1 = float(grid.x_axis[0]), float(grid.x_axis[-1])
+            xy, d = polyline_vertices(entry.georef, x0, x1)
+            hit = {"name": name, "grid": grid, "xy": self._to_common(xy, entry.georef.crs_authid), "d": d,
+                   "span": (x0, x1)}
+            self._ert_cache[name] = hit
+        return hit
+
+    # --- scena -----------------------------------------------------------------------------------------
+    def _schedule(self, *_a) -> None:
+        if self._plotter is not None:
+            self._timer.start()
+
+    def _apply_scale(self, *_a) -> None:
+        if self._plotter is not None:
+            self._plotter.set_scale(zscale=float(self._spin_ve.value()))
+            self._plotter.render()
+
+    def _add_curtain(self, name: str, item: dict, rgba, depth_top: float, depth_bottom: float, kind: str):
+        c = curtain(item["xy"], item["d"], item["span"], depth_top, depth_bottom, origin=self._origin)
+        mesh = self._pv.PolyData(c["points"], c["faces"])
+        mesh.active_texture_coordinates = c["tcoords"]
+        self._plotter.add_mesh(mesh, texture=self._pv.Texture(rgba), lighting=False, name=name,
+                               reset_camera=False, show_scalar_bar=False)
+        self._shown[name] = kind
+
+    def _rebuild(self) -> None:
+        if self._plotter is None:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self._rebuild_scene()
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _rebuild_scene(self) -> None:
+        pl = self._plotter
+        for name in list(self._shown):
+            pl.remove_actor(name, render=False)
+        self._shown.clear()
+        dmax = float(self._spin_depth.value())
+        gpr_sel = self.checked("gpr") if self._store is not None else []
+        ert_sel = self.checked("ert")
+        errors, label_pts, label_txt = [], [], []
+
+        gprs, erts = [], []
+        for text, pi in gpr_sel:
+            try:
+                gprs.append(self._gpr_item(int(pi), int(self._spin_ch.value())))
+            except Exception as exc:
+                errors.append(f"{text}: {exc}")
+        for text, name in ert_sel:
+            try:
+                erts.append(self._ert_item(str(name)))
+            except Exception as exc:
+                errors.append(f"{text}: {exc}")
+        for it in gprs + erts:
+            self._set_origin_from(it["xy"])
+
+        gain = float(self._spin_gain.value())
+        for it in gprs:
+            base, depth = it["base"], it["depth"]
+            rows = base.shape[0] if dmax <= 0 else max(2, int(np.ceil(base.shape[0] * min(1.0, dmax / depth))))
+            shown_depth = depth * rows / base.shape[0]
+            rgba = rgba_from_array(np.clip(base[:rows] * gain, -1.0, 1.0), self._cb_gpr.currentText(), -1.0, 1.0)
+            self._add_curtain(f"gpr::{it['name']}", it, rgba, 0.0, shown_depth, "gpr")
+            label_pts.append((*self._local(it["xy"][0]), 0.0))
+            label_txt.append(it["name"])
+
+        if erts:
+            vals = np.concatenate([e["grid"].data[np.isfinite(e["grid"].data)] for e in erts])
+            lo, hi = np.percentile(vals, _ERT_CLIM_PERCENTILES) if vals.size else (0.0, 1.0)
+            for it in erts:
+                g = it["grid"]
+                depth = g.depth_axis
+                keep = np.ones(len(depth), bool) if dmax <= 0 else depth <= dmax
+                if keep.sum() < 2:                      # limite sotto il passo di griglia: restano le prime 2 righe
+                    keep[:2] = True
+                rgba = rgba_from_array(g.data[keep], self._cb_ert.currentText(), float(lo), float(hi))
+                self._add_curtain(f"ert::{it['name']}", it, rgba, float(depth[keep][0]), float(depth[keep][-1]), "ert")
+                label_pts.append((*self._local(it["xy"][0]), 0.0))
+                label_txt.append(it["name"])
+
+        if self._chk_labels.isChecked() and label_pts:
+            pl.add_point_labels(np.asarray(label_pts), label_txt, name="labels", font_size=11, shape=None,
+                                show_points=False, always_visible=True, text_color="black", render=False)
+            self._shown["labels"] = "x"
+        self._draw_crossings(gprs, erts, dmax)
+        if errors:
+            self._txt_cross.appendPlainText("\n".join(f"⚠ {e}" for e in errors))
+        self._apply_scale()
+        if self._shown and self._first_camera:
+            self._view_iso()
+            self._first_camera = False
+        pl.render()
+
+    def _local(self, xy) -> tuple:
+        return float(xy[0] - self._origin[0]), float(xy[1] - self._origin[1])
+
+    def _draw_crossings(self, gprs, erts, dmax: float) -> None:
+        lines = []
+        if self._chk_cross.isChecked():
+            for e in erts:
+                depth_e = float(e["grid"].depth_axis[-1])
+                for g in gprs:
+                    for da, db, x, y in crossings(g["xy"], g["d"], e["xy"], e["d"]):
+                        depth = min(g["depth"], depth_e) if dmax <= 0 else dmax
+                        name = f"x::{g['name']}::{e['name']}::{da:.2f}"
+                        line = self._pv.Line((x - self._origin[0], y - self._origin[1], 0.0),
+                                             (x - self._origin[0], y - self._origin[1], -depth))
+                        self._plotter.add_mesh(line, color="red", line_width=4, name=name,
+                                               reset_camera=False, render=False)
+                        self._shown[name] = "x"
+                        lines.append(f"{e['name']} × {g['name']}:  ERT a {db:.1f} m,  GPR a {da:.1f} m")
+        self._txt_cross.setPlainText("\n".join(lines))
+
+    def _view_top(self) -> None:
+        if self._plotter is not None:
+            self._plotter.view_xy()
+            self._plotter.reset_camera()
+            self._plotter.render()
+
+    def _view_iso(self) -> None:
+        if self._plotter is not None:
+            self._plotter.camera_position = "iso"
+            self._plotter.reset_camera()
+            self._plotter.render()
+
+    # --- chiusura -----------------------------------------------------------------------------------------
+    def cleanup(self) -> None:
+        self._timer.stop()
+        plotter, self._plotter = self._plotter, None
+        if plotter is not None:
+            try:
+                plotter.close()
+            except Exception:
+                pass
+
+    def closeEvent(self, event) -> None:
+        self.cleanup()
+        super().closeEvent(event)

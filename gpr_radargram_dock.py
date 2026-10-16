@@ -117,6 +117,7 @@ from .gpr_ert_georef import lonlat_transformer
 from .gpr_ert_import import to_grid as ert_to_grid
 from .gpr_ert_panel import ErtSectionPanel
 from .gpr_ert_store import align_to_channel, delete_ert, list_ert, load_ert, save_ert
+from .gpr_fence_dock import FenceDock
 
 try:
     from .gpr_viewer_common import (
@@ -474,6 +475,8 @@ class RadargramDock(QDockWidget):
         # Sezione ERT sotto il radargramma (pannello nascosto finche' non la si attiva dal menu "⋯").
         self._ert_panel = None
         self._ert_cache: dict = {}         # nome -> (ErtEntry, ErtGrid)
+        self._fence = None                 # finestra "Vista 3D profili" (si crea alla prima apertura)
+        self._fence_plotter_factory = None  # solo per i test: sostituisce il QtInteractor
 
         # Disegno anomalie/interfacce direttamente sul radargramma.
         self._draw_mode: str | None = None          # None | "point" | "line" | "polygon"
@@ -629,6 +632,11 @@ class RadargramDock(QDockWidget):
             "Aggiunge al progetto una sezione ERT già invertita (CSV di ResIPY) e la georiferisce\n"
             "dai due estremi di un profilo KML. La sezione si affianca al radargramma sulla stessa x.")
         self._act_ert_import.triggered.connect(self._ert_import)
+        self._act_fence = more_menu.addAction("Vista 3D dei profili GPR ed ERT…")
+        self._act_fence.setToolTip(
+            "Apre una finestra agganciabile con i profili GPR della variante e le sezioni ERT come tende\n"
+            "verticali lungo le loro linee reali sulla mappa: i profili che si incrociano si vedono incrociati.")
+        self._act_fence.triggered.connect(self._open_fence)
         self._btn_more.setMenu(more_menu)
         flow.addWidget(_group(QLabel("Variante"), self._cb_variant, self._btn_refresh, self._btn_more))
 
@@ -1221,6 +1229,7 @@ class RadargramDock(QDockWidget):
     def _set_store(self, store, keep_stem: str | None = None) -> None:
         self._store = store
         self._cur = None
+        self._fence_refresh()
         self._updating = True
         try:
             self._cb_profile.clear()
@@ -1547,6 +1556,10 @@ class RadargramDock(QDockWidget):
         if al is None:
             panel.clear("Il canale mostrato non ha coordinate: la sezione ERT non si può allineare.")
             return
+        if not al.is_parallel():
+            panel.clear(f"Il profilo GPR è inclinato di {al.angle_deg:.0f}° rispetto alla linea ERT «{name}»: "
+                        "affiancarli sulla stessa x non ha senso. Usa la vista 3D dei profili.")
+            return
         depth_max = float(max(self._ax.get_ylim())) if panel.follows_depth() else None
         panel.show_section(name, grid, al, entry.section.z_mode,
                            x_view=self._ax.get_xlim(), depth_max=depth_max)
@@ -1583,7 +1596,25 @@ class RadargramDock(QDockWidget):
         self._act_ert_show.setChecked(True)
         self._ert_reload_names(select=name)
         self._ert_refresh()
+        self._fence_refresh()
         self._show_message(f"Sezione ERT «{name}» importata nel progetto.")
+
+    def _open_fence(self) -> None:
+        """Apre (o riporta in primo piano) la vista 3D dei profili GPR ed ERT."""
+        if self._fence is None:
+            self._fence = FenceDock(self.iface, lambda: self._store, self._project_root,
+                                    parent=self.iface.mainWindow() if self.iface is not None else None,
+                                    plotter_factory=self._fence_plotter_factory)
+            if self.iface is not None and hasattr(self.iface, "addDockWidget"):
+                self.iface.addDockWidget(Qt.RightDockWidgetArea, self._fence)
+        else:
+            self._fence.refresh_lists()
+        self._fence.show()
+        self._fence.raise_()
+
+    def _fence_refresh(self) -> None:
+        if self._fence is not None:
+            self._fence.refresh_lists()
 
     def _ert_delete(self, name: str) -> None:
         if not name:
@@ -1596,6 +1627,7 @@ class RadargramDock(QDockWidget):
         self._ert_cache.pop(name, None)
         self._ert_reload_names()
         self._ert_refresh()
+        self._fence_refresh()
 
     def _on_look_changed(self, *_a) -> None:
         if self._cur is None:
@@ -3778,6 +3810,10 @@ class RadargramDock(QDockWidget):
 
     def cleanup(self) -> None:
         """Da chiamare allo scaricamento del plugin: stacca segnali e rimuove le tracce dalla mappa."""
+        fence, self._fence = self._fence, None
+        if fence is not None:
+            fence.cleanup()
+            fence.close()
         if self._band_filter_on:                # l'attenuazione sulla mappa non deve restare dopo di noi
             self._band_filter_on = False
             self._sync_band_filter(force=True)

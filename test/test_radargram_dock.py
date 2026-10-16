@@ -2976,5 +2976,108 @@ class ImportDialogManualTest(_DockBase):
         self.assertIn("stessa distanza", dlg._lbl_info.text())
 
 
+@unittest.skipUnless(HAS_ENV, "QGIS/matplotlib non disponibili")
+class FenceDockTest(_DockBase):
+    """Vista 3D dei profili: GPR sintetici (nord 0 e 10, est 500000..500004.95) incrociati da una linea ERT lungo y."""
+
+    def setUp(self):
+        super().setUp()
+        self.dock._project_root_provider = lambda: self.root
+        csv = os.path.join(self.root, "export.csv")
+        _ert_csv(csv, length=40.0)
+        # linea ERT ortogonale ai profili GPR: x = 500002, da y = -20 a y = +20
+        g = _G.ErtGeoref.from_endpoints((500002.0, -20.0), (500002.0, 20.0), 40.0, "EPSG:32632")
+        _S.save_ert(self.root, "T", csv, g)
+        try:
+            import pyvista as pv
+            from qgis.PyQt.QtWidgets import QLabel
+        except ImportError:
+            self.skipTest("pyvista non disponibile in questo interprete")
+        # niente QtInteractor: sotto la piattaforma Qt offscreen non esiste un contesto OpenGL e VTK va in crash
+        self.dock._fence_plotter_factory = lambda parent: (pv.Plotter(off_screen=True, window_size=(600, 400)),
+                                                          QLabel("3D", parent))
+        self.dock._act_fence.trigger()
+        self._pump(50)
+        self.fence = self.dock._fence
+        if self.fence is None or self.fence._plotter is None:
+            self.skipTest("pyvista/pyvistaqt non disponibili in questo interprete")
+
+    def tearDown(self):
+        super().tearDown()
+
+    def _build(self, gpr=(), ert=()):
+        self.fence.set_checked("gpr", gpr)
+        self.fence.set_checked("ert", ert)
+        self.fence._timer.stop()
+        self.fence._rebuild()
+
+    def test_lists_gpr_profiles_and_ert_sections(self):
+        names_gpr = [t for t, _ in self.fence.checked("gpr")]
+        self.assertEqual(names_gpr, [])
+        top = self.fence._tree.topLevelItem(0)
+        self.assertEqual(top.childCount(), 2)
+        self.assertEqual(self.fence._tree.topLevelItem(1).childCount(), 1)
+        self.assertEqual(self.fence._tree.topLevelItem(1).child(0).text(0), "T")
+
+    def test_checked_profiles_become_curtains(self):
+        self._build(gpr=["Swath2", "Swath10"], ert=["T"])
+        shown = self.fence._shown
+        self.assertIn("gpr::Swath2", shown)
+        self.assertIn("gpr::Swath10", shown)
+        self.assertIn("ert::T", shown)
+        self.assertEqual(sum(1 for v in shown.values() if v == "x"), 3)       # 2 incroci + etichette
+
+    def test_crossings_are_listed_with_both_distances(self):
+        self._build(gpr=["Swath10"], ert=["T"])
+        text = self.fence._txt_cross.toPlainText()
+        self.assertIn("T × Swath10", text)
+        self.assertIn("ERT a 20.0 m", text)             # y = 0 sta a 20 m dall'inizio della linea ERT
+        self.assertIn("GPR a 2.0 m", text)              # x = 500002 sta a 2 m dall'inizio del profilo
+
+    def test_parallel_profiles_do_not_cross(self):
+        self._build(gpr=["Swath2"], ert=[])
+        self.assertEqual(self.fence._txt_cross.toPlainText(), "")
+
+    def test_unchecking_removes_the_actors(self):
+        self._build(gpr=["Swath2"], ert=["T"])
+        self._build(gpr=[], ert=[])
+        self.assertEqual(self.fence._shown, {})
+
+    def test_depth_limit_and_labels_toggle(self):
+        self.fence._spin_depth.setValue(0.1)
+        self.fence._chk_labels.setChecked(False)
+        self._build(gpr=["Swath2"], ert=["T"])
+        self.assertNotIn("labels", self.fence._shown)
+        self.assertIn("ert::T", self.fence._shown)
+
+    def test_ert_alone_and_gpr_alone(self):
+        self._build(ert=["T"])
+        self.assertIn("ert::T", self.fence._shown)
+        self._build(gpr=["Swath10"])
+        self.assertNotIn("ert::T", self.fence._shown)
+
+    def test_importing_an_ert_refreshes_the_list(self):
+        csv = os.path.join(self.root, "export.csv")
+        g = _G.ErtGeoref.from_endpoints((500003.0, -20.0), (500003.0, 20.0), 40.0, "EPSG:32632")
+        _S.save_ert(self.root, "T2", csv, g)
+        self.dock._fence_refresh()
+        self.assertEqual(self.fence._tree.topLevelItem(1).childCount(), 2)
+
+    def test_checks_survive_a_refresh(self):
+        self.fence.set_checked("gpr", ["Swath2"])
+        self.fence.refresh_lists()
+        self.assertEqual([t for t, _ in self.fence.checked("gpr")], ["Swath2"])
+
+    def test_dock_cleanup_closes_the_fence(self):
+        self.dock.cleanup()
+        self.assertIsNone(self.dock._fence)
+        self.assertIsNone(self.fence._plotter)
+
+    def test_screenshot_is_not_blank(self):
+        self._build(gpr=["Swath2", "Swath10"], ert=["T"])
+        img = self.fence._plotter.screenshot(return_img=True)
+        self.assertGreater(int(np.asarray(img).std()), 5)
+
+
 if __name__ == "__main__":
     unittest.main()

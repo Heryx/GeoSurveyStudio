@@ -9,6 +9,7 @@ autosufficiente anche se l'export di ResIPY viene spostato.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -22,6 +23,8 @@ from .gpr_ert_import import ErtSection, load_ert_section
 ERT_DIR = "ERT"
 _SECTION_FILE = "section.csv"
 _GEOREF_FILE = "georef.json"
+# Oltre questo angolo tra profilo GPR e linea ERT la proiezione affiancata non e' un confronto valido.
+MAX_PARALLEL_ANGLE_DEG = 20.0
 
 
 def safe_name(name: str) -> str:
@@ -97,6 +100,11 @@ class ErtAlignment:
     median_offset_m: float      # scostamento laterale mediano tra tracce GPR e linea ERT
     max_offset_m: float
     overlap_m: float            # tratto di profilo GPR che cade entro la sezione ERT
+    angle_deg: float = 0.0      # inclinazione media del profilo GPR sulla linea ERT (0 = paralleli, 90 = ortogonali)
+
+    def is_parallel(self, max_angle_deg: float = MAX_PARALLEL_ANGLE_DEG) -> bool:
+        """Vero se la proiezione sulla linea ERT ha senso: profili (quasi) paralleli o sovrapposti."""
+        return self.angle_deg <= max_angle_deg
 
     def ert_to_gpr(self, ert_d):
         """Distanza GPR per distanze ERT; NaN dove il profilo GPR non arriva."""
@@ -131,4 +139,22 @@ def align_to_channel(georef: ErtGeoref, east, north, dist, ert_length: float | N
     inside = (ert_d >= d0 - 1e-9) & (ert_d <= d1 + 1e-9)
     overlap = float(gx[inside].max() - gx[inside].min()) if inside.sum() >= 2 else 0.0
     return ErtAlignment(gpr_dist=gx, ert_dist=ert_d, median_offset_m=float(np.median(off)),
-                        max_offset_m=float(np.max(off)), overlap_m=overlap)
+                        max_offset_m=float(np.max(off)), overlap_m=overlap,
+                        angle_deg=_track_angle_deg(georef, east[ok][order], north[ok][order], ert_d))
+
+
+def _track_angle_deg(georef: ErtGeoref, east, north, ert_d) -> float:
+    """Angolo (0-90) tra la direzione del profilo GPR e quella della linea ERT sotto di esso.
+
+    Direzione del GPR: dal primo all'ultimo punto (la forma fine non conta); direzione ERT: la
+    tangente della polilinea al punto di mezzo. Linee percorse in verso opposto contano come parallele.
+    """
+    gx, gy = float(east[-1] - east[0]), float(north[-1] - north[0])
+    if math.hypot(gx, gy) < 1e-9:
+        return 0.0
+    mid = float(np.median(ert_d))
+    pts = georef.points
+    k = int(np.clip(np.searchsorted([p.distance for p in pts], mid) - 1, 0, len(pts) - 2))
+    ex, ey = pts[k + 1].x - pts[k].x, pts[k + 1].y - pts[k].y
+    cos = abs(gx * ex + gy * ey) / (math.hypot(gx, gy) * math.hypot(ex, ey))
+    return math.degrees(math.acos(min(1.0, cos)))
