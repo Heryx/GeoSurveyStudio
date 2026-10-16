@@ -3133,6 +3133,102 @@ class FenceDockTest(_DockBase):
             _FD.import_ert_section = original
         self.assertIn("non riuscita", self.fence._txt_cross.toPlainText())
 
+    # -- time-slice ------------------------------------------------------------------------------
+    def _slice_group(self, group="gpr_slices", variant="Lavoro", slices=(("a.tif", 0.0, 0.2), ("b.tif", 0.2, 0.4))):
+        """Gruppo di time-slice con un gradiente, sopra i profili GPR sintetici (est 500000.., nord 0 e 10)."""
+        folder = os.path.join(self.root, "Processing", "timeslices", group)
+        os.makedirs(folder, exist_ok=True)
+        rows = []
+        for i, (name, z0, z1) in enumerate(slices):
+            grid = np.add.outer(np.arange(8, dtype=np.float32), np.arange(10, dtype=np.float32)) + i
+            _RIO.write_tif_singleband(grid, os.path.join(folder, name), 500000.0, -2.0, 12.0, 2.0, 32632)
+            rows.append({"index": i, "z_from": z0, "z_to": z1, "grid": name})
+        _SM.write_sliceset(folder, _SS.SliceSpec(), rows, {"kind": "ogpr", "variant_id": variant}, crs_epsg=32632)
+        self.fence.refresh_variants()
+        return folder
+
+    def _slice_group_item(self):
+        return self.fence._tree.topLevelItem(2)
+
+    def test_time_slices_are_listed_by_group_with_depth_labels(self):
+        self._slice_group()
+        top = self._slice_group_item()
+        self.assertEqual(top.text(0), "Time-slice")
+        self.assertEqual(top.childCount(), 1)
+        group = top.child(0)
+        self.assertIn("Lavoro", group.text(0))
+        self.assertTrue(group.isExpanded())                    # e' il gruppo della variante aperta
+        self.assertEqual([group.child(i).text(0) for i in range(group.childCount())],
+                         ["0.00\u20130.20 m", "0.20\u20130.40 m"])
+
+    def test_groups_of_other_variants_stay_collapsed(self):
+        self._slice_group(group="altro", variant="v3")
+        self.assertFalse(self._slice_group_item().child(0).isExpanded())
+
+    def test_checked_slice_becomes_a_plane_and_unchecked_is_removed(self):
+        self._slice_group()
+        self._build(gpr=["Swath10"])
+        self.fence.set_checked("slice", ["a.tif"])
+        self.fence._timer.stop()
+        self.fence._rebuild()
+        self.assertIn("slice::a.tif", self.fence._shown)
+        self.assertNotIn("slice::b.tif", self.fence._shown)
+        self.assertIn("gpr::Swath10", self.fence._shown)
+        self.fence.set_checked("slice", [])
+        self.fence._timer.stop()
+        self.fence._rebuild()
+        self.assertNotIn("slice::a.tif", self.fence._shown)
+
+    def test_slice_alone_is_enough_to_build_the_scene(self):
+        self._slice_group()
+        self.fence.set_checked("slice", ["a.tif", "b.tif"])
+        self.fence._timer.stop()
+        self.fence._rebuild()
+        self.assertEqual(sorted(k for k, v in self.fence._shown.items() if v == "slice"),
+                         ["slice::a.tif", "slice::b.tif"])
+        img = self.fence._plotter.screenshot(return_img=True)
+        self.assertGreater(int(np.asarray(img).std()), 5)
+
+    def test_palette_and_opacity_do_not_break_the_scene(self):
+        self._slice_group()
+        self.fence.set_checked("slice", ["a.tif"])
+        for i in range(self.fence._cb_slice.count()):
+            self.fence._cb_slice.setCurrentIndex(i)
+            self.fence._timer.stop()
+            self.fence._rebuild()
+            self.assertIn("slice::a.tif", self.fence._shown)
+        self.fence._spin_slice_op.setValue(0.3)
+        self.fence._timer.stop()
+        self.fence._rebuild()
+        self.assertIn("slice::a.tif", self.fence._shown)
+
+    def test_slice_checks_survive_a_refresh(self):
+        self._slice_group()
+        self.fence.set_checked("slice", ["b.tif"])
+        self.fence.refresh_variants()
+        self.assertEqual([t for t, _ in self.fence.checked("slice")], ["0.20\u20130.40 m"])
+
+    def test_regenerated_raster_is_reloaded(self):
+        folder = self._slice_group()
+        path = os.path.join(folder, "a.tif")
+        self.fence.set_checked("slice", ["a.tif"])
+        self.fence._slice_item(path)
+        first = self.fence._slice_cache[path]["_mtime"]
+        os.utime(path, (first + 100, first + 100))
+        self.fence._slice_item(path)
+        self.assertNotEqual(self.fence._slice_cache[path]["_mtime"], first)
+
+    def test_unreadable_raster_is_reported_not_raised(self):
+        folder = self._slice_group()
+        with open(os.path.join(folder, "a.tif"), "wb") as fh:
+            fh.write(b"non e' un tif")
+        self.fence.set_checked("slice", ["a.tif", "b.tif"])
+        self.fence._timer.stop()
+        self.fence._rebuild()
+        self.assertNotIn("slice::a.tif", self.fence._shown)
+        self.assertIn("slice::b.tif", self.fence._shown)
+        self.assertIn("0.00\u20130.20 m", self.fence._txt_cross.toPlainText())
+
     def test_screenshot_is_not_blank(self):
         self._build(gpr=["Swath2", "Swath10"], ert=["T"])
         img = self.fence._plotter.screenshot(return_img=True)

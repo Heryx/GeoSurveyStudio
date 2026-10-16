@@ -85,6 +85,21 @@ def curtain(xy, d, tex_span, depth_top: float, depth_bottom: float, origin=(0.0,
     return {"points": np.vstack([top, bot]), "faces": faces.astype(np.int64), "tcoords": tc}
 
 
+def plane(corners_xy, depth: float, origin=(0.0, 0.0)) -> dict:
+    """Quadrilatero orizzontale a profondita' ``depth``: ``points (4,3)``, ``faces``, ``tcoords (4,2)``.
+
+    ``corners_xy`` = angoli in ordine: alto-sinistra, alto-destra, basso-destra, basso-sinistra
+    (alto = nord nella texture, riga 0 in alto). Gli angoli possono non formare un rettangolo
+    (raster in un CRS diverso da quello della scena).
+    """
+    c = np.asarray(corners_xy, dtype=np.float64)
+    if c.shape != (4, 2):
+        raise ValueError("servono 4 angoli")
+    pts = np.column_stack([c[:, 0] - origin[0], c[:, 1] - origin[1], np.full(4, -float(depth))])
+    tc = np.array([[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]])
+    return {"points": pts, "faces": np.array([4, 0, 1, 2, 3], dtype=np.int64), "tcoords": tc}
+
+
 def downsample(data, max_rows: int = MAX_TEXTURE_ROWS, max_cols: int = MAX_TEXTURE_COLS):
     """Riduce a blocchi (media ignorando i NaN) fino a stare nei limiti della texture."""
     a = np.asarray(data, dtype=np.float32)
@@ -102,14 +117,18 @@ def downsample(data, max_rows: int = MAX_TEXTURE_ROWS, max_cols: int = MAX_TEXTU
     return out.astype(np.float32)
 
 
-def rgba_from_array(data, cmap_name: str, vmin: float, vmax: float):
-    """Texture ``uint8 (h, w, 4)`` con la riga 0 in alto; i NaN sono trasparenti."""
+def rgba_from_array(data, cmap_name, vmin: float, vmax: float):
+    """Texture ``uint8 (h, w, 4)`` con la riga 0 in alto; i NaN sono trasparenti.
+
+    ``cmap_name`` e' il nome di una palette matplotlib o una ``Colormap`` gia' costruita.
+    """
     from matplotlib import colormaps
 
     a = np.asarray(data, dtype=np.float64)
     span = (vmax - vmin) if vmax > vmin else 1.0
     norm = np.clip((a - vmin) / span, 0.0, 1.0)
-    rgba = colormaps[cmap_name](np.nan_to_num(norm, nan=0.0))
+    cmap = colormaps[cmap_name] if isinstance(cmap_name, str) else cmap_name
+    rgba = cmap(np.nan_to_num(norm, nan=0.0))
     rgba[..., 3] = np.where(np.isfinite(a), 1.0, 0.0)
     return (rgba * 255.0 + 0.5).astype(np.uint8)
 

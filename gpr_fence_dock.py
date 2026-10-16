@@ -40,11 +40,13 @@ from .gpr_ert_georef import lonlat_transformer
 from .gpr_ert_import import to_grid as ert_to_grid
 from .gpr_ert_import_dialog import import_ert_section
 from .gpr_ert_store import list_ert, load_ert
+from .gpr_fence_slices import colormap_from_hex, discover_slice_groups, load_slice
 from .radargram_store import VariantStore, discover_variants
 from .gpr_fence_geometry import (
     crossings,
     curtain,
     downsample,
+    plane,
     polyline_vertices,
     rgba_from_array,
     track_vertices,
@@ -59,6 +61,7 @@ except Exception:                                    # matplotlib/scipy mancanti
 
 _GPR_CMAPS = ("gray", "RdBu_r", "seismic", "bone")
 _ERT_CMAPS = ("viridis", "turbo", "Spectral_r", "jet", "plasma")
+_SLICE_CMAPS = ("viridis", "gray", "turbo", "RdBu_r", "Spectral_r")
 _CACHE_MAX = 24
 _ERT_CLIM_PERCENTILES = (2.0, 98.0)
 _ROLE = Qt.UserRole
@@ -96,6 +99,8 @@ class FenceDock(QDockWidget):
         self._store = None
         self._gpr_cache: OrderedDict = OrderedDict()
         self._ert_cache: dict = {}
+        self._slice_cache: dict = {}
+        self._slice_info: dict = {}      # percorso raster -> riga del manifest
         self._origin = None
         self._shown: dict = {}            # nome attore -> tipo ("gpr" | "ert" | "x")
         self._first_camera = True
@@ -190,6 +195,20 @@ class FenceDock(QDockWidget):
         self._cb_ert.addItems(_ERT_CMAPS)
         self._cb_ert.currentIndexChanged.connect(self._schedule)
         _line("Palette ERT", self._cb_ert)
+        self._cb_slice = QComboBox()
+        self._cb_slice.addItem("Stile del file", "")
+        for name in _SLICE_CMAPS:
+            self._cb_slice.addItem(name, name)
+        self._cb_slice.setToolTip("Palette delle time-slice: lo stile salvato nel raster oppure una palette a scelta.")
+        self._cb_slice.currentIndexChanged.connect(self._schedule)
+        _line("Palette slice", self._cb_slice)
+        self._spin_slice_op = QDoubleSpinBox()
+        self._spin_slice_op.setRange(0.1, 1.0)
+        self._spin_slice_op.setSingleStep(0.05)
+        self._spin_slice_op.setValue(0.85)
+        self._spin_slice_op.setToolTip("Opacità dei piani delle time-slice: più bassa, meglio si vedono i profili sotto.")
+        self._spin_slice_op.valueChanged.connect(self._schedule)
+        _line("Opacità slice", self._spin_slice_op)
         self._spin_depth = QDoubleSpinBox()
         self._spin_depth.setRange(0.0, 100.0)
         self._spin_depth.setSpecialValueText("tutta")
@@ -383,14 +402,16 @@ class FenceDock(QDockWidget):
             return
         store = self._store
         self._ert_cache.clear()
-        checked = {(it.parent().text(0), it.text(0)) for it in self._iter_items() if it.checkState(0) == Qt.Checked}
+        checked = {self._path_key(it) for it in self._iter_items() if it.checkState(0) == Qt.Checked}
+        self._slice_info.clear()
         self._updating = True
         try:
             self._tree.clear()
             gpr_title = f"Profili GPR ({getattr(store, 'name', '')})" if store is not None else "Profili GPR"
             gpr = QTreeWidgetItem(self._tree, [gpr_title])
             ert = QTreeWidgetItem(self._tree, ["Sezioni ERT"])
-            for top in (gpr, ert):
+            slc = QTreeWidgetItem(self._tree, ["Time-slice"])
+            for top in (gpr, ert, slc):
                 top.setFlags(Qt.ItemIsEnabled)
                 top.setExpanded(True)
             if store is not None:
@@ -398,6 +419,15 @@ class FenceDock(QDockWidget):
                     self._add_child(gpr, p.stem, ("gpr", pi), (gpr_title, p.stem) in checked)
             for name in list_ert(self._project_root()):
                 self._add_child(ert, name, ("ert", name), (ert.text(0), name) in checked)
+            for g in discover_slice_groups(self._slice_root()):
+                title = f"{g['name']}  ({g['variant']})" if g["variant"] else g["name"]
+                gi = QTreeWidgetItem(slc, [title])
+                gi.setFlags(Qt.ItemIsEnabled)
+                gi.setExpanded(store is not None and g["variant"] == getattr(store, "name", None))
+                for row in g["slices"]:
+                    label = f"{row['z_from']:.2f}–{row['z_to']:.2f} m"
+                    self._slice_info[row["path"]] = dict(row, epsg=g["epsg"], group=g["name"])
+                    self._add_child(gi, label, ("slice", row["path"]), (slc.text(0), title, label) in checked)
         finally:
             self._updating = False
         self._apply_filter(self._ed_filter.text())
@@ -411,10 +441,26 @@ class FenceDock(QDockWidget):
         it.setData(0, _ROLE, payload)
 
     def _iter_items(self):
-        for t in range(self._tree.topLevelItemCount()):
-            top = self._tree.topLevelItem(t)
-            for c in range(top.childCount()):
-                yield top.child(c)
+        """Voci spuntabili (con un tipo di dati), a qualunque profondita' dell'albero."""
+        stack = [self._tree.topLevelItem(t) for t in range(self._tree.topLevelItemCount())][::-1]
+        while stack:
+            it = stack.pop()
+            if it.data(0, _ROLE):
+                yield it
+            stack.extend(it.child(c) for c in range(it.childCount() - 1, -1, -1))
+
+    @staticmethod
+    def _path_key(item) -> tuple:
+        """Testi dalla radice alla voce: identifica una voce anche dopo la ricostruzione dell'albero."""
+        parts = []
+        while item is not None:
+            parts.append(item.text(0))
+            item = item.parent()
+        return tuple(reversed(parts))
+
+    def _slice_root(self) -> str:
+        zone = self._current_zone()
+        return str(zone["base"]) if zone else self._workspace_root()
 
     def _check_group(self, group: int, on: bool) -> None:
         self._updating = True
@@ -454,7 +500,8 @@ class FenceDock(QDockWidget):
             for it in self._iter_items():
                 data = it.data(0, _ROLE)
                 if data and data[0] == kind:
-                    it.setCheckState(0, Qt.Checked if it.text(0) in wanted else Qt.Unchecked)
+                    names_of_item = {it.text(0), os.path.basename(str(data[1]))}
+                    it.setCheckState(0, Qt.Checked if names_of_item & wanted else Qt.Unchecked)
         finally:
             self._updating = False
         self._schedule()
@@ -495,6 +542,24 @@ class FenceDock(QDockWidget):
         while len(self._gpr_cache) > _CACHE_MAX:
             self._gpr_cache.popitem(last=False)
         return item
+
+    def _slice_item(self, path: str):
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0.0
+        hit = self._slice_cache.get(path)
+        if hit is None or hit.get("_mtime") != mtime:      # raster rigenerato: si rilegge
+            hit = dict(load_slice(path), _mtime=mtime)
+            self._slice_cache[path] = hit
+            while len(self._slice_cache) > _CACHE_MAX:
+                self._slice_cache.pop(next(iter(self._slice_cache)))
+        info = self._slice_info.get(path, {})
+        epsg = hit["epsg"] or int(info.get("epsg") or 0)
+        corners = self._to_common(np.asarray(hit["corners"], dtype=np.float64), f"EPSG:{epsg}" if epsg else "")
+        return dict(hit, corners=np.asarray(corners), path=path, name=os.path.basename(path),
+                    z_from=float(info.get("z_from", 0.0)), z_to=float(info.get("z_to", 0.0)),
+                    z_center=float(info.get("z_center", 0.0)))
 
     def _ert_item(self, name: str):
         hit = self._ert_cache.get(name)
@@ -556,8 +621,16 @@ class FenceDock(QDockWidget):
                 erts.append(self._ert_item(str(name)))
             except Exception as exc:
                 errors.append(f"{text}: {exc}")
+        slices = []
+        for text, path in self.checked("slice"):
+            try:
+                slices.append(self._slice_item(str(path)))
+            except Exception as exc:
+                errors.append(f"{text}: {exc}")
         for it in gprs + erts:
             self._set_origin_from(it["xy"])
+        for it in slices:
+            self._set_origin_from(it["corners"])
 
         gain = float(self._spin_gain.value())
         for it in gprs:
@@ -582,6 +655,20 @@ class FenceDock(QDockWidget):
                 self._add_curtain(f"ert::{it['name']}", it, rgba, float(depth[keep][0]), float(depth[keep][-1]), "ert")
                 label_pts.append((*self._local(it["xy"][0]), 0.0))
                 label_txt.append(it["name"])
+
+        style = str(self._cb_slice.currentData() or "")
+        for it in slices:
+            cmap = (colormap_from_hex(it["colors"]) if not style else None) or (style or "viridis")
+            rgba = rgba_from_array(it["data"], cmap, it["vmin"], it["vmax"])
+            pl_geo = plane(it["corners"], it["z_center"], origin=self._origin)
+            mesh = self._pv.PolyData(pl_geo["points"], pl_geo["faces"])
+            mesh.active_texture_coordinates = pl_geo["tcoords"]
+            name = f"slice::{it['name']}"
+            pl.add_mesh(mesh, texture=self._pv.Texture(rgba), lighting=False, name=name, reset_camera=False,
+                        show_scalar_bar=False, opacity=float(self._spin_slice_op.value()), render=False)
+            self._shown[name] = "slice"
+            label_pts.append((*self._local(it["corners"][0]), -it["z_center"]))
+            label_txt.append(f"{it['z_from']:.2f}–{it['z_to']:.2f} m")
 
         if self._chk_labels.isChecked() and label_pts:
             pl.add_point_labels(np.asarray(label_pts), label_txt, name="labels", font_size=11, shape=None,
