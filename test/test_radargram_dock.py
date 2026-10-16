@@ -3028,7 +3028,8 @@ class FenceDockTest(_DockBase):
         names_gpr = [t for t, _ in self.fence.checked("gpr")]
         self.assertEqual(names_gpr, [])
         top = self.fence._tree.topLevelItem(0)
-        self.assertEqual(top.childCount(), 2)
+        self.assertEqual(top.childCount(), 1)                      # un gruppo per sorgente spuntata
+        self.assertEqual(top.child(0).childCount(), 2)             # con i suoi profili
         self.assertEqual(self.fence._tree.topLevelItem(1).childCount(), 1)
         self.assertEqual(self.fence._tree.topLevelItem(1).child(0).text(0), "T")
 
@@ -3086,18 +3087,21 @@ class FenceDockTest(_DockBase):
         self.assertIsNone(self.fence._plotter)
         self.fence.refresh_variants()               # dopo la pulizia non deve sollevare
 
-    def test_variant_and_zone_selection(self):
-        self.assertEqual(self.fence._cb_variant.count(), 2)
-        self.assertEqual(self.fence._store.name, "Lavoro")           # "Lavoro" e' la variante di default
-        self.assertTrue(self.fence._cb_zone.isHidden())               # un'area sola: nessun selettore
-        self._build(gpr=["Swath2"])
-        i = self.fence._cb_variant.findText("v3", Qt.MatchStartsWith)
-        self.fence._cb_variant.setCurrentIndex(i)
-        self.assertEqual(self.fence._store.name, "v3")
-        self.assertEqual(self.fence.checked("gpr"), [])               # altra variante: le spunte ripartono
-        self.assertEqual(self.fence._tree.topLevelItem(0).childCount(), 2)
+    def test_default_source_is_the_working_variant(self):
+        srcs = self.fence.checked_sources()
+        self.assertEqual([x["name"] for x in srcs], ["Lavoro"])
+        leaves = [it.text(0) for it in self.fence._src_leaves()]
+        self.assertEqual(len(leaves), 2)                              # Lavoro e v3, a livello unico (un'area sola)
 
-    def test_two_zones_show_the_zone_selector_and_switch_variants(self):
+    def test_switching_the_source_replaces_the_group(self):
+        self._build(gpr=["Swath2"])
+        self.fence.set_sources(["v3"])
+        self.assertEqual([x["name"] for x in self.fence.checked_sources()], ["v3"])
+        self.assertEqual(self.fence.checked("gpr"), [])               # altra variante: le spunte ripartono
+        self.assertEqual(self.fence._tree.topLevelItem(0).childCount(), 1)
+        self.assertEqual(self.fence._tree.topLevelItem(0).child(0).childCount(), 2)
+
+    def test_two_zones_list_their_variants_and_both_can_be_shown(self):
         other = tempfile.mkdtemp()
         try:
             _write_variant(other, "Solo", ["Alfa", "Beta", "Gamma"])
@@ -3105,10 +3109,13 @@ class FenceDockTest(_DockBase):
                      {"name": "Zona2", "base": other, "active": False}]
             fence = self._make_fence(zones_provider=lambda: zones)
             try:
-                self.assertFalse(fence._cb_zone.isHidden())
-                fence._cb_zone.setCurrentIndex(fence._cb_zone.findData("Zona2"))
-                self.assertEqual(fence._store.name, "Solo")
-                self.assertEqual(fence._tree.topLevelItem(0).childCount(), 3)
+                self.assertEqual(fence._src_tree.topLevelItemCount(), 2)         # una voce per area
+                self.assertEqual([x["id"].split("\x1f")[0] for x in fence.checked_sources()], ["Zona1"])
+                fence.set_sources(["Zona1/Lavoro", "Zona2/Solo"])                 # aree diverse insieme
+                top = fence._tree.topLevelItem(0)
+                self.assertEqual(top.childCount(), 2)
+                self.assertEqual([top.child(i).childCount() for i in range(2)], [2, 3])
+                self.assertIn("Zona2 \u203a Solo", top.child(1).text(0))
             finally:
                 fence.cleanup()
         finally:
@@ -3234,9 +3241,7 @@ class FenceDockTest(_DockBase):
 
     # -- layout e leggibilita' dell'elenco -----------------------------------------------------------
     def _select_variant(self, name):
-        i = self.fence._cb_variant.findText(name, Qt.MatchStartsWith)
-        self.assertGreaterEqual(i, 0)
-        self.fence._cb_variant.setCurrentIndex(i)
+        self.fence.set_sources([name])
 
     def test_many_profiles_do_not_push_ert_and_slices_out_of_view(self):
         _write_variant(self.root, "Molti", [f"P{i:02d}" for i in range(20)])
@@ -3244,25 +3249,27 @@ class FenceDockTest(_DockBase):
         self.fence.refresh_variants()
         self._select_variant("Molti")
         gpr, ert, slc = (self.fence._tree.topLevelItem(i) for i in range(3))
-        self.assertFalse(gpr.isExpanded())                   # 20 profili: il gruppo parte chiuso
-        self.assertIn("20", gpr.text(0))                      # ma il conteggio si legge
+        group = gpr.child(0)
+        self.assertFalse(group.isExpanded())                  # 20 profili: il gruppo parte chiuso
+        self.assertIn("20", group.text(0))                    # ma il conteggio si legge
         self.assertTrue(ert.isExpanded())
         self.assertTrue(slc.isExpanded())
 
     def test_few_profiles_stay_expanded(self):
         self.assertTrue(self.fence._tree.topLevelItem(0).isExpanded())
+        self.assertTrue(self.fence._tree.topLevelItem(0).child(0).isExpanded())
 
     def test_group_with_a_checked_profile_stays_open_and_user_choice_is_remembered(self):
         _write_variant(self.root, "Molti", [f"P{i:02d}" for i in range(20)])
         self.fence.refresh_variants()
         self._select_variant("Molti")
-        gpr = self.fence._tree.topLevelItem(0)
-        gpr.setExpanded(True)                                 # l'utente lo apre
+        group = lambda: self.fence._tree.topLevelItem(0).child(0)
+        group().setExpanded(True)                             # l'utente lo apre
         self.fence.refresh_lists()
-        self.assertTrue(self.fence._tree.topLevelItem(0).isExpanded())
-        self.fence._tree.topLevelItem(0).setExpanded(False)   # e lo richiude
+        self.assertTrue(group().isExpanded())
+        group().setExpanded(False)                            # e lo richiude
         self.fence.refresh_lists()
-        self.assertFalse(self.fence._tree.topLevelItem(0).isExpanded())
+        self.assertFalse(group().isExpanded())
 
     def test_side_panel_can_be_hidden_to_give_room_to_the_view(self):
         self.assertFalse(self.fence._side.isHidden())
@@ -3379,7 +3386,7 @@ class FenceDockTest(_DockBase):
 
     def test_ticking_the_tree_turns_that_slider_off_only(self):
         f = self._scrubbing()
-        gpr = f._tree.topLevelItem(0)
+        gpr = f._tree.topLevelItem(0).child(0)
         gpr.child(1).setCheckState(0, Qt.Checked)                  # a mano: voglio proprio questo
         self.assertFalse(f._scrub["gpr"].is_active())
         self.assertTrue(f._scrub["ert"].is_active())
@@ -3495,6 +3502,127 @@ class FenceDockTest(_DockBase):
         self.fence._rebuild()
         self.assertIn("slice::e2.tif", self.fence._shown)
 
+    # -- piu' zone, piu' processi, cursore per gruppo -----------------------------------------------------
+    def _two_sources(self):
+        """Lavoro (2 profili: Swath2, Swath10) e Molti (20 profili) spuntate insieme, cursori attivi."""
+        _write_variant(self.root, "Molti", [f"M{i:02d}" for i in range(20)])
+        self.fence.cleanup()
+        self.fence = self._make_fence(scrub=True)
+        self.fence.set_sources(["Lavoro", "Molti"])
+        self.fence._scrub["gpr"].set_active(True)
+        self.fence._update_scrub()
+        return self.fence
+
+    def test_several_sources_are_shown_together_as_groups(self):
+        f = self._two_sources()
+        top = f._tree.topLevelItem(0)
+        self.assertEqual(top.childCount(), 2)
+        self.assertEqual(sorted(top.child(i).childCount() for i in range(2)), [2, 20])
+        self.assertEqual(sorted(x["name"] for x in f.checked_sources()), ["Lavoro", "Molti"])
+
+    def test_same_profile_name_in_two_processes_does_not_overwrite(self):
+        self.fence.set_sources(["Lavoro", "v3"])
+        self.fence.set_checked("gpr", ["Swath2"])               # il nome si trova in entrambe
+        self.fence._timer.stop()
+        self.fence._rebuild()
+        curtains = sorted(k for k in self.fence._shown if k.startswith("gpr::"))
+        self.assertEqual(len(curtains), 2)
+        self.assertTrue(all("Swath2" in k and "(" in k for k in curtains))     # distinti dalla sorgente
+
+    def test_scope_selector_appears_only_with_several_groups(self):
+        self.assertTrue(self.fence._scrub["gpr"].cb_scope.isHidden())
+        f = self._two_sources()
+        self.assertFalse(f._scrub["gpr"].cb_scope.isHidden())
+        self.assertEqual(f._scrub["gpr"].cb_scope.count(), 2)
+        self.assertTrue(f._scrub["ert"].cb_scope.isHidden())                   # l'ERT e' un solo gruppo
+
+    def test_gpr_slider_stays_inside_the_chosen_group(self):
+        f = self._two_sources()
+        sc = f._scrub["gpr"]
+        sizes = {}
+        for i in range(sc.cb_scope.count()):
+            sc.cb_scope.setCurrentIndex(i)
+            sizes[sc.cb_scope.currentText().split("  (")[0]] = sc.count()
+        self.assertEqual(sizes, {"Lavoro": 2, "Molti": 20})                   # niente piu' 22 elementi in fila
+        sc.cb_scope.setCurrentIndex(sc.cb_scope.findText("Lavoro", Qt.MatchStartsWith))
+        sc.slider.setValue(sc.slider.maximum())                                # in fondo al gruppo...
+        f._timer.stop()
+        f._rebuild()
+        shown = [k for k in f._shown if k.startswith("gpr::")]
+        self.assertEqual(len(shown), 1)
+        self.assertIn("Swath10", shown[0])                                     # ...resta nello stesso gruppo
+        sc.btn_next.click()
+        self.assertEqual(sc.index(), sc.count() - 1)
+
+    def test_changing_group_restarts_from_its_first_profile_and_names_it(self):
+        f = self._two_sources()
+        sc = f._scrub["gpr"]
+        sc.cb_scope.setCurrentIndex(sc.cb_scope.findText("Molti", Qt.MatchStartsWith))
+        sc.slider.setValue(5)
+        sc.cb_scope.setCurrentIndex(sc.cb_scope.findText("Lavoro", Qt.MatchStartsWith))
+        self.assertEqual(sc.index(), 0)
+        self.assertIn("Lavoro", sc.lbl.text())
+        self.assertIn("(1/2)", sc.lbl.text())
+        f._timer.stop()
+        f._rebuild()
+        self.assertEqual([k for k in f._shown if k.startswith("gpr::")], ["gpr::Swath2"])
+
+    def test_chosen_group_is_kept_when_lists_are_refreshed(self):
+        f = self._two_sources()
+        sc = f._scrub["gpr"]
+        sc.cb_scope.setCurrentIndex(sc.cb_scope.findText("Molti", Qt.MatchStartsWith))
+        f.refresh_variants()
+        self.assertTrue(sc.cb_scope.currentText().startswith("Molti"))
+
+    def test_slice_slider_scrolls_inside_one_group_at_a_time(self):
+        self._slice_group()                                                    # gpr_slices: 2 slice
+        self._slice_group(group="altro", variant="v3",
+                          slices=(("p.tif", 0.0, 0.1), ("q.tif", 0.1, 0.2), ("r.tif", 0.2, 0.3)))
+        self.fence.cleanup()
+        self.fence = self._make_fence(scrub=True)
+        sc = self.fence._scrub["slice"]
+        self.assertFalse(sc.cb_scope.isHidden())
+        counts = {}
+        for i in range(sc.cb_scope.count()):
+            sc.cb_scope.setCurrentIndex(i)
+            counts[sc.cb_scope.currentText().split("  (")[0]] = sc.count()
+        self.assertEqual(counts, {"altro": 3, "gpr_slices": 2})
+        sc.cb_scope.setCurrentIndex(sc.cb_scope.findText("altro", Qt.MatchStartsWith))
+        self.fence._timer.stop()
+        self.fence._rebuild()
+        self.assertEqual([k for k in self.fence._shown if k.startswith("slice::")], ["slice::p.tif"])
+
+    def test_removing_a_source_drops_its_group_and_its_store(self):
+        f = self._two_sources()
+        self.assertEqual(len(f._stores), 2)
+        f.set_sources(["Lavoro"])
+        self.assertEqual(f._tree.topLevelItem(0).childCount(), 1)
+        self.assertEqual(len(f._stores), 1)
+
+    def test_checked_profiles_survive_adding_another_source(self):
+        self.fence.set_checked("gpr", ["Swath10"])
+        for it in self.fence._src_leaves():                       # l'utente spunta a mano un'altra variante
+            if it.data(0, _FD._ROLE)["name"] == "v3":
+                it.setCheckState(0, Qt.Checked)
+        self.assertEqual(sorted(x["name"] for x in self.fence.checked_sources()), ["Lavoro", "v3"])
+        self.assertEqual(self.fence._tree.topLevelItem(0).childCount(), 2)
+        self.assertEqual([t for t, _ in self.fence.checked("gpr")], ["Swath10"])      # solo quello del gruppo Lavoro
+
+    def test_unchecking_every_source_is_respected_after_a_refresh(self):
+        self.fence.set_sources([])
+        self.fence.refresh_variants()
+        self.assertEqual(self.fence.checked_sources(), [])
+        self.assertEqual(self.fence._tree.topLevelItem(0).childCount(), 0)
+        self.assertFalse(self.fence._scrub["gpr"].slider.isEnabled())
+
+    def test_slice_groups_name_the_zone_they_belong_to(self):
+        zones = [{"name": "Zona1", "base": self.root, "active": True}]
+        self.fence.cleanup()
+        self.fence = self._make_fence(zones_provider=lambda: zones)
+        self._slice_group()
+        title = self._slice_group_item().child(0).text(0)
+        self.assertTrue(title.startswith("Zona1 \u203a "), title)
+
     def test_screenshot_is_not_blank(self):
         self._build(gpr=["Swath2", "Swath10"], ert=["T"])
         img = self.fence._plotter.screenshot(return_img=True)
@@ -3532,8 +3660,8 @@ class FencePluginWiringTest(unittest.TestCase):
                 self.assertIsNotNone(dock)
                 self.assertEqual(len(iface.docks), 1)
                 self.assertEqual(iface.docks[0][0], Qt.RightDockWidgetArea)
-                self.assertEqual(dock._store.name, "Lavoro")
-                self.assertEqual(dock._tree.topLevelItem(0).childCount(), 2)
+                self.assertEqual([x["name"] for x in dock.checked_sources()], ["Lavoro"])
+                self.assertEqual(dock._tree.topLevelItem(0).child(0).childCount(), 2)
                 self.assertTrue(dock.isFloating())                   # si apre mobile, di dimensione utile
                 self.assertGreaterEqual(dock.width(), 1000)
                 self.assertIs(GS.GeoSurveyStudioPlugin.open_fence_dock(fake), dock)     # riusato

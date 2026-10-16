@@ -1,18 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Finestra agganciabile "Vista 3D profili": radargrammi GPR e sezioni ERT come tende verticali.
+"""Finestra agganciabile "Vista 3D profili": radargrammi GPR, sezioni ERT e time-slice nello spazio.
 
 Ogni profilo si disegna lungo la sua linea reale sulla mappa (coordinate per traccia del GPR,
 georiferimento per l'ERT), quindi due profili che si incrociano si incrociano anche qui, nel punto
-giusto. Profondita' sempre in verticale dal piano z = 0 (modalita' piana, come nel pannello 2D).
+giusto. Profondita' sempre in verticale dal piano z = 0 (modalita' piana, come nel pannello 2D). Le
+time-slice sono piani orizzontali alla profondita' centrale della loro finestra.
 
-I profili si spuntano in un elenco: quelli del GPR sono i profili della variante aperta nel pannello
-"Radargrammi processati", quelli ERT sono le sezioni importate nel progetto.
+Cosa si vede si decide in due passi:
+
+- **Sorgenti GPR**: un elenco di zone -> varianti processate, spuntabili a piacere. Ogni variante
+  spuntata porta nell'elenco dei profili un gruppo con i suoi profili; zone e processi diversi si
+  possono quindi vedere insieme.
+- **Elenco dei profili**: GPR (un gruppo per sorgente), sezioni ERT e time-slice (un gruppo per
+  cartella). Si spunta cio' che si vuole vedere, oppure si usano i cursori sotto la vista: ognuno
+  scorre un elemento alla volta *dentro il gruppo scelto* con il suo selettore, senza attraversare
+  le altre zone.
 """
 
 from __future__ import annotations
 
 import os
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 
 import numpy as np
 from qgis.PyQt.QtCore import QTimer, Qt, pyqtSignal
@@ -68,9 +76,11 @@ _ERT_CMAPS = ("viridis", "turbo", "Spectral_r", "jet", "plasma")
 _SLICE_CMAPS = ("viridis", "gray", "turbo", "RdBu_r", "Spectral_r")
 _CACHE_MAX = 24
 _ERT_CLIM_PERCENTILES = (2.0, 98.0)
-_ROLE = Qt.UserRole
-_SIDE_MIN_TOTAL_WIDTH = 640     # sotto questa larghezza il pannello dei comandi si nasconde da solo
-_GPR_EXPAND_MAX = 15            # oltre questi profili il gruppo GPR parte chiuso (non copre ERT e time-slice)
+_ROLE = Qt.UserRole                 # dati di una voce spuntabile: (tipo, payload)
+_GROUP = Qt.UserRole + 1            # identificativo stabile di un gruppo (sorgente GPR o cartella di time-slice)
+_SIDE_MIN_TOTAL_WIDTH = 640         # sotto questa larghezza il pannello dei comandi si nasconde da solo
+_GPR_EXPAND_MAX = 15                # oltre questi profili il gruppo parte chiuso (non copre ERT e time-slice)
+_SEP = "\x1f"
 
 
 def _load_pyvista():
@@ -84,10 +94,11 @@ def _load_pyvista():
 
 
 class _Scrubber(QWidget):
-    """Una riga: [x] titolo  ◀ cursore ▶  nome dell'elemento corrente (n/N).
+    """Due righe: [x] titolo + selettore del gruppo  /  ◀ cursore ▶ nome dell'elemento (n/N).
 
     Spuntata, la categoria mostra soltanto l'elemento sotto il cursore; non spuntata, quelli spuntati
-    nell'elenco. Il cursore percorre gli elementi dell'elenco nell'ordine in cui compaiono.
+    nell'elenco. Il cursore percorre gli elementi del *gruppo scelto* nel selettore, nell'ordine in cui
+    compaiono; con un gruppo solo il selettore non si vede.
     """
 
     changed = pyqtSignal()
@@ -100,11 +111,16 @@ class _Scrubber(QWidget):
         lay.setVerticalSpacing(0)
         self.chk = QCheckBox(title)
         self.chk.setToolTip(tip)
+        self.cb_scope = QComboBox()
+        self.cb_scope.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cb_scope.setMinimumContentsLength(8)
+        self.cb_scope.setToolTip("Gruppo su cui scorre il cursore (zona e processo, oppure cartella di time-slice).")
+        self.cb_scope.setVisible(False)
         self.btn_prev = QToolButton()
-        self.btn_prev.setText("\u25c0")
+        self.btn_prev.setText("◀")
         self.btn_prev.setAutoRaise(True)
         self.btn_next = QToolButton()
-        self.btn_next.setText("\u25b6")
+        self.btn_next.setText("▶")
         self.btn_next.setAutoRaise(True)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(0, 0)
@@ -112,19 +128,49 @@ class _Scrubber(QWidget):
         self.slider.setMinimumWidth(60)
         self.lbl = QLabel("")
         self.lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)   # il testo lungo si taglia, non allarga la finestra
-        # due righe: [x] titolo  nome (n/N)  /  ◀ cursore ▶ : stretta, la finestra puo' restare sottile
         lay.addWidget(self.chk, 0, 0, 1, 2)
-        lay.addWidget(self.lbl, 0, 2)
+        lay.addWidget(self.cb_scope, 0, 2, 1, 3)
         lay.addWidget(self.btn_prev, 1, 0)
         lay.addWidget(self.slider, 1, 1, 1, 2)
         lay.addWidget(self.btn_next, 1, 3)
+        lay.addWidget(self.lbl, 1, 4)
         lay.setColumnStretch(2, 1)
+        lay.setColumnStretch(4, 2)
         self.chk.toggled.connect(lambda _on: self.changed.emit())
         self.slider.valueChanged.connect(lambda _v: self.changed.emit())
+        self.cb_scope.currentIndexChanged.connect(self._on_scope)
         self.btn_prev.clicked.connect(lambda: self.slider.setValue(self.slider.value() - 1))
         self.btn_next.clicked.connect(lambda: self.slider.setValue(self.slider.value() + 1))
+        self._scope_updating = False
         self.set_count(0)
 
+    # --- gruppi ----------------------------------------------------------------------------------------
+    def set_scopes(self, options) -> None:
+        """``options`` = [(etichetta, chiave)]; resta scelto il gruppo di prima se esiste ancora."""
+        keep = self.scope_key()
+        self._scope_updating = True
+        try:
+            self.cb_scope.clear()
+            for label, key in options:
+                self.cb_scope.addItem(label, key)
+            i = self.cb_scope.findData(keep) if keep is not None else -1
+            self.cb_scope.setCurrentIndex(i if i >= 0 else (0 if options else -1))
+        finally:
+            self._scope_updating = False
+        self.cb_scope.setVisible(len(options) > 1)
+
+    def scope_key(self):
+        return self.cb_scope.currentData() if self.cb_scope.count() else None
+
+    def _on_scope(self, _i: int) -> None:
+        if self._scope_updating:
+            return
+        self.slider.blockSignals(True)
+        self.slider.setValue(0)                       # altro gruppo: si riparte dal primo elemento
+        self.slider.blockSignals(False)
+        self.changed.emit()
+
+    # --- cursore -----------------------------------------------------------------------------------------
     def set_count(self, n: int) -> None:
         self.slider.blockSignals(True)
         self.slider.setRange(0, max(0, n - 1))
@@ -155,7 +201,7 @@ class _Scrubber(QWidget):
 
 
 class FenceDock(QDockWidget):
-    """Vista 3D dei profili GPR e ERT del progetto."""
+    """Vista 3D dei profili GPR, delle sezioni ERT e delle time-slice del progetto."""
 
     def __init__(self, iface, workspace_provider=None, zones_provider=None, project_root_provider=None,
                  geometry_provider=None, parent=None, plotter_factory=None):
@@ -173,17 +219,18 @@ class FenceDock(QDockWidget):
         self._root_getter = project_root_provider
         self._geometry_provider = geometry_provider
         self._zones: list = []
-        self._store = None
+        self._stores: dict = {}           # id sorgente -> VariantStore (caricati solo per le sorgenti spuntate)
+        self._sources_seeded = False      # la prima volta si spunta la variante di lavoro; poi decide l'utente
         self._gpr_cache: OrderedDict = OrderedDict()
         self._ert_cache: dict = {}
         self._slice_cache: dict = {}
-        self._slice_info: dict = {}      # percorso raster -> riga del manifest
+        self._slice_info: dict = {}       # percorso raster -> riga del manifest
         self._origin = None
         self._side = None
         self._scrub: dict = {}
         self._side_user = False           # l'utente ha scelto a mano: niente piu' nascondi/mostra automatico
         self._hint_on = False
-        self._shown: dict = {}            # nome attore -> tipo ("gpr" | "ert" | "x")
+        self._shown: dict = {}            # nome attore -> tipo ("gpr" | "ert" | "slice" | "x")
         self._first_camera = True
         self._plotter = None
         self._pv = None
@@ -216,21 +263,14 @@ class FenceDock(QDockWidget):
         self._side = side
         sl = QVBoxLayout(side)
         sl.setContentsMargins(0, 0, 0, 0)
-        zrow = QHBoxLayout()
-        self._lbl_zone = QLabel("Area")
-        self._cb_zone = QComboBox()
-        self._cb_zone.setToolTip("Area indagata del progetto: ognuna ha le sue varianti e i suoi profili.")
-        self._cb_zone.currentIndexChanged.connect(self._on_zone_changed)
-        zrow.addWidget(self._lbl_zone)
-        zrow.addWidget(self._cb_zone, 1)
-        sl.addLayout(zrow)
-        vrow = QHBoxLayout()
-        self._cb_variant = QComboBox()
-        self._cb_variant.setToolTip("Variante processata di cui mostrare i profili GPR.")
-        self._cb_variant.currentIndexChanged.connect(self._on_variant_changed)
-        vrow.addWidget(QLabel("Variante"))
-        vrow.addWidget(self._cb_variant, 1)
-        sl.addLayout(vrow)
+        sl.addWidget(QLabel("Zone e processi GPR da mostrare"))
+        self._src_tree = QTreeWidget()
+        self._src_tree.setHeaderHidden(True)
+        self._src_tree.setMaximumHeight(130)
+        self._src_tree.setToolTip("Spunta le varianti processate (zona › processo) di cui vuoi i profili: "
+                                  "se ne possono vedere più insieme.")
+        self._src_tree.itemChanged.connect(self._on_source_changed)
+        sl.addWidget(self._src_tree)
         self._ed_filter = QLineEdit()
         self._ed_filter.setPlaceholderText("Filtra i profili…")
         self._ed_filter.textChanged.connect(self._apply_filter)
@@ -240,10 +280,10 @@ class FenceDock(QDockWidget):
         self._tree.itemChanged.connect(self._on_item_changed)
         sl.addWidget(self._tree, 1)
         row = QHBoxLayout()
-        for text, tip, slot in (("Tutti i GPR", "Spunta tutti i profili GPR visibili nel filtro.", lambda: self._check_group(0, True)),
-                                ("Nessun GPR", "Toglie la spunta a tutti i profili GPR.", lambda: self._check_group(0, False)),
+        for text, tip, slot in (("Tutti i GPR", "Spunta tutti i profili GPR visibili nel filtro.", lambda: self._check_kind("gpr", True)),
+                                ("Nessun GPR", "Toglie la spunta a tutti i profili GPR.", lambda: self._check_kind("gpr", False)),
                                 ("+ ERT", "Importa una sezione ERT invertita (CSV di ResIPY) e georiferiscila.", self._import_ert),
-                                ("↻", "Rilegge aree, varianti, profili GPR e sezioni ERT.", self.refresh_variants)):
+                                ("↻", "Rilegge zone, varianti, profili GPR, sezioni ERT e time-slice.", self.refresh_variants)):
             b = QPushButton(text)
             b.setToolTip(tip)
             b.clicked.connect(slot)
@@ -336,7 +376,7 @@ class FenceDock(QDockWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         bar = QHBoxLayout()
         self._btn_side = QToolButton()
-        self._btn_side.setText("\u2630 Comandi")
+        self._btn_side.setText("☰ Comandi")
         self._btn_side.setCheckable(True)
         self._btn_side.setChecked(True)
         self._btn_side.setToolTip("Mostra o nasconde l'elenco dei profili e i comandi, per lasciare tutto lo spazio alla vista 3D.")
@@ -352,7 +392,7 @@ class FenceDock(QDockWidget):
         widget.setMinimumSize(120, 120)
         vl.addWidget(widget, 1)
         for kind, title, tip in (
-                ("gpr", "Profili GPR", "Spuntata: mostra solo il profilo GPR sotto il cursore, passando in rassegna la lista."),
+                ("gpr", "Profili GPR", "Spuntata: mostra solo il profilo GPR sotto il cursore, nel gruppo scelto."),
                 ("ert", "Sezioni ERT", "Spuntata: mostra solo la sezione ERT sotto il cursore."),
                 ("slice", "Time-slice", "Spuntata: mostra solo la time-slice sotto il cursore, dalla più superficiale alla più profonda.")):
             sc = _Scrubber(title, tip)
@@ -388,7 +428,7 @@ class FenceDock(QDockWidget):
         if want == self._side.isHidden():
             self._set_side_visible(want, user=False)
 
-    # --- elenchi -----------------------------------------------------------------------------------
+    # --- provider --------------------------------------------------------------------------------
     def _project_root(self) -> str:
         try:
             return str(self._root_getter() or "") if self._root_getter else ""
@@ -416,58 +456,87 @@ class FenceDock(QDockWidget):
         with_data = [z for z in zones if discover_variants(z["base"])]
         return with_data or zones
 
-    def _current_zone(self):
-        name = self._cb_zone.currentData()
-        return next((z for z in self._zones if z["name"] == name), self._zones[0] if self._zones else None)
+    def _zone_named(self, name: str):
+        return next((z for z in self._zones if z["name"] == name), None)
+
+    def _zone_label_of_path(self, path: str) -> str:
+        """Nome dell'area che contiene ``path`` (la piu' specifica), o stringa vuota."""
+        p = os.path.normcase(os.path.normpath(str(path or "")))
+        best = ""
+        best_len = -1
+        for z in self._zones:
+            base = os.path.normcase(os.path.normpath(z["base"])) if z["base"] else ""
+            if z["name"] and base and (p == base or p.startswith(base + os.sep)) and len(base) > best_len:
+                best, best_len = z["name"], len(base)
+        return best
+
+    # --- sorgenti GPR: zone -> varianti ------------------------------------------------------------------
+    @staticmethod
+    def _source_id(zone: str, path: str) -> str:
+        return f"{zone}{_SEP}{os.path.normcase(os.path.normpath(path))}"
 
     def refresh_variants(self, *_a) -> None:
-        """Rilegge aree e varianti mantenendo la scelta fatta; apre la variante selezionata."""
+        """Rilegge zone e varianti mantenendo le spunte; ricostruisce poi gli elenchi dei profili."""
         if self._plotter is None:
             return
-        prev_zone = self._cb_zone.currentData()
-        prev_variant = str(self._cb_variant.currentData() or "")
         self._zones = self._zone_list()
+        prev = {it.data(0, _GROUP) for it in self._src_leaves() if it.checkState(0) == Qt.Checked}
         self._updating = True
         try:
-            self._cb_zone.clear()
+            self._src_tree.clear()
+            single = len(self._zones) == 1 and not self._zones[0]["name"]
             for z in self._zones:
-                self._cb_zone.addItem(z["name"] or "-", z["name"])
-            idx = next((i for i, z in enumerate(self._zones) if z["name"] == prev_zone), -1)
-            if idx < 0:
-                idx = next((i for i, z in enumerate(self._zones) if z["active"]), 0)
-            self._cb_zone.setCurrentIndex(idx)
-            self._lbl_zone.setVisible(len(self._zones) > 1)
-            self._cb_zone.setVisible(len(self._zones) > 1)
-            self._fill_variants(prev_variant)
+                refs = discover_variants(z["base"])
+                if not refs:
+                    continue
+                parent = self._src_tree.invisibleRootItem()
+                if not single:
+                    parent = QTreeWidgetItem(self._src_tree, [z["name"] or "-"])
+                    parent.setFlags(Qt.ItemIsEnabled)
+                    parent.setExpanded(True)
+                default = next((r for r in refs if r.name == "Lavoro"), refs[0])
+                for r in refs:
+                    it = QTreeWidgetItem(parent, [f"{r.name}  ({r.n_files})"])
+                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                    sid = self._source_id(z["name"], r.path)
+                    it.setData(0, _GROUP, sid)
+                    it.setData(0, _ROLE, {"zone": z["name"], "path": r.path, "name": r.name, "id": sid})
+                    # la prima volta si spunta la variante di lavoro dell'area attiva
+                    seed = (not self._sources_seeded) and z["active"] and r is default
+                    it.setCheckState(0, Qt.Checked if (sid in prev or seed) else Qt.Unchecked)
+            self._sources_seeded = True
         finally:
             self._updating = False
-        self._open_selected_variant()
+        self.refresh_lists()
 
-    def _fill_variants(self, keep: str = "") -> None:
-        zone = self._current_zone()
-        refs = discover_variants(zone["base"]) if zone else []
-        self._cb_variant.clear()
-        for r in refs:
-            self._cb_variant.addItem(f"{r.name}  ({r.n_files})", r.path)
-        want = self._cb_variant.findData(keep) if keep else -1
-        if want < 0 and self._cb_variant.count():
-            names = [os.path.basename(str(self._cb_variant.itemData(i))) for i in range(self._cb_variant.count())]
-            want = names.index("Lavoro") if "Lavoro" in names else 0
-        self._cb_variant.setCurrentIndex(want)
+    def _src_leaves(self):
+        stack = [self._src_tree.topLevelItem(t) for t in range(self._src_tree.topLevelItemCount())][::-1]
+        while stack:
+            it = stack.pop()
+            if it.data(0, _ROLE):
+                yield it
+            stack.extend(it.child(c) for c in range(it.childCount() - 1, -1, -1))
 
-    def _on_zone_changed(self, _i: int) -> None:
-        if self._updating:
-            return
+    def checked_sources(self) -> list:
+        """Sorgenti GPR spuntate: ``[{"zone", "path", "name", "id"}, ...]`` nell'ordine dell'elenco."""
+        return [dict(it.data(0, _ROLE)) for it in self._src_leaves() if it.checkState(0) == Qt.Checked]
+
+    def set_sources(self, names) -> None:
+        """Spunta solo le varianti con questi nomi (o ``zona/variante``); per uso programmatico e test."""
+        wanted = set(names)
         self._updating = True
         try:
-            self._fill_variants()
+            for it in self._src_leaves():
+                d = it.data(0, _ROLE)
+                ok = d["name"] in wanted or f"{d['zone']}/{d['name']}" in wanted
+                it.setCheckState(0, Qt.Checked if ok else Qt.Unchecked)
         finally:
             self._updating = False
-        self._open_selected_variant()
+        self.refresh_lists()
 
-    def _on_variant_changed(self, _i: int) -> None:
+    def _on_source_changed(self, _item, _col) -> None:
         if not self._updating:
-            self._open_selected_variant()
+            self.refresh_lists()
 
     def _make_geometry_provider(self, zone_name: str):
         """Il Profile Viewer ha in memoria solo i profili dell'area attiva: per le altre la geometria
@@ -476,31 +545,28 @@ class FenceDock(QDockWidget):
             return None
 
         def provider(stem):
-            z = next((z for z in self._zones if z["name"] == zone_name), None)
+            z = self._zone_named(zone_name)
             if z is not None and not z["active"]:
                 return None
             return self._geometry_provider(stem)
         return provider
 
-    def _open_selected_variant(self) -> None:
-        path = str(self._cb_variant.currentData() or "")
-        cur = self._store
-        if path and cur is not None and os.path.normcase(cur.path) == os.path.normcase(os.path.normpath(path))                 and not cur.is_stale():
-            self.refresh_lists()                      # stessa variante: aggiorna solo gli elenchi (ERT nuove)
-            return
-        zone = self._current_zone()
-        store = VariantStore(path, geometry_provider=self._make_geometry_provider(
-            zone["name"] if zone else "")) if path else None
-        self._set_store(store)
+    def _store_for(self, src: dict):
+        """Archivio della sorgente: si crea al primo bisogno e si rifa se i file sono cambiati su disco."""
+        store = self._stores.get(src["id"])
+        if store is not None and store.is_stale():
+            store = None
+        if store is None:
+            store = VariantStore(src["path"], geometry_provider=self._make_geometry_provider(src["zone"]))
+            self._stores[src["id"]] = store
+        return store
 
-    def _set_store(self, store) -> None:
-        if store is not self._store:                  # altra variante: cache e origine non valgono piu'
-            self._gpr_cache.clear()
-            self._origin = None
-            self._first_camera = True
-        self._store = store
-        self.refresh_lists()
+    @staticmethod
+    def _source_title(src: dict, n: int) -> str:
+        head = f"{src['zone']} › {src['name']}" if src["zone"] else src["name"]
+        return f"{head}  ({n})"
 
+    # --- importazione ERT --------------------------------------------------------------------------------
     def _import_ert(self, *_a) -> None:
         root = self._project_root()
         if not root:
@@ -521,47 +587,65 @@ class FenceDock(QDockWidget):
         super().showEvent(event)
         self.refresh_variants()                       # varianti e sezioni ERT possono essere cambiate nel frattempo
 
+    # --- elenco dei profili -------------------------------------------------------------------------------
     def refresh_lists(self) -> None:
-        """Ricostruisce l'elenco dei profili GPR (variante aperta) e delle sezioni ERT, mantenendo le spunte."""
+        """Ricostruisce l'elenco di profili GPR (uno per sorgente spuntata), sezioni ERT e time-slice."""
         if self._plotter is None:
             return
-        store = self._store
         self._ert_cache.clear()
         checked = {self._path_key(it) for it in self._iter_items() if it.checkState(0) == Qt.Checked}
         expanded = {self._path_key(it): it.isExpanded() for it in self._iter_all()}
         self._slice_info.clear()
+        sources = self.checked_sources()
+        live = {s["id"] for s in sources}
+        for sid in [k for k in self._stores if k not in live]:      # sorgente tolta: si libera l'archivio
+            del self._stores[sid]
+        notes = []
         self._updating = True
         try:
             self._tree.clear()
-            n_gpr = len(store.profiles) if store is not None else 0
-            gpr_title = f"Profili GPR ({store.name}) \u00b7 {n_gpr}" if store is not None else "Profili GPR"
-            gpr = QTreeWidgetItem(self._tree, [gpr_title])
+            gpr = QTreeWidgetItem(self._tree, ["Profili GPR"])
             ert = QTreeWidgetItem(self._tree, ["Sezioni ERT"])
             slc = QTreeWidgetItem(self._tree, ["Time-slice"])
             for top in (gpr, ert, slc):
                 top.setFlags(Qt.ItemIsEnabled)
                 top.setExpanded(expanded.get((top.text(0),), True))
-            if store is not None:
+            for src in sources:
+                try:
+                    store = self._store_for(src)
+                except Exception as exc:
+                    notes.append(f"{src['name']}: {exc}")
+                    continue
+                n = len(store.profiles)
+                gi = QTreeWidgetItem(gpr, [self._source_title(src, n)])
+                gi.setFlags(Qt.ItemIsEnabled)
+                gi.setData(0, _GROUP, src["id"])
+                key = (gpr.text(0), src["id"])
                 for pi, p in enumerate(store.profiles):
-                    self._add_child(gpr, p.stem, ("gpr", pi), (gpr_title, p.stem) in checked)
+                    self._add_child(gi, p.stem, ("gpr", (src["id"], pi)), key + (p.stem,) in checked)
+                # tanti profili coprirebbero ERT e time-slice sotto la piega dell'elenco: il gruppo parte chiuso,
+                # a meno che l'utente l'abbia gia' aperto o ci sia qualcosa di spuntato
+                gi.setExpanded(expanded.get(key, n <= _GPR_EXPAND_MAX or any(k[:2] == key for k in checked)))
             for name in list_ert(self._project_root()):
                 self._add_child(ert, name, ("ert", name), (ert.text(0), name) in checked)
+            variants = {s["name"] for s in sources}
             for g in project_slice_groups(self._slice_roots(), self._project_raster_paths()):
-                title = f"{g['name']}  ({g['variant']})" if g["variant"] else g["name"]
+                zone = self._zone_label_of_path(g["dir"])
+                head = f"{zone} › {g['name']}" if zone else g["name"]
+                title = f"{head}  ({g['variant']})" if g["variant"] else head
                 gi = QTreeWidgetItem(slc, [title])
                 gi.setFlags(Qt.ItemIsEnabled)
-                gi.setExpanded(expanded.get((slc.text(0), title),
-                                            store is not None and g["variant"] == getattr(store, "name", None)))
+                gi.setData(0, _GROUP, "slice" + _SEP + os.path.normcase(os.path.normpath(g["dir"])))
+                key = (slc.text(0), gi.data(0, _GROUP))
+                gi.setExpanded(expanded.get(key, g["variant"] in variants))
                 for row in g["slices"]:
                     label = f"{row['z_from']:.2f}–{row['z_to']:.2f} m"
                     self._slice_info[row["path"]] = dict(row, epsg=g["epsg"], group=g["name"])
-                    self._add_child(gi, label, ("slice", row["path"]), (slc.text(0), title, label) in checked)
+                    self._add_child(gi, label, ("slice", row["path"]), key + (label,) in checked)
         finally:
             self._updating = False
-        # tanti profili GPR coprirebbero ERT e time-slice sotto la piega dell'elenco: il gruppo parte chiuso
-        # (a meno che l'utente l'abbia gia' aperto o ci sia qualcosa di spuntato)
-        if (gpr_title,) not in expanded:
-            gpr.setExpanded(n_gpr <= _GPR_EXPAND_MAX or any(k[:1] == (gpr_title,) for k in checked))
+        if notes:
+            self._txt_cross.setPlainText("\n".join(f"⚠ {n}" for n in notes))
         self._apply_filter(self._ed_filter.text())
         self._update_scrub()
         self._schedule()
@@ -592,18 +676,21 @@ class FenceDock(QDockWidget):
 
     @staticmethod
     def _path_key(item) -> tuple:
-        """Testi dalla radice alla voce: identifica una voce anche dopo la ricostruzione dell'albero."""
+        """Dalla radice alla voce: identifica una voce anche dopo la ricostruzione dell'albero.
+
+        I gruppi si riconoscono dall'identificativo (stabile) e non dal titolo, che porta conteggi e nomi.
+        """
         parts = []
         while item is not None:
-            parts.append(item.text(0))
+            gid = item.data(0, _GROUP)
+            parts.append(gid if gid else item.text(0))
             item = item.parent()
         return tuple(reversed(parts))
 
     def _slice_roots(self) -> list:
-        """Radici in cui cercare le cartelle delle time-slice: area, progetto e cartella di lavoro."""
-        zone = self._current_zone()
+        """Radici in cui cercare le cartelle delle time-slice: tutte le aree, il progetto e la cartella di lavoro."""
         out = []
-        for r in (zone["base"] if zone else "", self._project_root(), self._workspace_root()):
+        for r in [z["base"] for z in self._zones] + [self._project_root(), self._workspace_root()]:
             if r and r not in out:
                 out.append(str(r))
         return out
@@ -614,16 +701,16 @@ class FenceDock(QDockWidget):
         return [lyr.source().split("|")[0] for lyr in QgsProject.instance().mapLayers().values()
                 if isinstance(lyr, QgsRasterLayer)]
 
-    def _check_group(self, group: int, on: bool) -> None:
+    def _check_kind(self, kind: str, on: bool) -> None:
         self._updating = True
         try:
-            top = self._tree.topLevelItem(group)
-            for c in range(top.childCount()):
-                it = top.child(c)
-                if not it.isHidden():
+            for it in self._iter_items():
+                if it.data(0, _ROLE)[0] == kind and not it.isHidden():
                     it.setCheckState(0, Qt.Checked if on else Qt.Unchecked)
         finally:
             self._updating = False
+        if kind in self._scrub:
+            self._scrub[kind].set_active(False)
         self._schedule()
 
     def _apply_filter(self, text: str) -> None:
@@ -640,8 +727,21 @@ class FenceDock(QDockWidget):
         self._schedule()
 
     # --- cursori -------------------------------------------------------------------------------------------------
+    def _groups(self, kind: str) -> list:
+        """Gruppi di una categoria, nell'ordine dell'elenco: ``[(titolo, chiave), ...]``."""
+        top = {"gpr": 0, "slice": 2}.get(kind)
+        if top is None or self._tree.topLevelItemCount() <= top:
+            return []
+        item = self._tree.topLevelItem(top)
+        return [(item.child(c).text(0), item.child(c).data(0, _GROUP)) for c in range(item.childCount())]
+
     def _leaves(self, kind: str) -> list:
-        return [it for it in self._iter_items() if it.data(0, _ROLE)[0] == kind]
+        """Elementi su cui scorre il cursore: quelli del gruppo scelto nel suo selettore."""
+        leaves = [it for it in self._iter_items() if it.data(0, _ROLE)[0] == kind]
+        key = self._scrub[kind].scope_key() if kind in self._scrub else None
+        if key is None:
+            return leaves
+        return [it for it in leaves if it.parent() is not None and it.parent().data(0, _GROUP) == key]
 
     def _selected(self, kind: str) -> list:
         """Elementi da mostrare per una categoria: quello sotto il cursore, se attivo, o i spuntati."""
@@ -655,22 +755,24 @@ class FenceDock(QDockWidget):
 
     def _update_scrub(self) -> None:
         for kind, sc in self._scrub.items():
+            sc.set_scopes(self._groups(kind))
             leaves = self._leaves(kind)
             sc.set_count(len(leaves))
             if not leaves:
                 continue
-            it = leaves[min(sc.index(), len(leaves) - 1)]
+            i = min(sc.index(), len(leaves) - 1)
+            it = leaves[i]
             name = it.text(0)
-            if kind == "slice" and it.parent() is not None:
-                name = f"{it.parent().text(0).split('  (')[0]} \u00b7 {name}"
-            sc.set_info(f"{name}   ({min(sc.index(), len(leaves) - 1) + 1}/{len(leaves)})")
+            if it.parent() is not None and (kind == "slice" or sc.cb_scope.count() > 1):
+                name = f"{it.parent().text(0)} · {name}"        # con piu' gruppi si dice in quale si e'
+            sc.set_info(f"{name}   ({i + 1}/{len(leaves)})")
 
     def _on_scrub_changed(self) -> None:
         self._update_scrub()
         self._schedule()
 
     def checked(self, kind: str) -> list:
-        """Payload (indice profilo GPR o nome ERT) degli elementi spuntati di un tipo."""
+        """Payload (profilo GPR, nome ERT o percorso time-slice) degli elementi spuntati di un tipo."""
         out = []
         for it in self._iter_items():
             data = it.data(0, _ROLE)
@@ -688,7 +790,9 @@ class FenceDock(QDockWidget):
             for it in self._iter_items():
                 data = it.data(0, _ROLE)
                 if data and data[0] == kind:
-                    names_of_item = {it.text(0), os.path.basename(str(data[1]))}
+                    payload = data[1]
+                    base = os.path.basename(str(payload)) if kind == "slice" else ""
+                    names_of_item = {it.text(0), base}
                     it.setCheckState(0, Qt.Checked if names_of_item & wanted else Qt.Unchecked)
         finally:
             self._updating = False
@@ -711,20 +815,26 @@ class FenceDock(QDockWidget):
             self._origin = (float(xy[0][0]), float(xy[0][1]))
 
     # --- dati dei profili ------------------------------------------------------------------------------
-    def _gpr_item(self, pi: int, ci: int):
-        key = (id(self._store), pi, ci)
+    def _gpr_item(self, ref, ci: int):
+        sid, pi = ref
+        store = self._stores.get(sid)
+        if store is None:
+            raise RuntimeError("variante non caricata")
+        key = (id(store), pi, ci)
         hit = self._gpr_cache.get(key)
         if hit is not None:
             self._gpr_cache.move_to_end(key)
             return hit
-        prof = self._store.profiles[pi]
+        prof = store.profiles[pi]
         ci = int(min(ci, prof.n_channels - 1))
-        ch = self._store.channel(pi, ci)
+        ch = store.channel(pi, ci)
         base = normalize_display(ch.data).astype(np.float32, copy=False)
         base = RadargramViewMixin._resample_disp_to_uniform_grid(base, ch.dist)
         xy, d = track_vertices(ch.east, ch.north, ch.dist)
         epsg = int(getattr(prof, "epsg", 0) or 0)
-        item = {"name": prof.stem, "base": downsample(base), "xy": self._to_common(xy, f"EPSG:{epsg}" if epsg else ""),
+        zone = sid.split(_SEP)[0]
+        item = {"name": prof.stem, "src": f"{zone} › {store.name}" if zone else store.name,
+                "base": downsample(base), "xy": self._to_common(xy, f"EPSG:{epsg}" if epsg else ""),
                 "d": d, "span": (float(ch.dist[0]), float(ch.dist[-1])), "depth": float(ch.depth_max_m)}
         self._gpr_cache[key] = item
         while len(self._gpr_cache) > _CACHE_MAX:
@@ -797,17 +907,18 @@ class FenceDock(QDockWidget):
             pl.remove_actor("hint", render=False)
             self._hint_on = False
         dmax = float(self._spin_depth.value())
-        gpr_sel = self._selected("gpr") if self._store is not None else []
-        ert_sel = self._selected("ert")
         errors, label_pts, label_txt = [], [], []
 
         gprs, erts = [], []
-        for text, pi in gpr_sel:
+        for text, ref in self._selected("gpr"):
             try:
-                gprs.append(self._gpr_item(int(pi), int(self._spin_ch.value())))
+                gprs.append(self._gpr_item(ref, int(self._spin_ch.value())))
             except Exception as exc:
                 errors.append(f"{text}: {exc}")
-        for text, name in ert_sel:
+        # lo stesso nome in due varianti: si distingue con la sorgente, altrimenti un profilo coprirebbe l'altro
+        dup = Counter(g["name"] for g in gprs)
+        gprs = [dict(g, label=f"{g['name']} ({g['src']})" if dup[g["name"]] > 1 else g["name"]) for g in gprs]
+        for text, name in self._selected("ert"):
             try:
                 erts.append(self._ert_item(str(name)))
             except Exception as exc:
@@ -829,9 +940,9 @@ class FenceDock(QDockWidget):
             rows = base.shape[0] if dmax <= 0 else max(2, int(np.ceil(base.shape[0] * min(1.0, dmax / depth))))
             shown_depth = depth * rows / base.shape[0]
             rgba = rgba_from_array(np.clip(base[:rows] * gain, -1.0, 1.0), self._cb_gpr.currentText(), -1.0, 1.0)
-            self._add_curtain(f"gpr::{it['name']}", it, rgba, 0.0, shown_depth, "gpr")
+            self._add_curtain(f"gpr::{it['label']}", it, rgba, 0.0, shown_depth, "gpr")
             label_pts.append((*self._local(it["xy"][0]), 0.0))
-            label_txt.append(it["name"])
+            label_txt.append(it["label"])
 
         if erts:
             vals = np.concatenate([e["grid"].data[np.isfinite(e["grid"].data)] for e in erts])
@@ -869,7 +980,9 @@ class FenceDock(QDockWidget):
         if errors:
             self._txt_cross.appendPlainText("\n".join(f"⚠ {e}" for e in errors))
         if not self._shown:
-            pl.add_text("Spunta profili GPR, sezioni ERT o time-slice nell'elenco (\u2630 Comandi)", name="hint",
+            self._origin = None                         # scena vuota: la prossima parte da zero (origine e camera)
+            self._first_camera = True
+            pl.add_text("Spunta profili GPR, sezioni ERT o time-slice nell'elenco (☰ Comandi)", name="hint",
                         position="upper_left", font_size=10, color="gray", render=False)
             self._hint_on = True
         self._apply_scale()
@@ -889,13 +1002,13 @@ class FenceDock(QDockWidget):
                 for g in gprs:
                     for da, db, x, y in crossings(g["xy"], g["d"], e["xy"], e["d"]):
                         depth = min(g["depth"], depth_e) if dmax <= 0 else dmax
-                        name = f"x::{g['name']}::{e['name']}::{da:.2f}"
+                        name = f"x::{g['label']}::{e['name']}::{da:.2f}"
                         line = self._pv.Line((x - self._origin[0], y - self._origin[1], 0.0),
                                              (x - self._origin[0], y - self._origin[1], -depth))
                         self._plotter.add_mesh(line, color="red", line_width=4, name=name,
                                                reset_camera=False, render=False)
                         self._shown[name] = "x"
-                        lines.append(f"{e['name']} × {g['name']}:  ERT a {db:.1f} m,  GPR a {da:.1f} m")
+                        lines.append(f"{e['name']} × {g['label']}:  ERT a {db:.1f} m,  GPR a {da:.1f} m")
         self._txt_cross.setPlainText("\n".join(lines))
 
     def _view_top(self) -> None:
@@ -914,6 +1027,7 @@ class FenceDock(QDockWidget):
     def cleanup(self) -> None:
         self._timer.stop()
         plotter, self._plotter = self._plotter, None
+        self._stores.clear()
         if plotter is not None:
             try:
                 plotter.close()
