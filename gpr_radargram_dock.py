@@ -51,8 +51,10 @@ from qgis.PyQt.QtWidgets import (
     QLayout,
     QLineEdit,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
+    QSplitter,
     QToolButton,
     QToolTip,
     QVBoxLayout,
@@ -110,6 +112,11 @@ from .gpr_annotation_analysis import (
 from .gpr_anomalies_dialog import AnomaliesDialog
 from .gpr_material_presets import material_preset
 from .gpr_training_export import export_variant_for_training
+from .gpr_ert_import_dialog import ErtImportDialog
+from .gpr_ert_georef import lonlat_transformer
+from .gpr_ert_import import to_grid as ert_to_grid
+from .gpr_ert_panel import ErtSectionPanel
+from .gpr_ert_store import align_to_channel, delete_ert, list_ert, load_ert, save_ert
 
 try:
     from .gpr_viewer_common import (
@@ -464,6 +471,10 @@ class RadargramDock(QDockWidget):
         self._layer_signal = None
         self._tree_signal = None
 
+        # Sezione ERT sotto il radargramma (pannello nascosto finche' non la si attiva dal menu "⋯").
+        self._ert_panel = None
+        self._ert_cache: dict = {}         # nome -> (ErtEntry, ErtGrid)
+
         # Disegno anomalie/interfacce direttamente sul radargramma.
         self._draw_mode: str | None = None          # None | "point" | "line" | "polygon"
         self._draw_vertices: list = []               # [{"x_m","depth_m","trace","east","north","amp"}, ...]
@@ -609,6 +620,15 @@ class RadargramDock(QDockWidget):
             "Salva il radargramma mostrato (vista attuale) con le annotazioni visibili, le\n"
             "etichette e la legenda delle classi, in PNG, PDF o SVG: per la relazione.")
         self._act_export_figure.triggered.connect(self._export_figure)
+        more_menu.addSeparator()
+        self._act_ert_show = more_menu.addAction("Mostra sezione ERT sotto il radargramma")
+        self._act_ert_show.setCheckable(True)
+        self._act_ert_show.toggled.connect(self._ert_set_visible)
+        self._act_ert_import = more_menu.addAction("Importa sezione ERT…")
+        self._act_ert_import.setToolTip(
+            "Aggiunge al progetto una sezione ERT già invertita (CSV di ResIPY) e la georiferisce\n"
+            "dai due estremi di un profilo KML. La sezione si affianca al radargramma sulla stessa x.")
+        self._act_ert_import.triggered.connect(self._ert_import)
         self._btn_more.setMenu(more_menu)
         flow.addWidget(_group(QLabel("Variante"), self._cb_variant, self._btn_refresh, self._btn_more))
 
@@ -853,7 +873,19 @@ class RadargramDock(QDockWidget):
         self._canvas.mpl_connect("scroll_event", self._on_scroll)
         self._canvas.mpl_connect("axes_leave_event", self._on_axes_leave)
         self._canvas.mpl_connect("key_press_event", self._on_key)
-        root.addWidget(self._canvas, 1)
+        self._ert_panel = ErtSectionPanel()
+        self._ert_panel.setVisible(False)
+        self._ert_panel.import_requested.connect(self._ert_import)
+        self._ert_panel.delete_requested.connect(self._ert_delete)
+        self._ert_panel.section_changed.connect(lambda _n: self._ert_refresh())
+        self._ert_panel.depth_follow_changed.connect(lambda _on: self._ert_sync_view())
+        split = QSplitter(Qt.Vertical)
+        split.setChildrenCollapsible(False)
+        split.addWidget(self._canvas)
+        split.addWidget(self._ert_panel)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        root.addWidget(split, 1)
 
         self._lbl_status = QLabel("")
         self._lbl_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
@@ -1286,6 +1318,7 @@ class RadargramDock(QDockWidget):
             self._map.show_track(ch.east, ch.north, pan_if_hidden=True)
             self._map.show_point(None)
         self._update_status()
+        self._ert_refresh()
 
     # ------------------------------------------------------------------
     # Disegno
@@ -1427,6 +1460,7 @@ class RadargramDock(QDockWidget):
         self._refresh_edit_artists(blit=False)
         self._blit.invalidate()
         self._canvas.draw_idle()
+        self._ert_sync_view()
 
     def _apply_reference(self) -> None:
         """Riporta profondita' di riferimento e fascia della time-slice sugli artisti."""
@@ -1447,6 +1481,121 @@ class RadargramDock(QDockWidget):
     def _reset_zoom(self) -> None:
         if self._cur is not None:
             self._redraw(reset_view=True)
+
+    # ------------------------------------------------------------------
+    # Sezione ERT sotto il radargramma
+    # ------------------------------------------------------------------
+
+    def _ert_active(self) -> bool:
+        return self._ert_panel is not None and self._act_ert_show.isChecked()
+
+    def _ert_set_visible(self, on: bool) -> None:
+        if self._ert_panel is None:
+            return
+        self._ert_panel.setVisible(bool(on))
+        if on:
+            self._ert_reload_names()
+            self._ert_refresh()
+
+    def _ert_reload_names(self, select: str = "") -> None:
+        names = list_ert(self._project_root())
+        keep = select or self._ert_panel.current_name()
+        if keep not in names:
+            keep = names[0] if names else ""
+        self._ert_panel.set_names(names, keep)
+
+    def _ert_get(self, name: str):
+        hit = self._ert_cache.get(name)
+        if hit is None:
+            entry = load_ert(self._project_root(), name)
+            hit = (entry, ert_to_grid(entry.section))
+            self._ert_cache[name] = hit
+        return hit
+
+    def _ert_channel_xy(self, ch, georef):
+        """Coordinate delle tracce nel CRS del georiferimento ERT (uguale a quello del profilo se noto)."""
+        epsg = self._store.profiles[self._pi].epsg if self._store is not None else 0
+        src = f"EPSG:{int(epsg)}" if epsg else ""
+        dst = georef.crs_authid
+        if not src or not dst or src.upper() == dst.upper():
+            return ch.east, ch.north
+        tr = lonlat_transformer(dst, src)
+        pts = np.asarray([tr(e, n) if (np.isfinite(e) and np.isfinite(n)) else (np.nan, np.nan)
+                          for e, n in zip(ch.east, ch.north)], dtype=np.float64)
+        return pts[:, 0], pts[:, 1]
+
+    def _ert_refresh(self) -> None:
+        """Ridisegna la sezione ERT per il canale mostrato (cambio profilo, sezione o importazione)."""
+        if not self._ert_active():
+            return
+        panel = self._ert_panel
+        name = panel.current_name()
+        ch = self._cur
+        if not name:
+            panel.clear()
+            return
+        if ch is None:
+            panel.clear("Nessun radargramma mostrato.")
+            return
+        try:
+            entry, grid = self._ert_get(name)
+            east, north = self._ert_channel_xy(ch, entry.georef)
+            al = align_to_channel(entry.georef, east, north, ch.dist)
+        except Exception as exc:
+            panel.clear(f"Impossibile mostrare la sezione ERT «{name}»: {exc}")
+            return
+        if al is None:
+            panel.clear("Il canale mostrato non ha coordinate: la sezione ERT non si può allineare.")
+            return
+        depth_max = float(max(self._ax.get_ylim())) if panel.follows_depth() else None
+        panel.show_section(name, grid, al, entry.section.z_mode,
+                           x_view=self._ax.get_xlim(), depth_max=depth_max)
+
+    def _ert_sync_view(self) -> None:
+        """Porta zoom e scorrimento del radargramma sulla sezione ERT (stessa x, e stessa profondita' se richiesto)."""
+        if not self._ert_active() or self._ax is None:
+            return
+        self._ert_panel.set_xlim(*self._ax.get_xlim())
+        if self._ert_panel.follows_depth():
+            self._ert_panel.set_ylim(float(max(self._ax.get_ylim())))
+
+    def _ert_cursor(self, x) -> None:
+        if self._ert_active():
+            self._ert_panel.set_cursor_x(x)
+
+    def _ert_import(self) -> None:
+        root = self._project_root()
+        if not root:
+            self._warn("Apri un progetto di GeoSurvey Studio: la sezione ERT si salva nella cartella del progetto.")
+            return
+        canvas = self.iface.mapCanvas() if self.iface is not None else None
+        dlg = ErtImportDialog(QgsProject.instance().crs().authid(), self, start_dir=root, canvas=canvas)
+        if dlg.exec() != dlg.Accepted:
+            return
+        data = dlg.result_data()
+        try:
+            folder = save_ert(root, data["name"], data["csv"], data["georef"])
+        except Exception as exc:
+            self._warn(f"Importazione ERT non riuscita: {exc}")
+            return
+        name = os.path.basename(folder)
+        self._ert_cache.pop(name, None)
+        self._act_ert_show.setChecked(True)
+        self._ert_reload_names(select=name)
+        self._ert_refresh()
+        self._show_message(f"Sezione ERT «{name}» importata nel progetto.")
+
+    def _ert_delete(self, name: str) -> None:
+        if not name:
+            return
+        ans = QMessageBox.question(self, "Sezione ERT", f"Togliere «{name}» dal progetto?\n"
+                                   "L'export originale di ResIPY non viene toccato.")
+        if ans != QMessageBox.Yes:
+            return
+        delete_ert(self._project_root(), name)
+        self._ert_cache.pop(name, None)
+        self._ert_reload_names()
+        self._ert_refresh()
 
     def _on_look_changed(self, *_a) -> None:
         if self._cur is None:
@@ -1711,10 +1860,12 @@ class RadargramDock(QDockWidget):
             self._refresh_vel_popup(cursor_xz=(self._cursor_x, self._cursor_z), blit=False)
         self._update_status()
         self._blit.update()
+        self._ert_cursor(self._cursor_x)
         self._map_timer.start()
 
     def _on_axes_leave(self, _event) -> None:
         self._clear_hover()
+        self._ert_cursor(None)
         if self._vline is not None:
             self._vline.set_visible(False)
             self._hline.set_visible(False)
@@ -1779,6 +1930,7 @@ class RadargramDock(QDockWidget):
         self._ax.set_ylim(*_clamp(y0, y1, 0.0, ch.depth_max_m))
         self._blit.invalidate()
         self._canvas.draw_idle()
+        self._ert_sync_view()
 
     def _on_scroll(self, event) -> None:
         if event.inaxes is not self._ax or self._cur is None or event.xdata is None:

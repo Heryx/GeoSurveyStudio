@@ -2598,5 +2598,383 @@ class PluginWiringTest(unittest.TestCase):
                 dock.deleteLater()
 
 
+# ---------------------------------------------------------------------------------------------
+# Sezione ERT sotto il radargramma e dialogo d'importazione
+# ---------------------------------------------------------------------------------------------
+if HAS_ENV:
+    _G = importlib.import_module("rasterlinker_feature_interpolation.gpr_ert_georef")
+    _S = importlib.import_module("rasterlinker_feature_interpolation.gpr_ert_store")
+    _D = importlib.import_module("rasterlinker_feature_interpolation.gpr_ert_import_dialog")
+
+
+def _ert_csv(path, length=10.0):
+    """Celle 1 m x 0.5 m; log10(res) = 1 + x/10 (dipende solo da x: rivela gli spostamenti)."""
+    lines = ["x,y,z,Resistivity(ohm.m),Resistivity(log10)"]
+    for xi in np.arange(0.5, length, 1.0):
+        for zi in np.arange(-0.25, -3.0, -0.5):
+            lg = 1.0 + xi / 10.0
+            lines.append(f"{xi},0.0,{zi},{10 ** lg},{lg}")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+
+
+@unittest.skipUnless(HAS_ENV, "QGIS/matplotlib non disponibili")
+class ErtViewTest(_DockBase):
+    def setUp(self):
+        super().setUp()
+        self.dock._project_root_provider = lambda: self.root
+        csv = os.path.join(self.root, "export.csv")
+        _ert_csv(csv)
+        # Il profilo 0 (Swath2) sta a nord = 10 m, da est 500000 a 500004.95. La linea ERT corre lungo
+        # lo stesso nord da 499998 a 500008: la traccia GPR a x=0 cade a 2 m lungo la linea ERT.
+        georef = _G.ErtGeoref.from_endpoints((499998.0, 10.0), (500008.0, 10.0), 10.0, "EPSG:32632")
+        _S.save_ert(self.root, "T", csv, georef)
+
+    def _show(self):
+        self.dock._act_ert_show.setChecked(True)
+        self._pump(30)
+        return self.dock._ert_panel
+
+    def test_hidden_until_requested(self):
+        self.assertFalse(self.dock._ert_panel.isVisible())
+        self.assertFalse(self.dock._act_ert_show.isChecked())
+
+    def test_listed_selected_and_drawn(self):
+        p = self._show()
+        self.assertTrue(p.isVisible())
+        self.assertEqual(p.current_name(), "T")
+        self.assertIsNotNone(p._grid)
+
+    def test_section_is_shifted_onto_the_gpr_distance(self):
+        p = self._show()
+        # x GPR = 3 m  ->  3 m + 2 m = 5 m lungo l'ERT  ->  log10 = 1.5
+        v = p.value_at(3.0, 1.0)
+        self.assertIsNotNone(v)
+        self.assertAlmostEqual(v, 1.5, delta=0.06)
+        # x GPR = 0.5 m -> 2.5 m lungo l'ERT
+        self.assertAlmostEqual(p.value_at(0.5, 1.0), 1.25, delta=0.06)
+
+    def test_only_the_gpr_stretch_is_drawn(self):
+        p = self._show()
+        xs = p._grid[0]
+        self.assertLessEqual(float(xs[0]), 0.2)
+        self.assertGreaterEqual(float(xs[-1]), self.dock._cur.length_m - 0.2)
+        self.assertLessEqual(float(xs[-1]), self.dock._cur.length_m + 1e-6)
+
+    def test_zoom_and_pan_follow_the_radargram(self):
+        p = self._show()
+        self.dock._set_view(1.0, 3.0, 0.2, 0.0)           # la profondita' cresce verso il basso
+        self._pump(10)
+        self.assertEqual(tuple(round(v, 6) for v in p._ax.get_xlim()), (1.0, 3.0))
+        self.assertAlmostEqual(p._ax.get_ylim()[0], 0.2)
+        self.assertAlmostEqual(p._ax.get_ylim()[1], 0.0)
+
+    def test_depth_follow_can_be_switched_off(self):
+        p = self._show()
+        p._chk_depth.setChecked(False)
+        self._pump(10)
+        self.dock._set_view(1.0, 3.0, 0.2, 0.0)
+        self.assertGreater(p._ax.get_ylim()[0], 0.2)
+
+    def test_changing_profile_redraws_with_the_new_offset(self):
+        p = self._show()
+        self.dock.select_profile(1)             # nord 0: a 10 m dalla linea ERT
+        self._pump(30)
+        self.assertIn("10.0 m", p._lbl.text())
+        self.dock.select_profile(0)
+        self._pump(30)
+        self.assertIn("0.0 m", p._lbl.text())
+
+    def test_label_declares_the_flat_mode(self):
+        p = self._show()
+        self.assertIn("piana", p._lbl.text())
+
+    def test_hiding_leaves_the_radargram_alone(self):
+        self._show()
+        self.dock._act_ert_show.setChecked(False)
+        self.assertFalse(self.dock._ert_panel.isVisible())
+        self.dock._set_view(1.0, 3.0, 0.0, 0.2)       # non deve sollevare
+        self.assertEqual(tuple(round(v, 6) for v in self.dock._ax.get_xlim()), (1.0, 3.0))
+
+    def test_no_sections_in_the_project(self):
+        import shutil
+        shutil.rmtree(os.path.join(self.root, "ERT"))
+        p = self._show()
+        self.assertEqual(p.current_name(), "")
+        self.assertIsNone(p._grid)
+
+    def test_profile_far_from_the_line_says_so(self):
+        p = self._show()
+        # sposta la linea ERT 500 m a nord: nessuna sovrapposizione utile
+        csv = os.path.join(self.root, "export.csv")
+        far = _G.ErtGeoref.from_endpoints((499998.0, 510.0), (500008.0, 510.0), 10.0, "EPSG:32632")
+        _S.save_ert(self.root, "T", csv, far)
+        self.dock._ert_cache.clear()
+        self.dock._ert_refresh()
+        self._pump(30)
+        self.assertIn("500.0 m", p._lbl.text())
+
+
+_KML = """<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2"><Document>
+<Placemark><name>P9</name><LineString><coordinates>
+2.455219060577314,36.59265013784221,0 2.455281505640994,36.59328796836483,0</coordinates></LineString></Placemark>
+<Placemark><name>P8</name><LineString><coordinates>
+2.455374535147292,36.59284739722405,0 2.454614928681824,36.5930129875788,0</coordinates></LineString></Placemark>
+</Document></kml>"""
+
+
+@unittest.skipUnless(HAS_ENV, "QGIS/matplotlib non disponibili")
+class ImportDialogTest(_DockBase):
+    def setUp(self):
+        super().setUp()
+        self.csv = os.path.join(self.root, "P9_inverted1.csv")
+        _ert_csv(self.csv, length=71.0)
+        self.kml = os.path.join(self.root, "doc.kml")
+        with open(self.kml, "w", encoding="utf-8") as fh:
+            fh.write(_KML)
+
+    def _dialog(self):
+        dlg = _D.ErtImportDialog("EPSG:32631", self.iface.mainWindow(), start_dir=self.root)
+        dlg._ed_csv.setText(self.csv)
+        dlg._on_csv()
+        self._pump(10)
+        return dlg
+
+    def test_finds_doc_kml_next_to_the_file_and_guesses_the_profile(self):
+        dlg = self._dialog()
+        self.assertEqual(dlg._ed_kml.text(), self.kml)
+        self.assertEqual([dlg._cb_profile.itemText(i) for i in range(dlg._cb_profile.count())], ["P9", "P8"])
+        self.assertEqual(dlg._cb_profile.currentText(), "P9")      # il nome del file contiene "P9"
+        self.assertEqual(dlg._ed_name.text(), "P9_inverted1")
+
+    def test_builds_a_two_point_georef_in_the_project_crs(self):
+        dlg = self._dialog()
+        g = dlg.result_data()["georef"]
+        self.assertIsNotNone(g)
+        self.assertEqual(g.crs_authid, "EPSG:32631")
+        self.assertEqual(len(g.points), 2)
+        self.assertAlmostEqual(g.map_length(), 71.4, delta=0.6)
+        self.assertAlmostEqual(dlg._spin_len.value(), 71.0, delta=0.6)
+        self.assertEqual(g.check(), [])
+        self.assertTrue(dlg._buttons.button(dlg._buttons.Ok).isEnabled())
+
+    def test_invert_swaps_the_ends(self):
+        dlg = self._dialog()
+        a = dlg.result_data()["georef"].points
+        dlg._chk_invert.setChecked(True)
+        b = dlg.result_data()["georef"].points
+        self.assertAlmostEqual(a[0].x, b[1].x, places=3)
+        self.assertAlmostEqual(a[0].y, b[1].y, places=3)
+
+    def test_wrong_length_warns_but_does_not_block(self):
+        dlg = self._dialog()
+        dlg._spin_len.setValue(50.0)
+        self.assertIn("⚠", dlg._lbl_info.text())
+        self.assertTrue(dlg._buttons.button(dlg._buttons.Ok).isEnabled())
+
+    def test_needs_a_name(self):
+        dlg = self._dialog()
+        dlg._ed_name.setText("")
+        dlg._update()
+        self.assertFalse(dlg._buttons.button(dlg._buttons.Ok).isEnabled())
+
+    def test_bad_file_disables_ok(self):
+        dlg = _D.ErtImportDialog("EPSG:32631", self.iface.mainWindow())
+        bad = os.path.join(self.root, "bad.csv")
+        with open(bad, "w") as fh:
+            fh.write("a,b\n1,2\n")
+        dlg._ed_csv.setText(bad)
+        dlg._on_csv()
+        self.assertFalse(dlg._buttons.button(dlg._buttons.Ok).isEnabled())
+        self.assertIn("non valido", dlg._lbl_info.text())
+
+
+@unittest.skipUnless(HAS_ENV, "QGIS/matplotlib non disponibili")
+class ImportDialogManualTest(_DockBase):
+    """Georiferimento a mano: due punti (scritti o cliccati) e punti da un layer."""
+
+    def setUp(self):
+        super().setUp()
+        from qgis.core import QgsFeature, QgsGeometry, QgsVectorLayer
+        self._QgsFeature, self._QgsGeometry, self._QgsVectorLayer = QgsFeature, QgsGeometry, QgsVectorLayer
+        self.csv = os.path.join(self.root, "P9_inverted1.csv")
+        _ert_csv(self.csv, length=71.0)
+        self._mem_layers = []
+
+    def tearDown(self):
+        if self._mem_layers:
+            QgsProject.instance().removeMapLayers([lyr.id() for lyr in self._mem_layers])
+        super().tearDown()
+
+    def _dialog(self, crs="EPSG:32631", canvas=None, mode=None):
+        dlg = _D.ErtImportDialog(crs, self.iface.mainWindow(), start_dir=self.root, canvas=canvas)
+        dlg._ed_csv.setText(self.csv)
+        dlg._on_csv()
+        if mode is not None:
+            dlg._cb_mode.setCurrentIndex(mode)
+        self._pump(10)
+        return dlg
+
+    def _points_layer(self, rows, crs="EPSG:32631", name="elettrodi"):
+        lyr = self._QgsVectorLayer(f"Point?crs={crs}&field=dist:double&field=etichetta:string", name, "memory")
+        feats = []
+        for dist, x, y in rows:
+            f = self._QgsFeature(lyr.fields())
+            f.setGeometry(self._QgsGeometry.fromPointXY(QgsPointXY(x, y)))
+            f["dist"], f["etichetta"] = dist, "e"
+            feats.append(f)
+        lyr.dataProvider().addFeatures(feats)
+        QgsProject.instance().addMapLayer(lyr)
+        self._mem_layers.append(lyr)
+        return lyr
+
+    def _ok(self, dlg):
+        return dlg._buttons.button(dlg._buttons.Ok).isEnabled()
+
+    # -- due punti sulla mappa ----------------------------------------------------------------
+    def test_two_typed_points_make_a_line(self):
+        dlg = self._dialog(mode=1)
+        dlg._ed_p[0].setText("100; 200")
+        dlg._ed_p[1].setText("100,0; 271,0")
+        dlg._update()
+        g = dlg.result_data()["georef"]
+        self.assertEqual(len(g.points), 2)
+        self.assertAlmostEqual(g.map_length(), 71.0)
+        self.assertEqual(g.check(), [])
+        self.assertTrue(self._ok(dlg))
+
+    def test_missing_point_asks_for_it(self):
+        dlg = self._dialog(mode=1)
+        dlg._ed_p[0].setText("100; 200")
+        dlg._update()
+        self.assertFalse(self._ok(dlg))
+        self.assertIn("due punti", dlg._lbl_info.text())
+
+    def test_wrong_distance_between_points_warns(self):
+        dlg = self._dialog(mode=1)
+        dlg._ed_p[0].setText("0; 0")
+        dlg._ed_p[1].setText("0; 90")
+        dlg._update()
+        self.assertIn("⚠", dlg._lbl_info.text())
+
+    def test_map_click_fills_the_field_in_the_project_crs(self):
+        canvas = self.iface.mapCanvas()                       # EPSG:32632
+        dlg = self._dialog(crs="EPSG:32631", canvas=canvas, mode=1)
+        dlg._on_map_click(0, QgsPointXY(500000.0, 4000000.0))
+        from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform
+        want = QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:32632"),
+                                      QgsCoordinateReferenceSystem("EPSG:32631"),
+                                      QgsProject.instance().transformContext()).transform(
+            QgsPointXY(500000.0, 4000000.0))
+        got = _G.parse_xy(dlg._ed_p[0].text())
+        self.assertAlmostEqual(got[0], want.x(), places=2)
+        self.assertAlmostEqual(got[1], want.y(), places=2)
+
+    def test_pick_hides_the_dialog_and_restores_tool_and_dialog(self):
+        canvas = self.iface.mapCanvas()
+        before = canvas.mapTool()
+        dlg = self._dialog(crs="EPSG:32632", canvas=canvas, mode=1)
+        dlg.show()
+        dlg._btn_pick[1].click()
+        self._pump(10)
+        self.assertFalse(dlg.isVisible())
+        self.assertIs(canvas.mapTool(), dlg._tool)
+        dlg._tool.canvasClicked.emit(QgsPointXY(500010.0, 20.0), Qt.LeftButton)
+        self._pump(10)
+        self.assertTrue(dlg.isVisible())
+        self.assertIs(canvas.mapTool(), before)
+        self.assertEqual(_G.parse_xy(dlg._ed_p[1].text()), (500010.0, 20.0))
+        dlg.close()
+
+    def test_changing_tool_while_picking_brings_the_dialog_back(self):
+        canvas = self.iface.mapCanvas()
+        dlg = self._dialog(crs="EPSG:32632", canvas=canvas, mode=1)
+        dlg.show()
+        dlg._btn_pick[0].click()
+        self._pump(10)
+        self.assertFalse(dlg.isVisible())
+        canvas.unsetMapTool(dlg._tool)
+        self._pump(10)
+        self.assertTrue(dlg.isVisible())
+        dlg.close()
+
+    def test_pick_buttons_disabled_without_canvas(self):
+        dlg = self._dialog(mode=1)
+        self.assertFalse(dlg._btn_pick[0].isEnabled())
+
+    # -- layer ------------------------------------------------------------------------------------
+    def test_layer_with_distance_field_anchors_each_point(self):
+        self._points_layer([(0.0, 100.0, 200.0), (10.0, 110.0, 200.0), (25.0, 125.0, 200.0),
+                            (71.0, 171.0, 200.0)])
+        dlg = self._dialog(mode=2)
+        self.assertEqual(dlg._cb_layer.count(), 1)
+        i = dlg._cb_dist.findData("dist")
+        self.assertGreaterEqual(i, 0)
+        self.assertEqual(dlg._cb_dist.findData("etichetta"), -1)     # i campi di testo non si offrono
+        dlg._cb_dist.setCurrentIndex(i)
+        g = dlg.result_data()["georef"]
+        self.assertEqual([round(p.distance, 3) for p in g.points], [0.0, 10.0, 25.0, 71.0])
+        self.assertEqual(g.check(), [])
+        self.assertTrue(self._ok(dlg))
+        self.assertFalse(dlg._chk_invert.isEnabled())
+
+    def test_layer_without_field_uses_proportional_distance(self):
+        self._points_layer([(0, 100.0, 200.0), (0, 130.0, 200.0), (0, 130.0, 240.0)])
+        dlg = self._dialog(mode=2)
+        g = dlg.result_data()["georef"]
+        length = dlg._spin_len.value()                  # proposta dalla sezione sintetica (70.5 m)
+        self.assertAlmostEqual(g.points[-1].distance, length)
+        self.assertAlmostEqual(g.points[1].distance, 30.0 * length / 70.0)
+        self.assertTrue(dlg._chk_invert.isEnabled())
+
+    def test_layer_invert_reverses_the_order(self):
+        self._points_layer([(0, 100.0, 200.0), (0, 130.0, 200.0), (0, 130.0, 240.0)])
+        dlg = self._dialog(mode=2)
+        dlg._chk_invert.setChecked(True)
+        g = dlg.result_data()["georef"]
+        self.assertEqual((g.points[0].x, g.points[0].y), (130.0, 240.0))
+
+    def test_only_selected_features(self):
+        lyr = self._points_layer([(0.0, 0.0, 0.0), (10.0, 10.0, 0.0), (20.0, 20.0, 0.0), (30.0, 30.0, 0.0)])
+        ids = [f.id() for f in lyr.getFeatures()]
+        lyr.selectByIds(ids[1:3])
+        dlg = self._dialog(mode=2)
+        dlg._cb_dist.setCurrentIndex(dlg._cb_dist.findData("dist"))
+        dlg._chk_selected.setChecked(True)
+        g = dlg.result_data()["georef"]
+        self.assertEqual([round(p.distance, 3) for p in g.points], [10.0, 20.0])
+
+    def test_layer_in_another_crs_is_reprojected(self):
+        from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform
+        self._points_layer([(0, 500000.0, 4000000.0), (0, 500070.0, 4000000.0)], crs="EPSG:32632")
+        dlg = self._dialog(crs="EPSG:32631", mode=2)
+        g = dlg.result_data()["georef"]
+        want = QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:32632"),
+                                      QgsCoordinateReferenceSystem("EPSG:32631"),
+                                      QgsProject.instance().transformContext()).transform(
+            QgsPointXY(500000.0, 4000000.0))
+        self.assertAlmostEqual(g.points[0].x, want.x(), places=2)
+        self.assertAlmostEqual(g.points[0].y, want.y(), places=2)
+
+    def test_layer_with_a_single_point_is_refused(self):
+        self._points_layer([(0, 0.0, 0.0)])
+        dlg = self._dialog(mode=2)
+        self.assertFalse(self._ok(dlg))
+        self.assertIn("almeno 2", dlg._lbl_info.text())
+
+    def test_no_point_layers_in_the_project(self):
+        dlg = self._dialog(mode=2)
+        self.assertFalse(self._ok(dlg))
+        self.assertIn("layer di punti", dlg._lbl_info.text())
+
+    def test_duplicate_distances_are_reported_not_raised(self):
+        self._points_layer([(5.0, 0.0, 0.0), (5.0, 10.0, 0.0)])
+        dlg = self._dialog(mode=2)
+        dlg._cb_dist.setCurrentIndex(dlg._cb_dist.findData("dist"))
+        self.assertFalse(self._ok(dlg))
+        self.assertIn("stessa distanza", dlg._lbl_info.text())
+
+
 if __name__ == "__main__":
     unittest.main()
