@@ -32,10 +32,15 @@ import copy
 import math
 import os
 
-from qgis.PyQt.QtCore import QObject, QPoint, QRect, QSettings, QSize, Qt, QTimer, pyqtSignal
+from qgis.PyQt.QtCore import QObject, QPoint, QRect, QSettings, QSize, QStringListModel, Qt, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QColor
+try:
+    from qgis.PyQt.QtWidgets import QActionGroup
+except ImportError:                                  # Qt6: QActionGroup vive in QtGui
+    from qgis.PyQt.QtGui import QActionGroup
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
+    QCompleter,
     QComboBox,
     QDockWidget,
     QDoubleSpinBox,
@@ -95,6 +100,14 @@ from .gpr_annotation_classes import (
 )
 from .gpr_annotation_classes_dialog import AnnotationClassesDialog, color_icon
 from .gpr_annotation_tools import local_extremum_row, trace_between
+from .gpr_annotation_analysis import (
+    METRIC_FIELDS,
+    group_anomalies,
+    plan_samples,
+    region_amplitude,
+    section_metrics,
+)
+from .gpr_anomalies_dialog import AnomaliesDialog
 from .gpr_material_presets import material_preset
 from .gpr_training_export import export_variant_for_training
 
@@ -108,6 +121,7 @@ try:
         normalize_display,
     )
     from .gpr_viewer_radargram import RadargramViewMixin
+    from matplotlib.colors import to_rgba
     from matplotlib.patches import Polygon
     from matplotlib.path import Path as MplPath
 except Exception:                                    # matplotlib/scipy mancanti
@@ -405,7 +419,8 @@ class RadargramDock(QDockWidget):
 
     def __init__(self, iface, workspace_provider=None, geometry_provider=None,
                  feature_sink=None, feature_query=None, parent=None, zones_provider=None,
-                 project_root_provider=None, feature_update=None, feature_delete=None):
+                 project_root_provider=None, feature_update=None, feature_delete=None,
+                 band_filter=None):
         super().__init__("Radargrammi processati", parent or (iface.mainWindow() if iface else None))
         self.setObjectName("GeoSurveyRadargramDock")
         self.setAllowedAreas(Qt.AllDockWidgetAreas)
@@ -427,6 +442,9 @@ class RadargramDock(QDockWidget):
         self._feature_query = feature_query
         self._feature_update = feature_update      # (trace_id, vertices=None, epsg=None, attributes=None)
         self._feature_delete = feature_delete      # (trace_id)
+        self._band_filter = band_filter            # (band | None): attenua sulla mappa le annotazioni fuori fascia
+        self._band_filter_on = False
+        self._band_applied = None
         self._store: VariantStore | None = None
         self._pi = 0
         self._ci = 0
@@ -462,6 +480,8 @@ class RadargramDock(QDockWidget):
         self._hidden_conf: set = set()     # livelli di affidabilita' nascosti
         self._show_labels = True
         self._hover_id: str | None = None
+        self._nb_tol: float | None = None   # profili vicini: tolleranza (m) o None = spenti
+        self._all_records: list | None = None   # annotazioni di tutta la variante (cache, vedi _all_feature_records)
 
         # Classi di segnale (iperbole, riflettore, attenuazione...): scelte prima di
         # disegnare, con i tasti 1-9; ognuna ha colore e geometria di default.
@@ -513,6 +533,11 @@ class RadargramDock(QDockWidget):
         self.refresh_variants()
         if iface is not None:
             self._on_current_layer_changed(iface.activeLayer())
+        if self._band_filter is not None:       # nessuna attenuazione rimasta da una sessione precedente
+            try:
+                self._band_filter(None)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Interfaccia
@@ -579,6 +604,11 @@ class RadargramDock(QDockWidget):
             "attuale (geometry.json) e i parametri di processing (meta.json).\n"
             "Non modifica nulla nel progetto QGIS.")
         self._act_export_training.triggered.connect(self._export_training)
+        self._act_export_figure = more_menu.addAction("Esporta figura annotata…")
+        self._act_export_figure.setToolTip(
+            "Salva il radargramma mostrato (vista attuale) con le annotazioni visibili, le\n"
+            "etichette e la legenda delle classi, in PNG, PDF o SVG: per la relazione.")
+        self._act_export_figure.triggered.connect(self._export_figure)
         self._btn_more.setMenu(more_menu)
         flow.addWidget(_group(QLabel("Variante"), self._cb_variant, self._btn_refresh, self._btn_more))
 
@@ -715,7 +745,12 @@ class RadargramDock(QDockWidget):
         self._btn_show.setToolTip(
             "Quali annotazioni vedere: per classe e per affidabilità, con o senza etichette.\n"
             "Il menu è anche la legenda dei colori.")
-        tools.addWidget(_group(self._btn_edit, self._btn_undo, self._btn_redo, self._btn_show))
+        self._btn_anom = QPushButton("Anomalie…")
+        self._btn_anom.setToolTip(
+            "Tabella delle anomalie: le annotazioni con lo stesso codice, su tutti i profili,\n"
+            "contate come un solo oggetto. Doppio clic per andare alla prima; esporta in CSV.")
+        self._btn_anom.clicked.connect(self._open_anomalies)
+        tools.addWidget(_group(self._btn_edit, self._btn_undo, self._btn_redo, self._btn_show, self._btn_anom))
         tools.addWidget(_sep())
 
         self._spin_vel_mns = QDoubleSpinBox()
@@ -785,7 +820,13 @@ class RadargramDock(QDockWidget):
             e.editingFinished.connect(self._on_card_text_finished)
             return e
 
-        self._ed_code = _edit("Codice", "Codice anomalia: lo stesso codice su più profili indica lo stesso oggetto.", 60)
+        self._ed_code = _edit("Codice", "Codice anomalia: lo stesso codice su più profili indica lo stesso oggetto.\n"
+                              "Mentre scrivi si propongono i codici già usati.", 60)
+        self._completer_model = QStringListModel(self)
+        completer = QCompleter(self._completer_model, self)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        self._ed_code.setCompleter(completer)
         self._ed_interp = _edit("Interpretazione", "Che cos'è (muro, fossa, sottoservizio...).", 110)
         self._ed_notes = _edit("Note", "Note libere.", 110)
         self._lbl_card_info = QLabel("")
@@ -1054,6 +1095,63 @@ class RadargramDock(QDockWidget):
         if n_err:
             msg += f"  |  {n_err} falliti"
         self._show_message(msg)
+
+    def _build_export_figure(self):
+        """Figura del radargramma mostrato (vista attuale) con le annotazioni visibili, le etichette
+        e la legenda delle classi presenti: pronta per la relazione. None se non c'e' nulla da mostrare."""
+        ch = self._cur
+        if ch is None or self._base is None or self._store is None:
+            return None
+        from matplotlib.lines import Line2D
+        fig = Figure(figsize=(10.0, 4.2))
+        ax = fig.add_axes([0.07, 0.14, 0.90, 0.74])
+        disp = np.clip(self._base * float(self._spin_gain.value()), -1.0, 1.0)
+        ax.imshow(disp, aspect="auto", cmap=self._cb_cmap.currentText() or "RdBu_r", vmin=-1.0, vmax=1.0,
+                  extent=[0.0, max(ch.length_m, 1e-6), ch.depth_max_m, 0.0], interpolation="bilinear",
+                  interpolation_stage="data", resample=True)
+        ax.set_xlim(*self._ax.get_xlim())
+        ax.set_ylim(*self._ax.get_ylim())
+        ax.set_xlabel("Distanza (m)", fontsize=9)
+        ax.set_ylabel("Profondità (m)", fontsize=9)
+        ax.tick_params(labelsize=8)
+        used: dict = {}
+        for rec in self._features:
+            if not self._feature_visible(rec):
+                continue
+            color = color_for(self._classes, rec["class_code"])
+            self._paint_feature(ax, rec, color, labels=self._show_labels)
+            used.setdefault(rec["class_code"], color)
+        handles = [Line2D([0], [0], marker="s", ls="none", mfc=color, mec="#1f1f1f", ms=7,
+                          label=label_for(self._classes, code)) for code, color in used.items()]
+        if handles:
+            ax.legend(handles=handles, loc="lower right", fontsize=7, framealpha=0.9)
+        info = self._store.profiles[self._pi]
+        ax.set_title(f"{self._store.name} · {info.stem} · canale {self._cb_channel.currentText()}"
+                     f"   (v = {self._spin_vel_mns.value():.3f} m/ns)", fontsize=9)
+        return fig
+
+    def _export_figure_to(self, path: str, dpi: int = 200) -> bool:
+        fig = self._build_export_figure()
+        if fig is None:
+            return False
+        fig.savefig(path, dpi=int(dpi), facecolor="white")
+        return True
+
+    def _export_figure(self) -> None:
+        if self._cur is None:
+            self._show_message("Niente da esportare: apri prima un radargramma.")
+            return
+        stem = self._store.profiles[self._pi].stem
+        path, _flt = QFileDialog.getSaveFileName(
+            self, "Esporta figura annotata", f"{stem}_ch{self._ci}.png",
+            "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)")
+        if not path:
+            return
+        try:
+            self._export_figure_to(path)
+            self._show_message(f"Figura salvata: {path}")
+        except Exception as exc:
+            self._show_message(f"Figura non salvata: {exc}")
 
     def _on_zone_changed(self, _i: int) -> None:
         if self._updating:
@@ -1374,6 +1472,7 @@ class RadargramDock(QDockWidget):
             self._spin_depth.setValue(float(np.clip(self._ref_z, self._spin_depth.minimum(), self._spin_depth.maximum())))
             self._spin_depth.blockSignals(False)
         self._apply_reference()
+        self._sync_band_filter()
         if self._blit is not None:
             self._blit.update()
         self._update_status()
@@ -1388,6 +1487,7 @@ class RadargramDock(QDockWidget):
         else:
             self._band = None
             self._apply_reference()
+            self._sync_band_filter()
             self._blit.update()
 
     def _connect_layer_signal(self) -> None:
@@ -1992,6 +2092,7 @@ class RadargramDock(QDockWidget):
                     class_code=cls["code"] if cls else "",
                     class_label=cls["label"] if cls else "",
                     confidence=self._cur_conf,
+                    metrics=self._compute_metrics(kind, verts),
                 )
                 new_id = self._result_feature_id(result)
                 what = cls["label"] if cls else kind
@@ -2342,6 +2443,7 @@ class RadargramDock(QDockWidget):
         senza tempo (fatte prima) restano alla profondita' salvata.
         """
         self._features = []
+        self._all_records = None          # le annotazioni degli altri profili si rileggono al bisogno
         ch = self._cur
         if ch is None or self._feature_query is None or self._store is None:
             return
@@ -2398,6 +2500,7 @@ class RadargramDock(QDockWidget):
                 "notes": str(feat.get("notes") or ""),
                 "velocity_m_ns": feat.get("velocity_m_ns"),
                 "rdp": feat.get("rdp"),
+                "metrics": {k: (feat.get("metrics") or {}).get(k) for k in METRIC_FIELDS},
                 "pts": pts,
                 "ctx": rec_ctx,
             })
@@ -2419,45 +2522,134 @@ class RadargramDock(QDockWidget):
             if not self._feature_visible(rec):
                 continue
             color = color_for(self._classes, rec["class_code"])
-            self._draw_feature_extras(rec, color)
+            primary, extras = self._paint_feature(self._ax, rec, color, labels=self._show_labels)
+            self._persisted_extra.extend(extras)
             if self._sel_id is not None and rec["id"] == self._sel_id:
+                primary.remove()          # la selezionata si disegna con gli artisti animati
                 continue
-            xs = [p["x_m"] for p in rec["pts"]]
-            zs = [p["depth_m"] for p in rec["pts"]]
-            kind = rec["kind"]
-            if kind == "point":
-                artist = self._ax.scatter(
-                    xs, zs, s=34, color=color, edgecolor="#1f1f1f", linewidths=0.6, zorder=5)
-            elif kind == "polygon":
-                artist = Polygon(
-                    list(zip(xs, zs)), closed=True, facecolor=color, edgecolor=color,
-                    alpha=0.26, linewidth=1.4, zorder=4)
-                self._ax.add_patch(artist)
-            else:   # "line"
-                (artist,) = self._ax.plot(xs, zs, color=color, lw=1.6, alpha=0.95, zorder=5)
-            self._persisted_artists.append(artist)
+            self._persisted_artists.append(primary)
+        self._draw_ghosts()
 
-    def _draw_feature_extras(self, rec, color: str) -> None:
-        """Curva dell'iperbole misurata (tratteggiata) ed etichetta col codice anomalia."""
+    def _paint_feature(self, ax, rec, color: str, labels: bool = True):
+        """Disegna un'annotazione su `ax` (il radargramma del pannello o la figura da esportare).
+
+        Ritorna ``(artista principale, [curva dell'iperbole, etichetta...])``: la curva tratteggiata
+        c'e' solo per le iperboli misurate, l'etichetta e' il codice anomalia."""
         ch = self._cur
         pts = rec["pts"]
-        if rec.get("source") == "iperbole_fit" and rec["kind"] == "point" and rec.get("velocity_m_ns"):
+        xs = [p["x_m"] for p in pts]
+        zs = [p["depth_m"] for p in pts]
+        kind = rec["kind"]
+        if kind == "point":
+            primary = ax.scatter(xs, zs, s=34, color=color, edgecolor="#1f1f1f", linewidths=0.6, zorder=5)
+        elif kind == "polygon":
+            primary = Polygon(list(zip(xs, zs)), closed=True, facecolor=to_rgba(color, 0.26),
+                              edgecolor=color, linewidth=1.4, zorder=4)     # riempimento chiaro, bordo pieno
+            ax.add_patch(primary)
+        else:   # "line"
+            (primary,) = ax.plot(xs, zs, color=color, lw=1.6, alpha=0.95, zorder=5)
+        extras = []
+        if rec.get("source") == "iperbole_fit" and kind == "point" and rec.get("velocity_m_ns"):
             v_ref = max(self._reference_velocity_m_s(), 1e-9)
             v_fit = m_ns_to_velocity_m_s(float(rec["velocity_m_ns"]))
-            xs = np.linspace(0.0, max(ch.length_m, 1e-6), 400, dtype=np.float64)
+            cx = np.linspace(0.0, max(ch.length_m, 1e-6), 400, dtype=np.float64)
             t0 = 2.0 * float(pts[0]["depth_m"]) / v_ref
-            zs = hyperbola_curve_depth(xs - float(pts[0]["x_m"]), t0, v_fit, v_ref, 0.0)
-            ok = np.isfinite(zs) & (zs >= 0.0) & (zs <= ch.depth_max_m * 1.02)
+            cz = hyperbola_curve_depth(cx - float(pts[0]["x_m"]), t0, v_fit, v_ref, 0.0)
+            ok = np.isfinite(cz) & (cz >= 0.0) & (cz <= ch.depth_max_m * 1.02)
             if ok.any():
-                (curve,) = self._ax.plot(xs[ok], zs[ok], color=color, ls="--", lw=1.2, alpha=0.85, zorder=4)
-                self._persisted_extra.append(curve)
-        if self._show_labels and rec.get("anomaly_id"):
+                (curve,) = ax.plot(cx[ok], cz[ok], color=color, ls="--", lw=1.2, alpha=0.85, zorder=4)
+                extras.append(curve)
+        if labels and rec.get("anomaly_id"):
             top = min(pts, key=lambda p: p["depth_m"])
-            text = self._ax.annotate(
+            extras.append(ax.annotate(
                 rec["anomaly_id"], xy=(top["x_m"], top["depth_m"]), xytext=(6, -3),
                 textcoords="offset points", fontsize=7, color="#111111", zorder=8,
-                bbox=dict(boxstyle="round,pad=0.15", fc="#ffffff", ec=color, lw=0.8, alpha=0.85))
-            self._persisted_extra.append(text)
+                bbox=dict(boxstyle="round,pad=0.15", fc="#ffffff", ec=color, lw=0.8, alpha=0.85)))
+        return primary, extras
+
+    # -- profili vicini: le annotazioni degli altri profili che passano vicino a questo ------------
+
+    def _all_feature_records(self) -> list:
+        """Annotazioni di tutta la variante (cache: si rilegge dopo ogni modifica o cambio profilo)."""
+        if self._all_records is None:
+            records = []
+            if self._feature_query is not None and self._store is not None:
+                try:
+                    records = self._feature_query(self._store.name, None, None, all_profiles=True) or []
+                except Exception:
+                    records = []
+            self._all_records = records
+        return self._all_records
+
+    def _set_neighbour_tol(self, tol) -> None:
+        self._nb_tol = None if tol is None else float(tol)
+        self._redraw_annotations()
+        if tol is not None and self._features is not None:
+            n = sum(1 for a in self._persisted_extra if getattr(a, "_gss_ghost", False))
+            self._show_message(f"Profili vicini entro {tol:g} m: {n} annotazioni proiettate.")
+
+    def _ghost_points(self, f):
+        """[(est, nord, profondita' mostrata)] dei vertici di un'annotazione di un altro profilo.
+        La profondita' segue il tempo doppio (come le annotazioni di questo profilo)."""
+        pts = []
+        for v in f.get("vertices") or []:
+            twt = v.get("twt_ns")
+            z = self._twt_to_depth(twt) if twt is not None else None
+            if z is None:
+                z = float(v.get("depth_m", 0.0))
+            pts.append((float(v["east"]), float(v["north"]), float(z)))
+        return pts
+
+    def _draw_ghosts(self) -> None:
+        """Punti sbiaditi nel colore della classe: dove le annotazioni degli altri profili passano
+        entro la tolleranza da questo profilo (il muro che continua, l'iperbole sul profilo accanto).
+        Quelle con lo stesso codice dell'annotazione selezionata risaltano."""
+        tol, ch = self._nb_tol, self._cur
+        if tol is None or ch is None or self._ax is None or self._store is None:
+            return
+        if not (0 <= self._pi < len(self._store)):
+            return
+        cur_key = (self._store.profiles[self._pi].stem, int(self._ci))
+        ok = np.isfinite(ch.east) & np.isfinite(ch.north)
+        if not ok.any():
+            return
+        east, north, dist = ch.east[ok], ch.north[ok], ch.dist[ok]
+        box = (east.min() - tol, east.max() + tol, north.min() - tol, north.max() + tol)
+        sel = self._selected_rec()
+        sel_code = sel["anomaly_id"] if sel else ""
+        for f in self._all_feature_records():
+            if (f.get("profile_stem"), f.get("channel")) == cur_key:
+                continue
+            if not self._visible_class_conf(f.get("class_code") or "", f.get("confidence") or ""):
+                continue
+            pts = self._ghost_points(f)
+            if not pts:
+                continue
+            es, ns = [p[0] for p in pts], [p[1] for p in pts]
+            if max(es) < box[0] or min(es) > box[1] or max(ns) < box[2] or min(ns) > box[3]:
+                continue            # il riquadro dell'annotazione non tocca quello del profilo (+ tolleranza)
+            samples = np.asarray(plan_samples(pts, f.get("kind") == "polygon", max(tol / 2.0, 0.05)))
+            d = np.hypot(samples[:, 0, None] - east[None, :], samples[:, 1, None] - north[None, :])
+            nearest = np.argmin(d, axis=1)
+            keep = d[np.arange(len(samples)), nearest] <= tol
+            if not keep.any():
+                continue
+            color = color_for(self._classes, f.get("class_code") or "")
+            code = f.get("anomaly_id") or ""
+            strong = bool(sel_code) and code == sel_code
+            xs, zs = dist[nearest[keep]], samples[keep, 2]
+            art = self._ax.scatter(
+                xs, zs, s=28 if strong else 9, color=color, alpha=0.95 if strong else 0.5,
+                edgecolor="#ffffff" if strong else "none", linewidths=0.8, zorder=3)
+            art._gss_ghost = True
+            self._persisted_extra.append(art)
+            if self._show_labels and code:
+                i = int(np.argmin(zs))
+                text = self._ax.annotate(
+                    code, xy=(xs[i], zs[i]), xytext=(5, -3), textcoords="offset points", fontsize=7,
+                    style="italic", color="#444444", zorder=3)
+                text._gss_ghost = False
+                self._persisted_extra.append(text)
 
     def _refresh_persisted_features(self) -> None:
         """Rilegge dal layer e ridisegna le annotazioni (vedi `_load_features`)."""
@@ -2466,10 +2658,13 @@ class RadargramDock(QDockWidget):
 
     # -- filtri ("Mostra"), etichette, tooltip ----------------------------------------------
 
-    def _feature_visible(self, rec) -> bool:
-        if rec["class_code"] in self._hidden_classes:
+    def _visible_class_conf(self, class_code: str, confidence: str) -> bool:
+        if class_code in self._hidden_classes:
             return False
-        return not (rec["confidence"] and rec["confidence"] in self._hidden_conf)
+        return not (confidence and confidence in self._hidden_conf)
+
+    def _feature_visible(self, rec) -> bool:
+        return self._visible_class_conf(rec["class_code"], rec["confidence"])
 
     def _rebuild_show_menu(self) -> None:
         btn = getattr(self, "_btn_show", None)
@@ -2495,9 +2690,81 @@ class RadargramDock(QDockWidget):
             act.setChecked(code not in self._hidden_conf)
             act.toggled.connect(lambda on, c=code: self._on_show_conf(c, on))
         menu.addSeparator()
+        sub = menu.addMenu("Profili vicini")
+        sub.setToolTip("Proietta su questo radargramma le annotazioni degli altri profili che passano vicino.")
+        group = QActionGroup(sub)
+        group.setExclusive(True)
+        for label, tol in (("Nascosti", None), ("Entro 0,5 m", 0.5), ("Entro 1 m", 1.0), ("Entro 2 m", 2.0)):
+            act = sub.addAction(label)
+            act.setCheckable(True)
+            group.addAction(act)
+            act.setChecked(self._nb_tol == tol)
+            act.triggered.connect(lambda _on=False, t=tol: self._set_neighbour_tol(t))
+        self._nb_group = group
+        act = menu.addAction("Mappa: attenua fuori dalla fascia time-slice")
+        act.setCheckable(True)
+        act.setChecked(self._band_filter_on)
+        act.setEnabled(self._band_filter is not None)
+        act.setToolTip("Sulla mappa di QGIS le annotazioni fuori dalla fascia di profondità della\n"
+                       "time-slice mostrata si attenuano (i dati non cambiano).")
+        act.toggled.connect(self._on_band_filter_toggled)
+        menu.addSeparator()
         menu.addAction("Mostra tutto").triggered.connect(self._show_all)
         btn.setMenu(menu)
         self._show_menu = menu           # Qt non tiene il possesso: se lo perdo il menu sparisce
+
+    # -- fascia time-slice sulla mappa -------------------------------------------------------
+
+    def _on_band_filter_toggled(self, on: bool) -> None:
+        self._band_filter_on = bool(on)
+        self._sync_band_filter(force=True)
+        if self._band_filter_on and self._band is None:
+            self._show_message("Fascia time-slice: seleziona una time-slice (con «Segui time-slice» attivo) "
+                               "per attenuare le annotazioni fuori fascia.")
+
+    def _sync_band_filter(self, force: bool = False) -> None:
+        """Applica sulla mappa la fascia della time-slice corrente (o toglie l'attenuazione)."""
+        if self._band_filter is None:
+            return
+        band = self._band if self._band_filter_on else None
+        if not force and band == self._band_applied:
+            return
+        self._band_applied = band
+        try:
+            self._band_filter(band)
+        except Exception as exc:
+            self._show_message(f"Filtro per fascia non applicato: {exc}")
+
+    # -- anomalie: lo stesso codice su piu' profili e' un oggetto -----------------------------
+
+    def _build_anomalies_dialog(self):
+        self._all_records = None            # sempre dati freschi: si apre di rado
+        rows, without = group_anomalies(self._all_feature_records())
+        labels = {c["code"]: c["label"] for c in self._classes}
+        dlg = AnomaliesDialog(rows, without, labels, self)
+        dlg.goto.connect(self._goto_feature)
+        return dlg
+
+    def _open_anomalies(self) -> None:
+        if self._store is None:
+            self._show_message("Apri prima una variante.")
+            return
+        self._anomalies_dialog = self._build_anomalies_dialog()
+        self._anomalies_dialog.show()       # non modale: si puo' navigare e tornare
+
+    def _goto_feature(self, stem: str, channel: int, fid: str) -> None:
+        """Apre il profilo/canale dell'annotazione e la seleziona."""
+        if self._store is None:
+            return
+        pi = next((i for i, p in enumerate(self._store.profiles) if p.stem == stem), None)
+        if pi is None:
+            self._show_message(f"Profilo {stem} non presente in questa variante.")
+            return
+        self.select_profile(pi, int(channel))
+        if any(r["id"] == fid for r in self._features):
+            self._select_feature(fid)
+        else:
+            self._show_message(f"Annotazione non trovata su {stem} canale {channel}.")
 
     def _on_labels_toggled(self, on: bool) -> None:
         self._show_labels = bool(on)
@@ -2547,6 +2814,12 @@ class RadargramDock(QDockWidget):
         scale = float(rec["ctx"].get("depth_scale", 1.0))
         lo, hi = min(zs) * scale, max(zs) * scale
         lines.append(f"prof. {lo:.2f} m" if abs(hi - lo) < 0.005 else f"prof. {lo:.2f}–{hi:.2f} m")
+        metrics = self._metrics_text(rec)
+        if metrics:
+            lines.append(metrics)
+        obj = self._anomaly_summary(rec["anomaly_id"])
+        if obj:
+            lines.append(obj)
         return "\n".join(lines)
 
     def _clear_hover(self) -> None:
@@ -2932,14 +3205,38 @@ class RadargramDock(QDockWidget):
                       "amp": float(amp) if np.isfinite(amp) else None,
                       "twt_ns": self._depth_to_twt(depth)})
 
-    def _send_geometry(self, fid: str, pts, ctx: dict) -> bool:
+    def _compute_metrics(self, kind: str, pts) -> dict:
+        """Misure di un'annotazione (tutte le chiavi di `METRIC_FIELDS`, None dove non si applicano):
+        lunghezza/larghezza/area nella sezione e, per i poligoni, RMS d'ampiezza e contrasto in dB
+        rispetto ai due lati (negativo = zona piu' "spenta" del suo intorno)."""
+        ch = self._cur
+        xs = [float(p["x_m"]) for p in pts]
+        zs = [float(p["depth_m"]) for p in pts]
+        found = section_metrics(kind, xs, zs)
+        if kind == "polygon" and ch is not None:
+            found.update(region_amplitude(ch.data, ch.dist, ch.dz_m, xs, zs))
+        return {k: found.get(k) for k in METRIC_FIELDS}
+
+    @staticmethod
+    def _metrics_text(rec) -> str:
+        m = rec.get("metrics") or {}
+        parts = []
+        if m.get("area_m2") is not None:
+            parts.append(f"area {m['area_m2']:.3f} m²")
+        elif m.get("length_m") is not None:
+            parts.append(f"lungh. {m['length_m']:.2f} m")
+        if m.get("contrast_db") is not None:
+            parts.append(f"contrasto {m['contrast_db']:+.1f} dB")
+        return " · ".join(parts)
+
+    def _send_geometry(self, fid: str, pts, ctx: dict, metrics=None) -> bool:
         if self._feature_update is None:
             self._show_message("Modifica non disponibile: apri questo pannello da GeoSurvey Studio.")
             return False
         try:
             self._feature_update(
                 fid, vertices=self._vertices_payload(pts, float(ctx.get("depth_scale", 1.0))),
-                epsg=ctx["epsg"])
+                epsg=ctx["epsg"], metrics=metrics)
             return True
         except Exception as exc:
             self._show_message(f"Errore nella modifica: {exc}")
@@ -2954,22 +3251,25 @@ class RadargramDock(QDockWidget):
             self._refresh_edit_artists(blit=True)
             return False
         after = copy.deepcopy(rec["pts"])
-        if not self._send_geometry(rec["id"], after, rec["ctx"]):
+        before_metrics = dict(rec.get("metrics") or {})
+        after_metrics = self._compute_metrics(rec["kind"], after)
+        if not self._send_geometry(rec["id"], after, rec["ctx"], after_metrics):
             rec["pts"] = before
             self._refresh_edit_artists(blit=True)
             return False
+        rec["metrics"] = after_metrics
         fid, ctx = rec["id"], dict(rec["ctx"])
         before = copy.deepcopy(before)
         self._push_undo(label,
-                        lambda: self._restore_geometry(fid, before, ctx),
-                        lambda: self._restore_geometry(fid, after, ctx))
+                        lambda: self._restore_geometry(fid, before, ctx, before_metrics),
+                        lambda: self._restore_geometry(fid, after, ctx, after_metrics))
         self._populate_card()
         self._refresh_edit_artists(blit=True)
         self._show_message(f"{label}: salvato.")
         return True
 
-    def _restore_geometry(self, fid: str, pts, ctx: dict) -> bool:
-        ok = self._send_geometry(fid, copy.deepcopy(pts), ctx)
+    def _restore_geometry(self, fid: str, pts, ctx: dict, metrics=None) -> bool:
+        ok = self._send_geometry(fid, copy.deepcopy(pts), ctx, metrics)
         self._reload_overlay()
         return ok
 
@@ -3032,6 +3332,7 @@ class RadargramDock(QDockWidget):
                 velocity_m_ns=snap.get("velocity_m_ns"), rdp=snap.get("rdp"),
                 class_code=snap["class_code"], class_label=snap["class_label"],
                 confidence=snap["confidence"], trace_id=snap["id"], source=snap.get("source") or None,
+                metrics=snap.get("metrics"),
                 attributes={k: snap[k] for k in ("anomaly_id", "interpretation", "notes")})
             ok = True
         except Exception as exc:
@@ -3084,6 +3385,7 @@ class RadargramDock(QDockWidget):
         self._reload_overlay()
 
     def _push_undo(self, label: str, undo, redo) -> None:
+        self._all_records = None
         self._undo_stack.append({"label": label, "undo": undo, "redo": redo})
         del self._undo_stack[:-_UNDO_LIMIT]
         self._redo_stack = []
@@ -3135,11 +3437,33 @@ class RadargramDock(QDockWidget):
             self._ed_interp.setText(rec["interpretation"])
             self._ed_notes.setText(rec["notes"])
             zs = [p["depth_m"] for p in rec["pts"]]
-            self._lbl_card_info.setText(
-                f"{GEOMETRY_LABELS.get(rec['kind'], rec['kind'])} · {len(rec['pts'])} vert. · "
-                f"{min(zs):.2f}–{max(zs):.2f} m")
+            info = (f"{GEOMETRY_LABELS.get(rec['kind'], rec['kind'])} · {len(rec['pts'])} vert. · "
+                    f"{min(zs):.2f}–{max(zs):.2f} m")
+            metrics = self._metrics_text(rec)
+            if metrics:
+                info += f" · {metrics}"
+            obj = self._anomaly_summary(rec["anomaly_id"])
+            if obj:
+                info += f" · {obj}"
+            self._lbl_card_info.setText(info)
+            self._completer_model.setStringList(self._known_codes())
         finally:
             self._card_updating = False
+
+    def _known_codes(self) -> list:
+        """Codici anomalia gia' usati in tutta la variante: la scheda li propone mentre si scrive."""
+        rows, _without = group_anomalies(self._all_feature_records())
+        return [r["code"] for r in rows]
+
+    def _anomaly_summary(self, code: str) -> str:
+        """"M12: 4 annot. su 3 profili": quanto e' esteso l'oggetto di cui fa parte l'annotazione."""
+        if not code:
+            return ""
+        rows, _without = group_anomalies(self._all_feature_records())
+        row = next((r for r in rows if r["code"] == code), None)
+        if row is None or row["n"] < 2:
+            return ""
+        return f"{code}: {row['n']} annot. su {row['profiles']} {'profilo' if row['profiles'] == 1 else 'profili'}"
 
     def _on_card_class(self, i: int) -> None:
         rec = self._selected_rec()
@@ -3302,6 +3626,9 @@ class RadargramDock(QDockWidget):
 
     def cleanup(self) -> None:
         """Da chiamare allo scaricamento del plugin: stacca segnali e rimuove le tracce dalla mappa."""
+        if self._band_filter_on:                # l'attenuazione sulla mappa non deve restare dopo di noi
+            self._band_filter_on = False
+            self._sync_band_filter(force=True)
         try:
             if self._layer_signal is not None:
                 self._layer_signal.disconnect(self._on_current_layer_changed)

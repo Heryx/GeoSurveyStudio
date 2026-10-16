@@ -1045,7 +1045,7 @@ class _FakeAnnotationLayer:
         self.n += 1
         fid = kw.get("trace_id") or f"tr_fake_{self.n}"
         rec = {"id": fid, "kind": kw["kind"], "variant": kw["variant_name"], "stem": kw["profile_stem"],
-               "source": kw.get("source") or "radargramma",
+               "source": kw.get("source") or "radargramma", "metrics": dict(kw.get("metrics") or {}),
                "channel": kw["channel"], "velocity_m_ns": kw.get("velocity_m_ns"), "rdp": kw.get("rdp"),
                "class_code": kw.get("class_code") or "", "class_label": kw.get("class_label") or "",
                "confidence": kw.get("confidence") or "", "anomaly_id": "", "interpretation": "", "notes": "",
@@ -1055,14 +1055,27 @@ class _FakeAnnotationLayer:
         self.items[fid] = rec
         return {"id": fid}
 
-    def query(self, variant, stem, channel):
-        return [dict(r) for r in self.items.values()
-                if (r["stem"], r["channel"]) == (stem, channel)]
+    def query(self, variant, stem, channel, all_profiles=False):
+        out = []
+        for r in self.items.values():
+            if not all_profiles and (r["stem"], r["channel"]) != (stem, channel):
+                continue
+            row = dict(r)
+            row.setdefault("profile_stem", r["stem"])
+            zs = [v["depth_m"] for v in r["vertices"]]
+            row.setdefault("depth_from", min(zs))
+            row.setdefault("depth_to", max(zs))
+            row.setdefault("metrics", {})
+            out.append(row)
+        return out
 
-    def update(self, trace_id, vertices=None, epsg=None, attributes=None):
+    def update(self, trace_id, vertices=None, epsg=None, attributes=None, metrics=None):
         if trace_id not in self.items:
             raise KeyError(trace_id)
-        self.updates.append({"id": trace_id, "vertices": vertices, "attributes": attributes})
+        self.updates.append({"id": trace_id, "vertices": vertices, "attributes": attributes,
+                             "metrics": metrics})
+        if metrics is not None:
+            self.items[trace_id]["metrics"] = dict(metrics)
         if vertices is not None:
             self.items[trace_id]["vertices"] = [dict(v) for v in vertices]
         for k, v in (attributes or {}).items():
@@ -1799,7 +1812,8 @@ class AnnotationToolsTest(_DockBase):
         self.assertEqual(d._hit_feature(float(px2[0]), float(px2[1])), poly_id)
         d._show_all()
         self.assertEqual(len(d._persisted_artists), 2)
-        self.assertTrue(all(a.isChecked() for a in d._btn_show.menu().actions() if a.isCheckable()))
+        self.assertTrue(all(a.isChecked() for a in d._btn_show.menu().actions()
+                            if a.isCheckable() and not a.text().startswith("Mappa")))
 
     def test_hiding_the_selected_class_deselects_it(self):
         d = self.dock
@@ -1878,6 +1892,458 @@ class AnnotationToolsTest(_DockBase):
         scale = (v_mns * 1e9) / d._reference_velocity_m_s()
         want = f"prof. {rec['pts'][0]['depth_m'] * scale:.2f} m"
         self.assertIn(want, d._feature_tooltip(rec))
+
+
+@unittest.skipUnless(HAS_ENV, "QGIS/matplotlib non disponibili")
+class AnnotationAnalysisTest(_DockBase):
+    """Metriche, profili vicini, tabella anomalie, fascia time-slice sulla mappa, figura esportata."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = _FakeAnnotationLayer()
+        self.queries = []
+        d = self.dock
+        d._feature_sink = self.fake.sink
+
+        def query(variant, stem, channel, all_profiles=False):
+            self.queries.append(all_profiles)
+            return self.fake.query(variant, stem, channel, all_profiles=all_profiles)
+        d._feature_query = query
+        d._feature_update = self.fake.update
+        d._feature_delete = self.fake.delete
+
+    # -- utilita' -------------------------------------------------------------------------
+
+    def _ev(self, name, x_m, z_m, button=1):
+        cv = self.dock._canvas
+        cv.draw()
+        px, py = self.dock._ax.transData.transform((x_m, z_m))
+        return MouseEvent(name, cv, px, py, button=button)
+
+    def _key(self, key):
+        self.dock._on_key(types.SimpleNamespace(key=key))
+
+    def _press(self, x, z, **kw):
+        self.dock._on_mouse_press(self._ev("button_press_event", x, z, **kw))
+
+    def _release(self, x, z):
+        self.dock._on_mouse_release(self._ev("button_release_event", x, z))
+
+    def _move(self, x, z):
+        self.dock._on_mouse_move(self._ev("motion_notify_event", x, z))
+
+    def _draw(self, key, pts):
+        self._key(key)
+        for x, z in pts:
+            self._press(x, z)
+        self._key("enter")
+
+    def _rect(self, p0, p1, key="3"):
+        self._key(key)
+        self.dock._btn_draw_rect.setChecked(True)
+        self._press(*p0)
+        self._press(*p1)
+
+    def _last(self):
+        return list(self.fake.items.values())[-1]
+
+    def _add_foreign(self, fid, stem, channel, kind, coords, depth, code="", class_code="riflettore",
+                     twt=None, confidence="probabile"):
+        """Annotazione di un altro profilo; coords = [(est, nord), ...]."""
+        self.fake.items[fid] = {
+            "id": fid, "kind": kind, "stem": stem, "channel": channel, "source": "radargramma",
+            "class_code": class_code, "class_label": "", "confidence": confidence, "anomaly_id": code,
+            "interpretation": "", "notes": "", "velocity_m_ns": None, "rdp": None,
+            "vertices": [{"east": e, "north": n, "depth_m": depth, "twt_ns": twt, "amp": None}
+                         for e, n in coords]}
+
+    def _cur_geo(self):
+        d = self.dock
+        ch = d._cur
+        return ch.east.min(), ch.east.max(), float(np.nanmean(ch.north))
+
+    # -- metriche -------------------------------------------------------------------------
+
+    def test_a_drawn_line_stores_length_and_width_but_no_area(self):
+        self._draw("2", [(1.0, 0.05), (3.0, 0.05), (3.0, 0.15)])
+        m = self._last()["metrics"]
+        self.assertAlmostEqual(m["length_m"], 2.0 + 0.1, delta=0.06)
+        self.assertAlmostEqual(m["width_m"], 2.0, delta=0.06)
+        self.assertIsNone(m["area_m2"])
+        self.assertIsNone(m["contrast_db"])
+
+    def test_a_point_has_no_metrics(self):
+        self._draw("1", [(2.0, 0.08)])
+        self.assertTrue(all(v is None for v in self._last()["metrics"].values()))
+
+    def test_an_attenuated_zone_gets_area_rms_and_negative_contrast(self):
+        d = self.dock
+        ch = d._cur
+        rng = np.random.default_rng(5)
+        ch.data[:] = rng.normal(0, 1.0, ch.data.shape).astype(ch.data.dtype)
+        i0, i1 = ch.trace_at_distance(2.0), ch.trace_at_distance(3.0)
+        ch.data[8:28, i0:i1 + 1] *= 0.2                      # zona "spenta"
+        self._rect((2.0, 8 * ch.dz_m), (3.0, 28 * ch.dz_m))
+        m = self._last()["metrics"]
+        self.assertAlmostEqual(m["area_m2"], 1.0 * 20 * ch.dz_m, delta=0.02)
+        self.assertLess(m["contrast_db"], -8.0)
+        self.assertGreater(m["amp_rms"], 0.0)
+        self.assertLess(m["amp_rms"], 0.5)
+
+    def test_moving_a_vertex_rewrites_the_metrics_and_undo_restores_them(self):
+        d = self.dock
+        self._draw("2", [(1.0, 0.05), (2.0, 0.05)])
+        rid = self._last()["id"]
+        before = dict(self._last()["metrics"])
+        d._btn_edit.setChecked(True)
+        d._select_feature(None)
+        self._press(1.5, 0.05)
+        self._release(1.5, 0.05)
+        self._press(2.0, 0.05)
+        self._move(3.0, 0.05)
+        self._release(3.0, 0.05)
+        after = self.fake.items[rid]["metrics"]
+        self.assertGreater(after["length_m"], before["length_m"] + 0.5)
+        self._key("ctrl+z")
+        self.assertAlmostEqual(self.fake.items[rid]["metrics"]["length_m"], before["length_m"], places=6)
+
+    def test_metrics_appear_in_card_and_tooltip(self):
+        d = self.dock
+        self._rect((2.0, 0.05), (3.0, 0.15))
+        self.assertIn("area", d._lbl_card_info.text())
+        self.assertIn("m²", d._lbl_card_info.text())
+        self.assertIn("contrasto", d._lbl_card_info.text())
+        self.assertIn("contrasto", d._feature_tooltip(d._selected_rec()))
+
+    def test_deleted_polygon_comes_back_with_its_metrics(self):
+        d = self.dock
+        self._rect((2.0, 0.05), (3.0, 0.15))
+        rid = self._last()["id"]
+        want = dict(self._last()["metrics"])
+        d._btn_edit.setChecked(True)
+        d._select_feature(rid)
+        self._key("delete")
+        self._key("ctrl+z")
+        self.assertEqual(self.fake.items[rid]["metrics"], want)
+
+    # -- profili vicini -------------------------------------------------------------------
+
+    def _crossing_line(self, fid="nb1", code="M1", **kw):
+        e0, e1, n0 = self._cur_geo()
+        east = e0 + 2.0
+        self._add_foreign(fid, "Nord9", 0, "line", [(east, n0 - 5.0), (east, n0 + 5.0)], 0.10, code=code, **kw)
+
+    def test_neighbour_annotations_are_hidden_by_default_and_shown_within_tolerance(self):
+        d = self.dock
+        self._crossing_line()
+        d._refresh_persisted_features()
+        self.assertEqual([a for a in d._persisted_extra if getattr(a, "_gss_ghost", False)], [])
+        d._set_neighbour_tol(1.0)
+        ghosts = [a for a in d._persisted_extra if getattr(a, "_gss_ghost", False)]
+        self.assertEqual(len(ghosts), 1)
+        offs = np.asarray(ghosts[0].get_offsets())
+        self.assertGreaterEqual(len(offs), 3)
+        self.assertTrue(np.allclose(offs[:, 0], 2.0, atol=0.06))       # dove il muro attraversa il profilo
+        self.assertTrue(np.allclose(offs[:, 1], 0.10, atol=1e-6))
+        d._set_neighbour_tol(None)
+        self.assertEqual([a for a in d._persisted_extra if getattr(a, "_gss_ghost", False)], [])
+
+    def test_the_tolerance_decides_whether_a_parallel_neighbour_is_shown(self):
+        d = self.dock
+        e0, e1, n0 = self._cur_geo()
+        self._add_foreign("par", "Nord9", 0, "line", [(e0 + 1.0, n0 + 0.8), (e0 + 3.0, n0 + 0.8)], 0.1)
+        d._refresh_persisted_features()
+        ghosts = lambda: [a for a in d._persisted_extra if getattr(a, "_gss_ghost", False)]
+        d._set_neighbour_tol(0.5)
+        self.assertEqual(ghosts(), [])                                    # a 0,8 m: oltre la tolleranza
+        d._set_neighbour_tol(1.0)
+        self.assertEqual(len(ghosts()), 1)
+        xs = np.asarray(ghosts()[0].get_offsets())[:, 0]
+        self.assertAlmostEqual(float(xs.min()), 1.0, delta=0.06)          # il tratto parallelo, tutto
+        self.assertAlmostEqual(float(xs.max()), 3.0, delta=0.06)
+
+    def test_far_annotations_and_own_profile_are_not_projected(self):
+        d = self.dock
+        e0, e1, n0 = self._cur_geo()
+        self._add_foreign("far", "Nord9", 0, "point", [(e0 + 2.0, n0 + 30.0)], 0.1)
+        self._draw("2", [(1.0, 0.05), (2.0, 0.1)])                     # sul profilo mostrato
+        d._set_neighbour_tol(2.0)
+        self.assertEqual([a for a in d._persisted_extra if getattr(a, "_gss_ghost", False)], [])
+
+    def test_neighbour_depth_follows_the_two_way_time(self):
+        d = self.dock
+        e0, e1, n0 = self._cur_geo()
+        self._add_foreign("p", "Nord9", 0, "point", [(e0 + 2.0, n0 + 0.4)], 0.05, twt=3.0)
+        d._refresh_persisted_features()
+        d._set_neighbour_tol(1.0)
+        ghost = [a for a in d._persisted_extra if getattr(a, "_gss_ghost", False)][0]
+        self.assertAlmostEqual(float(np.asarray(ghost.get_offsets())[0][1]), d._twt_to_depth(3.0), places=6)
+
+    def test_neighbours_follow_class_filters_and_other_channels_of_the_same_profile_count(self):
+        d = self.dock
+        e0, e1, n0 = self._cur_geo()
+        stem = d._store.profiles[d._pi].stem
+        self._add_foreign("c1", stem, d._ci + 1, "point", [(e0 + 2.0, n0)], 0.1, class_code="iperbole")
+        d._refresh_persisted_features()
+        d._set_neighbour_tol(1.0)
+        self.assertEqual(len([a for a in d._persisted_extra if getattr(a, "_gss_ghost", False)]), 1)
+        d._on_show_class("iperbole", False)
+        self.assertEqual([a for a in d._persisted_extra if getattr(a, "_gss_ghost", False)], [])
+
+    def test_selecting_an_annotation_highlights_neighbours_with_the_same_code(self):
+        d = self.dock
+        self._crossing_line(code="M1")
+        self._crossing_line(fid="nb2", code="T7")
+        self._draw("2", [(1.0, 0.05), (2.0, 0.1)])
+        rid = self._last()["id"]
+        d._btn_edit.setChecked(True)
+        d._select_feature(rid)
+        d._ed_code.setText("M1")
+        d._on_card_text_finished()
+        d._set_neighbour_tol(1.0)
+        sizes = sorted(float(np.asarray(a.get_sizes())[0]) for a in d._persisted_extra if getattr(a, "_gss_ghost", False))
+        self.assertEqual(len(sizes), 2)
+        self.assertLess(sizes[0], sizes[1])                              # quello con lo stesso codice risalta
+
+    def test_neighbour_labels_show_the_code_and_follow_the_labels_switch(self):
+        d = self.dock
+        self._crossing_line(code="M1")
+        d._refresh_persisted_features()
+        d._set_neighbour_tol(1.0)
+        texts = [a.get_text() for a in d._persisted_extra if hasattr(a, "get_text")]
+        self.assertEqual(texts, ["M1"])
+        d._on_labels_toggled(False)
+        self.assertEqual([a for a in d._persisted_extra if hasattr(a, "get_text")], [])
+
+    def test_neighbour_menu_has_the_four_choices(self):
+        d = self.dock
+        sub = next(a.menu() for a in d._btn_show.menu().actions() if a.menu() is not None)
+        self.assertEqual([a.text() for a in sub.actions()], ["Nascosti", "Entro 0,5 m", "Entro 1 m", "Entro 2 m"])
+        self.assertTrue(sub.actions()[0].isChecked())
+        sub.actions()[2].trigger()
+        self.assertEqual(d._nb_tol, 1.0)
+
+    def test_all_profiles_records_are_cached_until_something_changes(self):
+        d = self.dock
+        self.queries.clear()
+        d._all_feature_records()
+        d._all_feature_records()
+        self.assertEqual(self.queries.count(True), 1)
+        self._draw("2", [(1.0, 0.05), (2.0, 0.1)])                        # una modifica invalida la cache
+        d._all_feature_records()
+        self.assertGreaterEqual(self.queries.count(True), 2)
+
+    # -- anomalie -------------------------------------------------------------------------
+
+    def _swath10_record(self, fid, code):
+        d = self.dock
+        pi = next(i for i, p in enumerate(d._store.profiles) if p.stem == "Swath10")
+        ch2 = d._store.channel(pi, 0)
+        pos = ch2.position(ch2.trace_at_distance(2.0))
+        self._add_foreign(fid, "Swath10", 0, "point", [pos], 0.12, code=code, class_code="iperbole")
+        return pos
+
+    def test_anomalies_dialog_groups_the_same_code_across_profiles(self):
+        d = self.dock
+        self._draw("2", [(1.0, 0.05), (2.0, 0.1)])
+        rid = self._last()["id"]
+        d._btn_edit.setChecked(True)
+        d._select_feature(rid)
+        d._ed_code.setText("M1")
+        d._on_card_text_finished()
+        self._swath10_record("s10", "M1")
+        self._swath10_record("s10b", "T7")
+        d._btn_edit.setChecked(False)                                     # fuori da Modifica: `1` e' una classe
+        self._draw("1", [(3.0, 0.1)])                                     # una senza codice
+        dlg = d._build_anomalies_dialog()
+        self.assertEqual(dlg._table.rowCount(), 2)
+        row = [dlg._table.item(0, c).text() for c in range(6)]
+        self.assertEqual(row[0], "M1")
+        self.assertEqual(row[2:4], ["2", "2"])
+        self.assertIn("Riflettore / interfaccia", row[1])
+        self.assertIn("Iperbole di diffrazione", row[1])
+        self.assertEqual(dlg._table.item(1, 0).text(), "T7")
+
+    def test_anomalies_dialog_goes_to_the_first_annotation(self):
+        d = self.dock
+        self._swath10_record("s10", "M1")
+        dlg = d._build_anomalies_dialog()
+        stem_before = d._store.profiles[d._pi].stem
+        dlg._go(0)
+        self.assertEqual(d._store.profiles[d._pi].stem, "Swath10")
+        self.assertNotEqual(stem_before, "Swath10")
+        self.assertEqual(d._sel_id, "s10")
+        self.assertFalse(d._card.isHidden())
+
+    def test_goto_a_missing_profile_or_annotation_says_so(self):
+        d = self.dock
+        d._goto_feature("NonEsiste", 0, "x")
+        self.assertIn("non presente", d._lbl_status.text())
+        stem = d._store.profiles[d._pi].stem
+        d._goto_feature(stem, 0, "mancante")
+        self.assertIn("non trovata", d._lbl_status.text())
+
+    def test_anomalies_dialog_without_codes_explains_and_exports_nothing(self):
+        d = self.dock
+        self._draw("1", [(3.0, 0.1)])
+        dlg = d._build_anomalies_dialog()
+        self.assertEqual(dlg._table.rowCount(), 0)
+        self.assertFalse(dlg._btn_csv.isEnabled())
+
+    def test_anomalies_csv_has_one_row_per_code_in_italian_excel_format(self):
+        d = self.dock
+        self._swath10_record("s10", "M1")
+        self._swath10_record("s10b", "M1")
+        dlg = d._build_anomalies_dialog()
+        path = os.path.join(self.root, "anomalie.csv")
+        self.assertEqual(dlg.export_csv_to(path), 1)
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            lines = fh.read().strip().splitlines()
+        self.assertEqual(lines[0].split(";")[:4], ["codice", "classi", "annotazioni", "profili"])
+        cells = lines[1].split(";")
+        self.assertEqual((cells[0], cells[1], cells[2], cells[3]), ("M1", "Iperbole di diffrazione", "2", "1"))
+        self.assertEqual(cells[7], "Swath10")
+
+    def test_card_shows_how_far_the_object_extends_and_suggests_known_codes(self):
+        d = self.dock
+        self._swath10_record("s10", "M1")
+        self._draw("2", [(1.0, 0.05), (2.0, 0.1)])
+        rid = self._last()["id"]
+        d._btn_edit.setChecked(True)
+        d._select_feature(rid)
+        d._ed_code.setText("M1")
+        d._on_card_text_finished()
+        self.assertIn("M1: 2 annot. su 2 profili", d._lbl_card_info.text())
+        self.assertIn("M1", d._completer_model.stringList())
+        d._select_feature(None)
+        d._select_feature(rid)
+        self.assertIn("M1: 2 annot.", d._feature_tooltip(d._selected_rec()))
+
+    def test_open_anomalies_shows_a_non_modal_dialog(self):
+        d = self.dock
+        d._open_anomalies()
+        self.assertTrue(d._anomalies_dialog.isVisible())
+        self.assertFalse(d._anomalies_dialog.isModal())
+        d._anomalies_dialog.close()
+
+    # -- fascia time-slice sulla mappa -------------------------------------------------------
+
+    def test_band_filter_follows_the_selected_timeslice_only_when_switched_on(self):
+        d = self.dock
+        calls = []
+        d._band_filter = calls.append
+        d.set_reference_depth(0.1, band=(0.05, 0.15))
+        self.assertEqual(calls, [])                                       # spento: la mappa non si tocca
+        d._on_band_filter_toggled(True)
+        self.assertEqual(calls, [(0.05, 0.15)])
+        d.set_reference_depth(0.2, band=(0.15, 0.25))
+        self.assertEqual(calls[-1], (0.15, 0.25))
+        n = len(calls)
+        d.set_reference_depth(0.2, band=(0.15, 0.25))                    # stessa fascia: niente lavoro inutile
+        self.assertEqual(len(calls), n)
+        d._on_follow_toggled(False)                                       # senza time-slice: nessuna fascia
+        self.assertIsNone(calls[-1])
+        d._on_band_filter_toggled(False)
+        self.assertIsNone(calls[-1])
+
+    def test_band_filter_without_a_timeslice_explains_and_cleanup_removes_it(self):
+        d = self.dock
+        calls = []
+        d._band_filter = calls.append
+        d._on_band_filter_toggled(True)
+        self.assertEqual(calls, [None])
+        self.assertIn("time-slice", d._lbl_status.text())
+        d.set_reference_depth(0.1, band=(0.05, 0.15))
+        d.cleanup()
+        self.assertIsNone(calls[-1])
+        self.assertFalse(d._band_filter_on)
+
+    def test_band_filter_errors_do_not_break_the_panel(self):
+        d = self.dock
+
+        def boom(_band):
+            raise RuntimeError("layer bloccato")
+        d._band_filter = boom
+        d.set_reference_depth(0.1, band=(0.05, 0.15))
+        d._on_band_filter_toggled(True)
+        self.assertIn("layer bloccato", d._lbl_status.text())
+
+    def test_new_dock_clears_a_stale_band_filter_and_menu_item_needs_the_bridge(self):
+        calls = []
+        dock = _DOCK.RadargramDock(self.iface, workspace_provider=lambda: self.root,
+                                   parent=self.iface.mainWindow(), band_filter=calls.append)
+        try:
+            self.assertEqual(calls, [None])
+            act = next(a for a in dock._btn_show.menu().actions() if a.text().startswith("Mappa"))
+            self.assertTrue(act.isEnabled())
+        finally:
+            dock.cleanup()
+            dock.close()
+        act2 = next(a for a in self.dock._btn_show.menu().actions() if a.text().startswith("Mappa"))
+        self.assertFalse(act2.isEnabled())                                # nessun ponte: voce spenta
+
+    # -- figura esportata ----------------------------------------------------------------
+
+    def test_export_figure_has_title_legend_and_the_visible_annotations_only(self):
+        d = self.dock
+        self._draw("2", [(1.0, 0.05), (2.0, 0.1)])
+        self._draw("3", [(2.5, 0.14), (3.5, 0.14), (3.5, 0.22)])
+        d._on_show_class("attenuazione", False)
+        fig = d._build_export_figure()
+        ax = fig.axes[0]
+        legend = [t.get_text() for t in ax.get_legend().get_texts()]
+        self.assertEqual(legend, ["Riflettore / interfaccia"])
+        self.assertIn(d._store.profiles[d._pi].stem, ax.get_title())
+        self.assertIn(d._store.name, ax.get_title())
+        self.assertEqual(ax.get_xlim(), d._ax.get_xlim())
+        self.assertEqual(len(ax.lines), 1)
+        self.assertEqual(len(ax.patches), 0)
+
+    def test_export_figure_includes_the_selected_annotation_and_the_labels(self):
+        d = self.dock
+        self._draw("2", [(1.0, 0.05), (2.0, 0.1)])           # appena creata: e' selezionata
+        d._ed_code.setText("M1")
+        d._on_card_text_finished()
+        self.assertIsNotNone(d._selected_rec())
+        fig = d._build_export_figure()
+        ax = fig.axes[0]
+        self.assertEqual(len(ax.lines), 1)                   # la selezionata c'e' anche se e' animata sul pannello
+        self.assertEqual([t.get_text() for t in ax.texts], ["M1"])
+        d._on_labels_toggled(False)
+        self.assertEqual([t.get_text() for t in d._build_export_figure().axes[0].texts], [])
+
+    def test_export_figure_without_annotations_has_no_legend(self):
+        fig = self.dock._build_export_figure()
+        self.assertIsNone(fig.axes[0].get_legend())
+
+    def test_export_figure_writes_png_pdf_and_svg(self):
+        d = self.dock
+        self._draw("2", [(1.0, 0.05), (2.0, 0.1)])
+        for ext, marker in (("png", b"\x89PNG"), ("pdf", b"%PDF"), ("svg", b"<?xml")):
+            path = os.path.join(self.root, f"fig.{ext}")
+            self.assertTrue(d._export_figure_to(path, dpi=80))
+            with open(path, "rb") as fh:
+                head = fh.read(200)
+            self.assertTrue(head.startswith(marker) or marker in head, ext)
+            self.assertGreater(os.path.getsize(path), 500)
+
+    def test_export_figure_action_uses_the_chosen_path_and_reports(self):
+        from unittest import mock
+        d = self.dock
+        path = os.path.join(self.root, "scelta.png")
+        with mock.patch.object(_DOCK.QFileDialog, "getSaveFileName", return_value=(path, "PNG (*.png)")):
+            d._export_figure()
+        self.assertTrue(os.path.isfile(path))
+        self.assertIn("Figura salvata", d._lbl_status.text())
+        with mock.patch.object(_DOCK.QFileDialog, "getSaveFileName", return_value=("", "")):
+            d._export_figure()                                            # annullato: nessun errore
+
+    def test_export_figure_is_in_the_more_menu_and_nothing_to_export_says_so(self):
+        d = self.dock
+        self.assertIn("Esporta figura annotata…", [a.text() for a in d._btn_more.menu().actions()])
+        d._cur = None
+        d._export_figure()
+        self.assertIn("Niente da esportare", d._lbl_status.text())
 
 
 @unittest.skipUnless(HAS_ENV, "QGIS/matplotlib non disponibili")

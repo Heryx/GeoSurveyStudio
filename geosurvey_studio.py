@@ -494,19 +494,24 @@ class GeoSurveyStudioPlugin(
             channel=channel, epsg=epsg, vertices=vertices,
             velocity_m_ns=velocity_m_ns, rdp=rdp, **extra)
 
-    def _radargram_feature_update(self, trace_id, vertices=None, epsg=None, attributes=None):
-        """Ponte per modificare un'annotazione gia' disegnata (vertici e/o attributi)."""
+    def _radargram_feature_update(self, trace_id, vertices=None, epsg=None, attributes=None, metrics=None):
+        """Ponte per modificare un'annotazione gia' disegnata (vertici, attributi, misure)."""
         return self.update_radargram_feature(
-            trace_id, vertices=vertices, epsg=epsg, attributes=attributes)
+            trace_id, vertices=vertices, epsg=epsg, attributes=attributes, metrics=metrics)
+
+    def _radargram_band_filter(self, band):
+        """Ponte per attenuare sulla mappa le annotazioni fuori dalla fascia della time-slice."""
+        return self.set_radargram_band_filter(band)
 
     def _radargram_feature_delete(self, trace_id):
         """Ponte per eliminare un'annotazione disegnata sul radargramma."""
         return self.delete_radargram_feature(trace_id)
 
-    def _radargram_feature_query(self, variant_name, profile_stem, channel):
+    def _radargram_feature_query(self, variant_name, profile_stem, channel, all_profiles=False):
         """Ponte verso TraceCaptureMixin per ridisegnare sul radargramma le geometrie
-        gia' digitalizzate su quel profilo/canale (vedi RadargramDock `feature_query`)."""
-        return self.query_radargram_features(variant_name, profile_stem, channel)
+        gia' digitalizzate su quel profilo/canale (vedi RadargramDock `feature_query`);
+        con `all_profiles` restituisce tutta la variante (profili vicini, anomalie)."""
+        return self.query_radargram_features(variant_name, profile_stem, channel, all_profiles=all_profiles)
 
     def open_radargram_dock(self, checked=False, variant=None, profile_stem=None, activate=True):
         """Mostra (creandolo se serve) il pannello dei radargrammi processati.
@@ -539,6 +544,7 @@ class GeoSurveyStudioPlugin(
                 feature_query=self._radargram_feature_query,
                 feature_update=getattr(self, "_radargram_feature_update", None),
                 feature_delete=getattr(self, "_radargram_feature_delete", None),
+                band_filter=getattr(self, "_radargram_band_filter", None),
                 parent=self.iface.mainWindow(),
             )
             self.iface.addDockWidget(Qt.BottomDockWidgetArea, dock)

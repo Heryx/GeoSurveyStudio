@@ -481,6 +481,113 @@ class CaptureRadargramFeatureTest(unittest.TestCase):
         self.assertAlmostEqual(found["point"]["rdp"], 14.06, places=6)
         self.assertEqual(found["point"]["vertices"][0]["twt_ns"], 2.4)
 
+    # -- fase 3: metriche, query su tutta la variante, fascia time-slice --------------------
+
+    def test_metrics_are_stored_returned_and_rewritten_on_update(self):
+        h = self.harness
+        feat = h.capture_radargram_feature(
+            kind="polygon", variant_name="Lavoro", profile_stem="Swath2", channel=0, epsg=32632,
+            vertices=[{"east": 500000.0, "north": 10.0, "depth_m": 0.05},
+                      {"east": 500001.0, "north": 10.0, "depth_m": 0.05},
+                      {"east": 500001.0, "north": 10.0, "depth_m": 0.15}],
+            metrics={"area_m2": 0.05, "width_m": 1.0, "contrast_db": -7.5, "amp_rms": 0.2, "length_m": 2.2,
+                     "inutile": 99})
+        stored = next(QgsProject.instance().mapLayersByName("Radargram Polygons")[0].getFeatures())
+        self.assertAlmostEqual(stored.attribute("area_m2"), 0.05)
+        self.assertAlmostEqual(stored.attribute("contrast_db"), -7.5)
+        self.assertEqual(stored.fields().indexOf("inutile"), -1)
+        back = h.query_radargram_features("Lavoro", "Swath2", 0)[0]
+        self.assertAlmostEqual(back["metrics"]["contrast_db"], -7.5)
+        self.assertAlmostEqual(back["metrics"]["width_m"], 1.0)
+        h.update_radargram_feature(feat.attribute("trace_id"), metrics={"area_m2": 0.2})
+        again = h.query_radargram_features("Lavoro", "Swath2", 0)[0]["metrics"]
+        self.assertAlmostEqual(again["area_m2"], 0.2)
+        self.assertIsNone(again["contrast_db"])             # le misure vecchie non restano
+        # senza `metrics` l'aggiornamento non le tocca
+        h.update_radargram_feature(feat.attribute("trace_id"), attributes={"notes": "x"})
+        self.assertAlmostEqual(h.query_radargram_features("Lavoro", "Swath2", 0)[0]["metrics"]["area_m2"], 0.2)
+
+    def test_capture_without_metrics_leaves_them_null(self):
+        h = self.harness
+        h.capture_radargram_feature(**self._two_vertices())
+        metrics = h.query_radargram_features("Lavoro", "Swath2", 0)[0]["metrics"]
+        self.assertEqual(set(metrics), {"length_m", "width_m", "area_m2", "amp_rms", "contrast_db"})
+        self.assertTrue(all(v is None for v in metrics.values()))
+
+    def test_all_profiles_query_returns_the_whole_variant_with_profile_and_depth_range(self):
+        h = self.harness
+        h.capture_radargram_feature(**self._two_vertices())
+        h.capture_radargram_feature(
+            kind="point", variant_name="Lavoro", profile_stem="Nord1", channel=3, epsg=32632,
+            vertices=[{"east": 500000.5, "north": 0.0, "depth_m": 0.2}])
+        h.capture_radargram_feature(
+            kind="point", variant_name="Altra", profile_stem="Nord1", channel=3, epsg=32632,
+            vertices=[{"east": 500000.5, "north": 0.0, "depth_m": 0.2}])
+        everything = h.query_radargram_features("Lavoro", "Swath2", 0, all_profiles=True)
+        self.assertEqual(len(everything), 2)                  # la variante "Altra" resta fuori
+        by_stem = {f["profile_stem"]: f for f in everything}
+        self.assertEqual(by_stem["Nord1"]["channel"], 3)
+        self.assertAlmostEqual(by_stem["Swath2"]["depth_from"], 0.05)
+        self.assertAlmostEqual(by_stem["Swath2"]["depth_to"], 0.10)
+        self.assertEqual(len(h.query_radargram_features("Lavoro", "Swath2", 0)), 1)   # il filtro normale c'e' ancora
+
+    def test_band_filter_dims_features_outside_the_band_and_can_be_removed(self):
+        from qgis.core import QgsExpression, QgsExpressionContext, QgsExpressionContextUtils, QgsSymbol
+        h = self.harness
+        h.capture_radargram_feature(**self._two_vertices())      # 0.05 - 0.10 m
+        h.capture_radargram_feature(
+            kind="point", variant_name="Lavoro", profile_stem="Swath2", channel=0, epsg=32632,
+            vertices=[{"east": 500000.5, "north": 10.0, "depth_m": 0.40}])
+        self.assertFalse(h.radargram_band_filter_active())
+        self.assertEqual(h.set_radargram_band_filter((0.0, 0.2)), 2)    # i due layer presenti
+        self.assertTrue(h.radargram_band_filter_active())
+        lines = QgsProject.instance().mapLayersByName("Radargram Lines")[0]
+        points = QgsProject.instance().mapLayersByName("Radargram Points")[0]
+        expr_text = lines.renderer().symbol().dataDefinedProperties().property(QgsSymbol.PropertyOpacity).expressionString()
+
+        def opacity(layer):
+            expr = QgsExpression(expr_text)
+            ctx = QgsExpressionContext(QgsExpressionContextUtils.globalProjectLayerScopes(layer))
+            ctx.setFeature(next(layer.getFeatures()))
+            return expr.evaluate(ctx)
+        self.assertEqual(opacity(lines), 100)                    # nella fascia
+        self.assertEqual(opacity(points), 12)                    # a 0,40 m: fuori
+        # i dati non cambiano: il pannello vede ancora tutto
+        self.assertEqual(len(h.query_radargram_features("Lavoro", "Swath2", 0)), 2)
+        self.assertEqual(points.featureCount(), 1)
+        h.set_radargram_band_filter(None)
+        self.assertFalse(h.radargram_band_filter_active())
+
+    def test_band_filter_keeps_features_without_depth_visible(self):
+        from qgis.core import QgsExpression, QgsExpressionContext
+        h = self.harness
+        expr = QgsExpression(h._radargram_band_expression(0.1, 0.2))
+        ctx = QgsExpressionContext()
+        from qgis.core import QgsFeature, QgsFields, QgsField
+        from qgis.PyQt.QtCore import QVariant
+        fields = QgsFields()
+        fields.append(QgsField("depth_from", QVariant.Double))
+        fields.append(QgsField("depth_to", QVariant.Double))
+        f = QgsFeature(fields)
+        f.setAttribute("depth_from", None)                      # NULL vero, come nel layer
+        f.setAttribute("depth_to", None)
+        ctx.setFields(fields)
+        ctx.setFeature(f)
+        expr.prepare(ctx)
+        self.assertEqual(expr.evaluate(ctx), 100)                # NULL: resta visibile
+        f.setAttribute("depth_from", 0.5)
+        f.setAttribute("depth_to", 0.6)
+        ctx.setFeature(f)
+        self.assertEqual(expr.evaluate(ctx), 12)
+        f.setAttribute("depth_from", 0.15)
+        f.setAttribute("depth_to", 0.6)                          # a cavallo del bordo
+        ctx.setFeature(f)
+        self.assertEqual(expr.evaluate(ctx), 100)
+
+    def test_band_filter_with_no_layers_does_nothing(self):
+        self.assertEqual(self.harness.set_radargram_band_filter((0.0, 1.0)), 0)
+        self.assertFalse(self.harness.radargram_band_filter_active())
+
     def test_modal_dialog_is_off_by_default_on_the_plugin(self):
         h = self.harness
         h._init_trace_capture()

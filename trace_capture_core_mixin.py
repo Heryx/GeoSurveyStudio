@@ -248,6 +248,11 @@ class TraceCaptureCoreMixin:
             ("class_code", QVariant.String, 64),
             ("class_label", QVariant.String, 128),
             ("confidence", QVariant.String, 16),
+            ("length_m", QVariant.Double, 0),
+            ("width_m", QVariant.Double, 0),
+            ("area_m2", QVariant.Double, 0),
+            ("amp_rms", QVariant.Double, 0),
+            ("contrast_db", QVariant.Double, 0),
         )
         provider = layer.dataProvider()
         if provider is not None:
@@ -1181,6 +1186,21 @@ class TraceCaptureCoreMixin:
         "class_code", "class_label", "confidence", "anomaly_id", "interpretation", "notes", "comment",
     )
 
+    _RADARGRAM_METRIC_FIELDS = ("length_m", "width_m", "area_m2", "amp_rms", "contrast_db")
+
+    @classmethod
+    def _radargram_metric_values(cls, metrics):
+        """Solo i campi numerici delle metriche; un valore mancante resta NULL."""
+        out = {}
+        for name in cls._RADARGRAM_METRIC_FIELDS:
+            value = (metrics or {}).get(name)
+            try:
+                value = float(value)
+                out[name] = value if math.isfinite(value) else None
+            except (TypeError, ValueError):
+                out[name] = None
+        return out
+
     def _radargram_vertex_attributes(self, verts):
         """Attributi che dipendono solo dai vertici (profondita', tempo, ampiezza).
 
@@ -1215,7 +1235,8 @@ class TraceCaptureCoreMixin:
 
     def capture_radargram_feature(self, kind, variant_name, profile_stem, channel, epsg, vertices,
                                    velocity_m_ns=None, rdp=None, class_code=None, class_label=None,
-                                   confidence=None, attributes=None, trace_id=None, source=None):
+                                   confidence=None, attributes=None, trace_id=None, source=None,
+                                   metrics=None):
         """Crea una feature (punto/linea/poligono) disegnata sul radargramma.
 
         Chiamata dal `feature_sink` passato a `RadargramDock`: i vertici arrivano
@@ -1233,7 +1254,9 @@ class TraceCaptureCoreMixin:
         ricreare una feature cancellata con lo stesso identificativo (annulla).
         `source` dice come e' nata: "radargramma" (disegnata a mano, default) o
         "iperbole_fit" (punto salvato dal fit dell'iperbole: `velocity_m_ns`/`rdp`
-        sono allora quelli del fit e il pannello ne ridisegna la curva).
+        sono allora quelli del fit e il pannello ne ridisegna la curva). `metrics`
+        porta le misure calcolate dal pannello (`_RADARGRAM_METRIC_FIELDS`: lunghezza,
+        larghezza, area, RMS d'ampiezza, contrasto in dB).
         """
         geom_kind = str(kind or "").strip().lower()
         if geom_kind not in ("point", "line", "polygon"):
@@ -1279,6 +1302,7 @@ class TraceCaptureCoreMixin:
         for name, value in (attributes or {}).items():
             if name in self._RADARGRAM_EDITABLE_ATTRS and value is not None:
                 values[name] = str(value)
+        values.update(self._radargram_metric_values(metrics))
         for name, value in values.items():
             idx = layer.fields().indexOf(name)
             if idx >= 0:
@@ -1336,13 +1360,15 @@ class TraceCaptureCoreMixin:
             except Exception:
                 pass
 
-    def update_radargram_feature(self, trace_id, vertices=None, epsg=None, attributes=None):
+    def update_radargram_feature(self, trace_id, vertices=None, epsg=None, attributes=None, metrics=None):
         """Modifica una geometria gia' disegnata: vertici e/o attributi di testo.
 
         Con `vertices` (stesso formato di `capture_radargram_feature`, `epsg` del
         profilo) cambiano geometria, profondita' e tempo; il tipo (punto/linea/
         poligono) non cambia mai. `attributes` accetta solo i campi in
-        `_RADARGRAM_EDITABLE_ATTRS`.
+        `_RADARGRAM_EDITABLE_ATTRS`. `metrics` (se dato) riscrive tutte le misure:
+        quelle non presenti nel dizionario tornano NULL, cosi' non restano valori
+        vecchi di una geometria che e' cambiata.
         """
         found = self._find_radargram_feature(trace_id)
         if found is None:
@@ -1370,6 +1396,11 @@ class TraceCaptureCoreMixin:
             idx = layer.fields().indexOf(name)
             if name in self._RADARGRAM_EDITABLE_ATTRS and idx >= 0:
                 attr_changes[idx] = "" if value is None else str(value)
+        if metrics is not None:
+            for name, value in self._radargram_metric_values(metrics).items():
+                idx = layer.fields().indexOf(name)
+                if idx >= 0:
+                    attr_changes[idx] = value
         if attr_changes and not provider.changeAttributeValues({fid: attr_changes}):
             raise RuntimeError("Il layer ha rifiutato i nuovi attributi.")
         self._after_radargram_feature_change(layer)
@@ -1409,13 +1440,16 @@ class TraceCaptureCoreMixin:
             return pts
         return []
 
-    def query_radargram_features(self, variant_name, profile_stem, channel):
+    def query_radargram_features(self, variant_name, profile_stem, channel, all_profiles=False):
         """Feature gia' disegnate sul radargramma per (variante, profilo, canale).
 
         Usata da RadargramDock (via `feature_query`) per ridisegnarle come overlay
         persistente quando si torna su un profilo/canale gia' digitalizzato -
-        vedi `_load_current`/`_redraw` in gpr_radargram_dock.py. Ritorna
-        `[{"kind": "point"|"line"|"polygon", "vertices": [{"east","north","depth_m"}]}]`.
+        vedi `_load_current`/`_redraw` in gpr_radargram_dock.py. Con
+        `all_profiles=True` ignora profilo e canale e restituisce tutta la variante
+        (profili vicini proiettati, tabella delle anomalie). Ritorna
+        `[{"kind": "point"|"line"|"polygon", "vertices": [{"east","north","depth_m"}], ...}]`
+        con anche id, classe, testi, profilo/canale, fascia di profondita' e metriche.
         """
         try:
             channel_i = int(channel) if channel is not None else None
@@ -1450,9 +1484,9 @@ class TraceCaptureCoreMixin:
                 if idx_stem < 0:
                     continue
                 for feat in lyr.getFeatures():
-                    if str(feat.attribute(idx_stem) or "") != stem:
+                    if not all_profiles and str(feat.attribute(idx_stem) or "") != stem:
                         continue
-                    if channel_i is not None and idx_ch >= 0:
+                    if not all_profiles and channel_i is not None and idx_ch >= 0:
                         try:
                             if int(feat.attribute(idx_ch)) != channel_i:
                                 continue
@@ -1488,6 +1522,11 @@ class TraceCaptureCoreMixin:
                         "source": text_attr(feat, "source"),
                         "velocity_m_ns": num_attr(feat, "velocity_m_ns"),
                         "rdp": num_attr(feat, "rdp"),
+                        "profile_stem": text_attr(feat, "profile_stem"),
+                        "channel": int(num_attr(feat, "channel")) if num_attr(feat, "channel") is not None else None,
+                        "depth_from": num_attr(feat, "depth_from"),
+                        "depth_to": num_attr(feat, "depth_to"),
+                        "metrics": {name: num_attr(feat, name) for name in self._RADARGRAM_METRIC_FIELDS},
                         "vertices": [
                             {"east": float(p.x()), "north": float(p.y()), "depth_m": d, "twt_ns": t, "amp": a}
                             for p, d, t, a in zip(pts, depths, twts, amps)
@@ -1495,4 +1534,74 @@ class TraceCaptureCoreMixin:
                     })
                 break   # un solo layer per nome nel progetto
         return out
+
+    # Su mappa le annotazioni fuori dalla fascia della time-slice si attenuano: e' solo
+    # una regola di visualizzazione (opacita' guidata da espressione), i dati e le
+    # query del pannello non cambiano. Attivata/disattivata dal pannello Radargrammi.
+    _RADARGRAM_BAND_OUT_OPACITY = 12      # % di opacita' fuori fascia
+
+    @staticmethod
+    def _radargram_band_expression(z_from, z_to):
+        z0, z1 = sorted((float(z_from), float(z_to)))
+        return ('CASE WHEN "depth_from" IS NULL OR "depth_to" IS NULL '
+                f'OR ("depth_to" >= {z0:.6f} AND "depth_from" <= {z1:.6f}) THEN 100 '
+                f'ELSE {TraceCaptureCoreMixin._RADARGRAM_BAND_OUT_OPACITY} END')
+
+    def set_radargram_band_filter(self, band):
+        """Attenua sulla mappa le annotazioni fuori dalla fascia di profondita' `band`
+        (z_da, z_a); con `band=None` ripristina la visualizzazione normale. Ritorna
+        quanti layer sono stati aggiornati."""
+        from qgis.core import QgsProperty, QgsSymbol
+        expr = None if band is None else self._radargram_band_expression(band[0], band[1])
+        done = 0
+        for layer_name in _RADARGRAM_TRACE_LAYER_NAMES.values():
+            for lyr in QgsProject.instance().mapLayers().values():
+                if not (isinstance(lyr, QgsVectorLayer) and lyr.isValid() and lyr.name() == layer_name):
+                    continue
+                renderer = lyr.renderer()
+                symbol = renderer.symbol() if renderer is not None and hasattr(renderer, "symbol") else None
+                if symbol is None:
+                    break
+                try:
+                    if expr is None:
+                        symbol.setDataDefinedProperty(QgsSymbol.PropertyOpacity, QgsProperty())
+                    else:
+                        symbol.setDataDefinedProperty(QgsSymbol.PropertyOpacity, QgsProperty.fromExpression(expr))
+                    self._set_radargram_label_band(lyr, expr)
+                    lyr.triggerRepaint()
+                    done += 1
+                except Exception:
+                    pass
+                break
+        return done
+
+    @staticmethod
+    def _set_radargram_label_band(layer, expr):
+        """Anche le etichette seguono la fascia (una etichetta fuori fascia non si vede)."""
+        from qgis.core import QgsProperty
+        labeling = layer.labeling()
+        if labeling is None or not hasattr(labeling, "settings"):
+            return
+        settings = labeling.settings()
+        props = settings.dataDefinedProperties()
+        if expr is None:
+            props.setProperty(QgsPalLayerSettings.Show, QgsProperty())
+        else:
+            cond = expr.replace(" THEN 100 ELSE %d END" % TraceCaptureCoreMixin._RADARGRAM_BAND_OUT_OPACITY,
+                                " THEN 1 ELSE 0 END")
+            props.setProperty(QgsPalLayerSettings.Show, QgsProperty.fromExpression(cond))
+        settings.setDataDefinedProperties(props)
+        layer.setLabeling(QgsVectorLayerSimpleLabeling(settings))
+
+    def radargram_band_filter_active(self):
+        """True se almeno un layer delle annotazioni ha la regola di fascia attiva."""
+        from qgis.core import QgsSymbol
+        for layer_name in _RADARGRAM_TRACE_LAYER_NAMES.values():
+            for lyr in QgsProject.instance().mapLayers().values():
+                if isinstance(lyr, QgsVectorLayer) and lyr.isValid() and lyr.name() == layer_name:
+                    renderer = lyr.renderer()
+                    symbol = renderer.symbol() if renderer is not None and hasattr(renderer, "symbol") else None
+                    if symbol is not None and symbol.dataDefinedProperties().isActive(QgsSymbol.PropertyOpacity):
+                        return True
+        return False
 

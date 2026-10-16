@@ -410,3 +410,31 @@ Verificato solo offscreen (test automatici). Da provare in QGIS:
    "Etichette" mostra il codice anomalia vicino all'annotazione.
 5. **Tooltip**: fermando il puntatore su un'annotazione (senza strumenti attivi, o in
    Modifica) compaiono classe, affidabilità, codice, interpretazione, note, profondità.
+
+## Annotazioni sul radargramma, Fase 3 (2026-10-16)
+
+Verificato solo offscreen (test automatici). Da provare in QGIS, in particolare il punto 4:
+
+1. **Metriche**: disegnare una linea e un rettangolo di attenuazione. La scheda mostra
+   lunghezza o area e, per i poligoni, il **contrasto in dB** (negativo = zona più
+   «spenta» del suo intorno; riferimento = le stesse righe sui due lati, larghi quanto
+   la zona). Nella tabella attributi: `length_m`, `width_m`, `area_m2`, `amp_rms`,
+   `contrast_db`; spostando un vertice si ricalcolano, Ctrl+Z le ripristina.
+2. **Profili vicini** (menu Mostra → Profili vicini → entro 0,5/1/2 m): sul radargramma
+   compaiono puntini sbiaditi, nel colore della classe, dove le annotazioni degli altri
+   profili (e degli altri canali) passano vicino a questo profilo; il codice anomalia è
+   l'etichetta. Selezionando un'annotazione con un codice, quelle degli altri profili con
+   lo stesso codice risaltano. Verificare con un muro segnato su due profili.
+3. **Anomalie…**: tabella con una riga per codice (annotazioni, profili, classi, fascia di
+   profondità, contrasto medio); doppio clic = apre il profilo e seleziona l'annotazione;
+   «Esporta CSV…» (separatore «;»). La scheda propone i codici già usati e mostra
+   «M12: 4 annot. su 3 profili».
+4. **Mappa: attenua fuori dalla fascia time-slice** (menu Mostra): con «Segui time-slice»
+   attivo e una time-slice selezionata, sulla mappa le annotazioni fuori dalla fascia di
+   profondità diventano quasi trasparenti (12%), anche le etichette spariscono; cambiando
+   time-slice la fascia segue; spegnendo la voce (o chiudendo il pannello) tutto torna
+   normale. Non cambia i dati. **È l'unica parte che non ho potuto vedere nemmeno
+   offscreen**: se non attenua, il rendering guidato da espressione va rivisto.
+5. **Esporta figura annotata…** (menu ⋯): PNG/PDF/SVG del radargramma nella vista attuale,
+   con annotazioni visibili, etichette, legenda delle sole classi presenti, titolo con
+   variante/profilo/canale e velocità.
