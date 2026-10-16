@@ -384,3 +384,29 @@ fluidità del trascinamento vanno provati in QGIS.
    progetto -> le classi restano (`<progetto>/metadata/annotation_classes.json`).
 5. Il vecchio dialogo "codice anomalia/note" dopo ogni disegno è ora spento
    (`trace_radargram_prompt_after_draw = False`): confermare che la scheda basta.
+
+## Annotazioni sul radargramma, Fase 2 (2026-10-16)
+
+Verificato solo offscreen (test automatici). Da provare in QGIS:
+
+1. **Iperbole annotata**: strumento "Iperbole", clic sull'apice, rotellina fino a far
+   combaciare la curva, poi **"Annota"**. **Atteso**: compare un punto giallo (classe
+   «Iperbole di diffrazione») con la curva tratteggiata; la scheda mostra
+   "v=… m/ns, εr=…, top a … m". In QGIS (tabella di "Radargram Points") `velocity_m_ns`
+   e `rdp` sono quelli del fit, `source = iperbole_fit`, la profondità è quella del top
+   dell'oggetto (non quella mostrata sul radargramma). Riaprendo il profilo la curva
+   si ridisegna; cambiando la velocità del profilo resta sul segnale.
+2. **Rettangolo**: premere `3` (attenuazione), poi "Rettangolo": due clic su angoli
+   opposti salvano un poligono a 4 vertici. Premendo `3`/`4` restando in Rettangolo la
+   modalità non cambia.
+3. **Aggancia**: spuntarlo e cliccare vicino a un riflettore netto: il vertice si
+   appoggia al picco (o ventre) di fase più vicino entro ~0,8 ns; vale anche
+   trascinando un vertice in Modifica. **Maiusc+clic** in Linea/Poligono: i vertici fra
+   il punto precedente e il nuovo seguono la fase del riflettore (max 40).
+   Se il riflettore è debole/discontinuo il tracciamento può non seguirlo: va provato
+   sui dati veri (SUASA) e, se serve, regolata la finestra (`_SNAP_NS`).
+4. **Mostra**: il menu elenca le classi coi colori (è la legenda); togliere una classe
+   o un livello di affidabilità la nasconde (e non si può più selezionare);
+   "Etichette" mostra il codice anomalia vicino all'annotazione.
+5. **Tooltip**: fermando il puntatore su un'annotazione (senza strumenti attivi, o in
+   Modifica) compaiono classe, affidabilità, codice, interpretazione, note, profondità.

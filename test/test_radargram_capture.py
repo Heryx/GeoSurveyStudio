@@ -467,6 +467,20 @@ class CaptureRadargramFeatureTest(unittest.TestCase):
         self.assertEqual([f["id"] for f in back], [tid])
         self.assertEqual(back[0]["class_code"], "riflettore")
 
+    def test_source_defaults_to_radargramma_and_a_fitted_hyperbola_keeps_its_own(self):
+        h = self.harness
+        h.capture_radargram_feature(**self._two_vertices())
+        h.capture_radargram_feature(
+            kind="point", variant_name="Lavoro", profile_stem="Swath2", channel=0, epsg=32632,
+            vertices=[{"east": 500000.5, "north": 10.0, "depth_m": 0.12, "twt_ns": 2.4}],
+            velocity_m_ns=0.08, rdp=14.06, class_code="iperbole", source="iperbole_fit")
+        found = {f["kind"]: f for f in h.query_radargram_features("Lavoro", "Swath2", 0)}
+        self.assertEqual(found["line"]["source"], "radargramma")
+        self.assertEqual(found["point"]["source"], "iperbole_fit")
+        self.assertAlmostEqual(found["point"]["velocity_m_ns"], 0.08, places=6)
+        self.assertAlmostEqual(found["point"]["rdp"], 14.06, places=6)
+        self.assertEqual(found["point"]["vertices"][0]["twt_ns"], 2.4)
+
     def test_modal_dialog_is_off_by_default_on_the_plugin(self):
         h = self.harness
         h._init_trace_capture()

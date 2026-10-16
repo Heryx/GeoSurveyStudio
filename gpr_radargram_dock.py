@@ -49,6 +49,7 @@ from qgis.PyQt.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -85,6 +86,7 @@ from .gpr_annotation_classes import (
     CONFIDENCE_LEVELS,
     DEFAULT_CONFIDENCE,
     GEOMETRY_LABELS,
+    UNCLASSIFIED_COLOR,
     class_by_code,
     color_for,
     label_for,
@@ -92,6 +94,7 @@ from .gpr_annotation_classes import (
     save_classes,
 )
 from .gpr_annotation_classes_dialog import AnnotationClassesDialog, color_icon
+from .gpr_annotation_tools import local_extremum_row, trace_between
 from .gpr_material_presets import material_preset
 from .gpr_training_export import export_variant_for_training
 
@@ -114,6 +117,8 @@ _SETTINGS = "GeoSurveyStudio/radargram_dock/"
 _HIT_PX = 9                     # raggio (pixel) entro cui un clic "prende" un vertice o una linea
 _MIN_VERTICES = {"point": 1, "line": 2, "polygon": 3}
 _UNDO_LIMIT = 100
+_SNAP_NS = 0.8                  # finestra (+-ns) in cui l'aggancio cerca il picco di fase piu' vicino
+_FOLLOW_MAX_VERTICES = 40       # Maiusc+clic: tetto ai vertici intermedi di un tratto tracciato
 _MAX_DISPLAY_COLS = 6000        # oltre, il radargramma si mostra decimato (media a blocchi)
 _CURSOR_MAP_DELAY_MS = 50
 _HYPER_VEL_STEP_MNS = 0.002     # passo per tacca di rotellina nello strumento "Calcola con iperbole"
@@ -451,7 +456,12 @@ class RadargramDock(QDockWidget):
         # Geometrie gia' salvate su questo profilo/canale, ridisegnate come overlay
         # persistente (non solo durante il disegno attivo) - vedi _refresh_persisted_features.
         self._persisted_artists: list = []
+        self._persisted_extra: list = []   # curve delle iperboli ed etichette (non una per annotazione)
         self._features: list = []          # record delle annotazioni mostrate (vedi _load_features)
+        self._hidden_classes: set = set()  # classi nascoste dal menu "Mostra" ("" = non classificato)
+        self._hidden_conf: set = set()     # livelli di affidabilita' nascosti
+        self._show_labels = True
+        self._hover_id: str | None = None
 
         # Classi di segnale (iperbole, riflettore, attenuazione...): scelte prima di
         # disegnare, con i tasti 1-9; ognuna ha colore e geometria di default.
@@ -648,6 +658,17 @@ class RadargramDock(QDockWidget):
         self._btn_draw_polygon = _draw_btn("Poligono", "polygon",
             "Disegna un poligono (es. il contorno di un'anomalia): un clic per\n"
             "vertice (almeno 3), poi 'Termina' (o Invio) per chiudere il contorno.")
+        self._btn_draw_rect = _draw_btn("Rettangolo", "rect",
+            "Disegna un rettangolo (es. una zona di attenuazione): un clic su un angolo,\n"
+            "un secondo clic sull'angolo opposto e si salva come poligono a 4 vertici.")
+        self._chk_snap = QCheckBox("Aggancia")
+        self._chk_snap.setChecked(str(QSettings().value(_SETTINGS + "snap", "0")) in ("1", "true", "True"))
+        self._chk_snap.setToolTip(
+            "Ogni vertice si appoggia al picco (o ventre) di fase più vicino sulla traccia, entro\n"
+            "circa 0,8 ns: i riflettori si seguono senza cercare il massimo a occhio.\n"
+            "Con Maiusc+clic su Linea/Poligono i vertici tra il punto precedente e il nuovo\n"
+            "seguono da soli la fase del riflettore.")
+        self._chk_snap.toggled.connect(self._on_snap_toggled)
         self._btn_draw_undo = _tool("⌫", "Rimuovi l'ultimo vertice (Backspace)")
         self._btn_draw_undo.clicked.connect(self._undo_draw_vertex)
         self._btn_draw_finish = _tool("✓", "Termina e salva la geometria (Invio)")
@@ -673,7 +694,8 @@ class RadargramDock(QDockWidget):
         tools.addWidget(_group(QLabel("Segnale"), self._cb_class, self._btn_classes,
                                QLabel("Affidabilità"), self._cb_conf))
         tools.addWidget(_group(
-            QLabel("Disegna"), self._btn_draw_point, self._btn_draw_line, self._btn_draw_polygon))
+            QLabel("Disegna"), self._btn_draw_point, self._btn_draw_line, self._btn_draw_polygon,
+            self._btn_draw_rect, self._chk_snap))
         self._grp_draw_ctx = _group(self._btn_draw_undo, self._btn_draw_finish, self._btn_draw_cancel)
         tools.addWidget(self._grp_draw_ctx)
         self._btn_edit = QPushButton("Modifica")
@@ -689,7 +711,11 @@ class RadargramDock(QDockWidget):
         self._btn_undo.clicked.connect(self._undo_annotation)
         self._btn_redo = _tool("↷", "Ripeti la modifica annullata (Ctrl+Y)")
         self._btn_redo.clicked.connect(self._redo_annotation)
-        tools.addWidget(_group(self._btn_edit, self._btn_undo, self._btn_redo))
+        self._btn_show = QPushButton("Mostra")
+        self._btn_show.setToolTip(
+            "Quali annotazioni vedere: per classe e per affidabilità, con o senza etichette.\n"
+            "Il menu è anche la legenda dei colori.")
+        tools.addWidget(_group(self._btn_edit, self._btn_undo, self._btn_redo, self._btn_show))
         tools.addWidget(_sep())
 
         self._spin_vel_mns = QDoubleSpinBox()
@@ -721,15 +747,22 @@ class RadargramDock(QDockWidget):
         self._btn_hyper.toggled.connect(self._on_hyper_toggled)
         self._btn_hyper.toggled.connect(self._update_tool_context)
         self._btn_hyper_save = QPushButton("Salva")
-        self._btn_hyper_save.setEnabled(False)
+        self._set_hyper_save_enabled(False)
         self._btn_hyper_save.setToolTip("Salva il valore calcolato con l'iperbole come velocità preimpostata del profilo.")
         self._btn_hyper_save.clicked.connect(self._save_hyper_fit_as_preset)
+        self._btn_hyper_note = QPushButton("Annota")
+        self._btn_hyper_note.setEnabled(False)
+        self._btn_hyper_note.setToolTip(
+            "Salva l'iperbole come annotazione (classe «Iperbole di diffrazione»): punto all'apice con\n"
+            "velocità, εr e profondità del top dell'oggetto calcolate dal fit. La curva si ridisegna\n"
+            "ogni volta che riapri il profilo.")
+        self._btn_hyper_note.clicked.connect(self._save_hyper_fit_as_annotation)
         self._btn_vel_clear = _tool("✕", "Pulisci l'apice dell'iperbole")
         self._btn_vel_clear.clicked.connect(self._clear_hyper_apex)
         self._lbl_vel = QLabel("v=n/d")
         self._lbl_vel.setToolTip("Velocità (m/ns) e permittività dielettrica (εr).")
         tools.addWidget(_group(QLabel("Velocità"), self._spin_vel_mns, self._btn_vel, self._btn_hyper))
-        self._grp_hyper_ctx = _group(self._btn_hyper_save, self._btn_vel_clear, self._lbl_vel)
+        self._grp_hyper_ctx = _group(self._btn_hyper_save, self._btn_hyper_note, self._btn_vel_clear, self._lbl_vel)
         tools.addWidget(self._grp_hyper_ctx)
 
         # Riga 3: scheda dell'annotazione selezionata (visibile solo con una selezione).
@@ -1135,7 +1168,7 @@ class RadargramDock(QDockWidget):
         self._hyper_apex = None
         self._hyper_v_mns = None
         self._hyper_locked = False
-        self._btn_hyper_save.setEnabled(False)
+        self._set_hyper_save_enabled(False)
         self._vel_apex = None
         self._sel_id = None              # la selezione e il trascinamento valgono per il canale mostrato
         self._edit_drag = None
@@ -1205,12 +1238,14 @@ class RadargramDock(QDockWidget):
         self._hyper_locked = False
         self._vel_apex = None
         self._persisted_artists = []
+        self._persisted_extra = []
         self._features = []
         self._sel_id = None
         self._edit_drag = None
+        self._hover_id = None
         self._card.setVisible(False)
         if getattr(self, "_btn_hyper_save", None) is not None:
-            self._btn_hyper_save.setEnabled(False)
+            self._set_hyper_save_enabled(False)
         self._blit.set_artists([])
         self._canvas.draw_idle()
         self._show_message(text)
@@ -1563,12 +1598,14 @@ class RadargramDock(QDockWidget):
             return
         if self._edit_drag is not None:
             self._edit_drag_to(event)
+        else:
+            self._update_hover(event)
         self._cursor_x, self._cursor_z = float(event.xdata), float(event.ydata)
         self._vline.set_xdata([self._cursor_x, self._cursor_x])
         self._vline.set_visible(True)
         self._hline.set_ydata([self._cursor_z, self._cursor_z])
         self._hline.set_visible(True)
-        if self._draw_mode in ("line", "polygon") and self._draw_vertices:
+        if self._draw_mode in ("line", "polygon", "rect") and self._draw_vertices:
             self._refresh_draw_preview(cursor_xz=(self._cursor_x, self._cursor_z), blit=False)
         if self._vel_mode_active:
             self._refresh_vel_popup(cursor_xz=(self._cursor_x, self._cursor_z), blit=False)
@@ -1577,6 +1614,7 @@ class RadargramDock(QDockWidget):
         self._map_timer.start()
 
     def _on_axes_leave(self, _event) -> None:
+        self._clear_hover()
         if self._vline is not None:
             self._vline.set_visible(False)
             self._hline.set_visible(False)
@@ -1590,7 +1628,8 @@ class RadargramDock(QDockWidget):
         self._canvas.setFocus()
         if event.button == 1:
             if self._draw_mode is not None:
-                self._add_draw_vertex(float(event.xdata), float(event.ydata))
+                shift = "shift" in str(getattr(event, "key", "") or "").split("+")
+                self._add_draw_vertex(float(event.xdata), float(event.ydata), follow=shift)
             elif self._edit_mode:
                 self._edit_press(event)
             elif self._hyper_mode_active:
@@ -1750,30 +1789,106 @@ class RadargramDock(QDockWidget):
         self._draw_vertices = []
         self._refresh_draw_preview(blit=True)
 
-    def _add_draw_vertex(self, x_m: float, z_m: float) -> None:
+    def _make_vertex(self, x_m: float, depth: float):
+        """Vertice di disegno (traccia piu' vicina, coordinate reali, ampiezza, tempo); None se
+        la geometria di quella traccia non e' valida."""
+        ch = self._cur
+        trace = ch.trace_at_distance(x_m)
+        pos = ch.position(trace)
+        if pos is None:
+            return None
+        depth = float(np.clip(depth, 0.0, ch.depth_max_m))
+        amp = ch.amplitude_at(trace, ch.row_at_depth(depth))
+        return {"x_m": float(x_m), "depth_m": depth, "trace": int(trace),
+                "east": float(pos[0]), "north": float(pos[1]),
+                "amp": amp if np.isfinite(amp) else None,
+                "twt_ns": self._depth_to_twt(depth)}
+
+    def _snap_half_window(self) -> int:
+        dt = self._dt_ns()
+        return max(1, int(round(_SNAP_NS / dt))) if dt > 0 else 2
+
+    def _snap_depth(self, trace: int, depth: float) -> float:
+        """Profondita' del picco (o ventre) di fase piu' vicino sulla traccia: il vertice si
+        appoggia al riflettore invece di restare dove e' caduto il clic."""
+        ch = self._cur
+        row = ch.row_at_depth(depth)
+        snapped = local_extremum_row(ch.data[:, trace], row, self._snap_half_window())
+        if snapped == row:
+            return float(depth)
+        return float(np.clip((snapped + 0.5) * ch.dz_m, 0.0, ch.depth_max_m))
+
+    def _follow_vertices(self, prev: dict, trace: int, depth: float) -> list:
+        """Vertici intermedi che seguono la fase del riflettore da `prev` alla nuova traccia
+        (Maiusc+clic): al massimo `_FOLLOW_MAX_VERTICES`, mai l'ultimo (e' quello cliccato)."""
+        ch = self._cur
+        n_tr = abs(int(trace) - int(prev["trace"]))
+        if n_tr < 2:
+            return []
+        step = max(2, int(math.ceil(n_tr / float(_FOLLOW_MAX_VERTICES))))
+        path = trace_between(
+            ch.data, prev["trace"], ch.row_at_depth(prev["depth_m"]), trace, ch.row_at_depth(depth),
+            self._snap_half_window(), step=step)
+        out = []
+        for t, row in path[1:-1]:
+            v = self._make_vertex(float(ch.dist[t]), (row + 0.5) * ch.dz_m)
+            if v is not None:
+                out.append(v)
+        return out
+
+    def _add_draw_vertex(self, x_m: float, z_m: float, follow: bool = False) -> None:
         ch = self._cur
         if ch is None:
             return
         trace = ch.trace_at_distance(x_m)
-        pos = ch.position(trace)
-        if pos is None:
+        depth = float(np.clip(z_m, 0.0, ch.depth_max_m))
+        if (self._chk_snap.isChecked() and self._draw_mode != "rect"
+                and ch.position(trace) is not None):
+            depth = self._snap_depth(trace, depth)
+        vertex = self._make_vertex(x_m, depth)
+        if vertex is None:
             self._show_message("Geometria non disponibile per questo punto del profilo: scartato.")
             return
-        east, north = pos
-        depth = float(np.clip(z_m, 0.0, ch.depth_max_m))
-        row = ch.row_at_depth(depth)
-        amp = ch.amplitude_at(trace, row)
         if not self._draw_vertices and self._sel_id is not None:
             self._select_feature(None)         # si comincia una nuova annotazione: la scheda precedente si chiude
-        self._draw_vertices.append({
-            "x_m": float(x_m), "depth_m": depth, "trace": int(trace),
-            "east": float(east), "north": float(north),
-            "amp": amp if np.isfinite(amp) else None,
-            "twt_ns": self._depth_to_twt(depth),
-        })
+        if self._draw_mode == "rect":
+            self._add_rect_corner(vertex)
+            return
+        if follow and self._draw_mode in ("line", "polygon") and self._draw_vertices:
+            self._draw_vertices.extend(self._follow_vertices(self._draw_vertices[-1], trace, depth))
+        self._draw_vertices.append(vertex)
         self._refresh_draw_preview(blit=True)
         if self._draw_mode == "point":
             self._finalize_drawn_feature()
+
+    def _rect_corners(self, a: dict, b: dict):
+        """I quattro angoli (senso orario sullo schermo) del rettangolo con diagonale a-b."""
+        xs, zs = (a["x_m"], b["x_m"]), (a["depth_m"], b["depth_m"])
+        x0, x1, z0, z1 = min(xs), max(xs), min(zs), max(zs)
+        corners = []
+        for x, z in ((x0, z0), (x1, z0), (x1, z1), (x0, z1)):
+            v = self._make_vertex(x, z)
+            if v is None:
+                return None
+            corners.append(v)
+        return corners
+
+    def _add_rect_corner(self, vertex: dict) -> None:
+        """Rettangolo: il primo clic fissa un angolo, il secondo l'angolo opposto e salva."""
+        if not self._draw_vertices:
+            self._draw_vertices.append(vertex)
+            self._refresh_draw_preview(blit=True)
+            return
+        a = self._draw_vertices[0]
+        if abs(vertex["x_m"] - a["x_m"]) < 1e-9 or abs(vertex["depth_m"] - a["depth_m"]) < 1e-9:
+            self._show_message("Il rettangolo ha larghezza o altezza nulla: scegli un angolo opposto.")
+            return
+        corners = self._rect_corners(a, vertex)
+        if corners is None:
+            self._show_message("Geometria non disponibile per questo punto del profilo: scartato.")
+            return
+        self._draw_vertices = corners
+        self._finalize_drawn_feature()
 
     def _undo_draw_vertex(self) -> None:
         if self._draw_vertices:
@@ -1798,6 +1913,22 @@ class RadargramDock(QDockWidget):
         if line is None:
             return
         verts = self._draw_vertices
+        if self._draw_mode == "rect" and verts and fill is not None:
+            a = verts[0]
+            if cursor_xz is None:
+                line.set_data([a["x_m"]], [a["depth_m"]])
+                fill.set_visible(False)
+            else:
+                x0, x1 = sorted((a["x_m"], float(cursor_xz[0])))
+                z0, z1 = sorted((a["depth_m"], float(cursor_xz[1])))
+                ring = [(x0, z0), (x1, z0), (x1, z1), (x0, z1)]
+                line.set_data([p[0] for p in ring] + [x0], [p[1] for p in ring] + [z0])
+                fill.set_xy(ring)
+                fill.set_visible(True)
+            line.set_visible(True)
+            if blit and self._blit is not None:
+                self._blit.update()
+            return
         if not verts:
             line.set_data([], [])
             line.set_visible(False)
@@ -1833,10 +1964,14 @@ class RadargramDock(QDockWidget):
     def _finalize_drawn_feature(self) -> None:
         mode = self._draw_mode
         verts = list(self._draw_vertices)
-        min_needed = {"point": 1, "line": 2, "polygon": 3}.get(mode or "", 2)
+        min_needed = {"point": 1, "line": 2, "polygon": 3, "rect": 4}.get(mode or "", 2)
         if mode is None or len(verts) < min_needed:
-            self._show_message(f"Servono almeno {min_needed} vertici per completare la geometria.")
+            self._show_message(
+                "Il rettangolo si chiude col secondo clic sull'angolo opposto."
+                if mode == "rect" else
+                f"Servono almeno {min_needed} vertici per completare la geometria.")
             return
+        kind = "polygon" if mode == "rect" else mode      # il rettangolo e' un poligono a 4 vertici
         new_id = None
         if self._feature_sink is None:
             self._show_message("Salvataggio non disponibile: apri questo pannello da GeoSurvey Studio.")
@@ -1846,7 +1981,7 @@ class RadargramDock(QDockWidget):
             cls = class_by_code(self._classes, self._cur_class)
             try:
                 result = self._feature_sink(
-                    kind=mode,
+                    kind=kind,
                     variant_name=self._store.name,
                     profile_stem=info.stem,
                     channel=int(self._ci),
@@ -1859,7 +1994,7 @@ class RadargramDock(QDockWidget):
                     confidence=self._cur_conf,
                 )
                 new_id = self._result_feature_id(result)
-                what = cls["label"] if cls else mode
+                what = cls["label"] if cls else kind
                 self._show_message(f"{what}: {len(verts)} vertici salvati nel layer.")
             except Exception as exc:
                 self._show_message(f"Errore nel salvataggio della geometria: {exc}")
@@ -1883,9 +2018,12 @@ class RadargramDock(QDockWidget):
         return ""
 
     @staticmethod
-    def _vertices_payload(verts) -> list:
+    def _vertices_payload(verts, depth_scale: float = 1.0) -> list:
+        """Vertici nel formato del ponte verso il layer. `depth_scale` serve ai punti di un'iperbole
+        misurata: la profondita' mostrata e' quella alla velocita' del profilo, quella salvata
+        (top dell'oggetto) e' quella alla velocita' del fit."""
         return [
-            {"east": v["east"], "north": v["north"], "depth_m": v["depth_m"],
+            {"east": v["east"], "north": v["north"], "depth_m": v["depth_m"] * depth_scale,
              "amp": v.get("amp"), "twt_ns": v.get("twt_ns")}
             for v in verts
         ]
@@ -2070,7 +2208,7 @@ class RadargramDock(QDockWidget):
         self._hyper_apex = None
         self._hyper_v_mns = None
         self._hyper_locked = False
-        self._btn_hyper_save.setEnabled(False)
+        self._set_hyper_save_enabled(False)
         self._lbl_vel.setText("v=n/d")
         self._refresh_hyper_overlay(blit=True)
 
@@ -2095,6 +2233,64 @@ class RadargramDock(QDockWidget):
         self._show_message(f"Velocità salvata come preimpostato per {stem}: {v_mns:.4f} m/ns (εr={rdp:.2f}).")
         self._load_current(reset_view=False, keep_y=True)
 
+    def _set_hyper_save_enabled(self, on: bool) -> None:
+        """Abilita insieme "Salva" (preimpostato) e "Annota" (annotazione) del fit iperbole."""
+        for name in ("_btn_hyper_save", "_btn_hyper_note"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.setEnabled(bool(on))
+
+    def _save_hyper_fit_as_annotation(self) -> None:
+        """Salva l'iperbole misurata come annotazione di classe "Iperbole di diffrazione".
+
+        Punto all'apice: profondita' del top dell'oggetto con la velocita' del fit
+        (z_apice * v_fit / v_rif), tempo doppio dell'apice, velocita' ed eps_r del fit.
+        La curva si ridisegna da sola riaprendo il profilo (vedi `_draw_persisted`).
+        """
+        if self._hyper_apex is None or self._hyper_v_mns is None or self._cur is None or self._store is None:
+            self._show_message("Fissa prima l'apice dell'iperbole (clic sul radargramma).")
+            return
+        if self._feature_sink is None:
+            self._show_message("Salvataggio non disponibile: apri questo pannello da GeoSurvey Studio.")
+            return
+        x0, z0 = self._hyper_apex
+        v_mns = float(self._hyper_v_mns)
+        v_fit = m_ns_to_velocity_m_s(v_mns)
+        rdp = velocity_to_rdp(v_fit)
+        top = float(z0) * v_fit / max(self._reference_velocity_m_s(), 1e-9)
+        vertex = self._make_vertex(x0, z0)
+        if vertex is None:
+            self._show_message("Geometria non disponibile per questo punto del profilo.")
+            return
+        vertex["depth_m"] = top
+        cls = (class_by_code(self._classes, "iperbole")
+               or next((c for c in self._classes if c["geometry"] == "point"), None))
+        info = self._store.profiles[self._pi]
+        try:
+            result = self._feature_sink(
+                kind="point", variant_name=self._store.name, profile_stem=info.stem,
+                channel=int(self._ci), epsg=int(info.epsg or 0), vertices=self._vertices_payload([vertex]),
+                velocity_m_ns=v_mns, rdp=rdp,
+                class_code=cls["code"] if cls else "", class_label=cls["label"] if cls else "",
+                confidence=self._cur_conf,
+                attributes={"interpretation": f"v={v_mns:.3f} m/ns, εr={rdp:.1f}, top a {top:.2f} m"},
+                source="iperbole_fit")
+        except Exception as exc:
+            self._show_message(f"Errore nel salvataggio dell'iperbole: {exc}")
+            return
+        self._show_message(
+            f"Iperbole annotata: v={v_mns:.4f} m/ns, εr={rdp:.2f}, top a {top:.2f} m.")
+        new_id = self._result_feature_id(result)
+        self._clear_hyper_apex()
+        if new_id:
+            self._after_feature_created(new_id)
+
+    def _on_snap_toggled(self, on: bool) -> None:
+        try:
+            QSettings().setValue(_SETTINGS + "snap", "1" if on else "0")
+        except Exception:
+            pass
+
     def _refresh_hyper_overlay(self, blit: bool = True) -> None:
         curve, marker = self._vel_curve_line, self._vel_apex_marker
         if curve is None or marker is None:
@@ -2103,7 +2299,7 @@ class RadargramDock(QDockWidget):
         if apex is None or self._hyper_v_mns is None:
             curve.set_visible(False)
             marker.set_visible(False)
-            self._btn_hyper_save.setEnabled(False)
+            self._set_hyper_save_enabled(False)
             if blit and self._blit is not None:
                 self._blit.update()
             return
@@ -2113,7 +2309,7 @@ class RadargramDock(QDockWidget):
         v_ref = self._reference_velocity_m_s()
         v_fit = m_ns_to_velocity_m_s(float(self._hyper_v_mns))
         rdp = velocity_to_rdp(v_fit)
-        self._btn_hyper_save.setEnabled(True)
+        self._set_hyper_save_enabled(True)
         lock_txt = "  (bloccato)" if self._hyper_locked else ""
         self._lbl_vel.setText(f"v={self._hyper_v_mns:.4f} m/ns  εr={rdp:.2f}{lock_txt}")
         ch = self._cur
@@ -2184,9 +2380,16 @@ class RadargramDock(QDockWidget):
                 })
             if len(pts) != len(verts) or not pts:
                 continue
+            source = str(feat.get("source") or "")
+            rec_ctx = dict(ctx)
+            v_fit = feat.get("velocity_m_ns")
+            if source == "iperbole_fit" and v_fit:
+                rec_ctx["depth_scale"] = (m_ns_to_velocity_m_s(float(v_fit))
+                                          / max(self._reference_velocity_m_s(), 1e-9))
             self._features.append({
                 "id": str(feat.get("id") or ""),
                 "kind": feat.get("kind"),
+                "source": source,
                 "class_code": str(feat.get("class_code") or ""),
                 "class_label": str(feat.get("class_label") or ""),
                 "confidence": str(feat.get("confidence") or ""),
@@ -2196,25 +2399,29 @@ class RadargramDock(QDockWidget):
                 "velocity_m_ns": feat.get("velocity_m_ns"),
                 "rdp": feat.get("rdp"),
                 "pts": pts,
-                "ctx": dict(ctx),
+                "ctx": rec_ctx,
             })
 
     def _draw_persisted(self) -> None:
         """Disegna come overlay statico (non blit-managed: si ricostruisce a ogni
         _redraw) le annotazioni gia' salvate, ognuna col colore della sua classe.
         L'annotazione selezionata si disegna a parte, con gli artisti animati."""
-        for artist in self._persisted_artists:
+        for artist in self._persisted_artists + self._persisted_extra:
             try:
                 artist.remove()
             except Exception:
                 pass
         self._persisted_artists = []
+        self._persisted_extra = []
         if self._ax is None or self._cur is None:
             return
         for rec in self._features:
-            if self._sel_id is not None and rec["id"] == self._sel_id:
+            if not self._feature_visible(rec):
                 continue
             color = color_for(self._classes, rec["class_code"])
+            self._draw_feature_extras(rec, color)
+            if self._sel_id is not None and rec["id"] == self._sel_id:
+                continue
             xs = [p["x_m"] for p in rec["pts"]]
             zs = [p["depth_m"] for p in rec["pts"]]
             kind = rec["kind"]
@@ -2230,10 +2437,137 @@ class RadargramDock(QDockWidget):
                 (artist,) = self._ax.plot(xs, zs, color=color, lw=1.6, alpha=0.95, zorder=5)
             self._persisted_artists.append(artist)
 
+    def _draw_feature_extras(self, rec, color: str) -> None:
+        """Curva dell'iperbole misurata (tratteggiata) ed etichetta col codice anomalia."""
+        ch = self._cur
+        pts = rec["pts"]
+        if rec.get("source") == "iperbole_fit" and rec["kind"] == "point" and rec.get("velocity_m_ns"):
+            v_ref = max(self._reference_velocity_m_s(), 1e-9)
+            v_fit = m_ns_to_velocity_m_s(float(rec["velocity_m_ns"]))
+            xs = np.linspace(0.0, max(ch.length_m, 1e-6), 400, dtype=np.float64)
+            t0 = 2.0 * float(pts[0]["depth_m"]) / v_ref
+            zs = hyperbola_curve_depth(xs - float(pts[0]["x_m"]), t0, v_fit, v_ref, 0.0)
+            ok = np.isfinite(zs) & (zs >= 0.0) & (zs <= ch.depth_max_m * 1.02)
+            if ok.any():
+                (curve,) = self._ax.plot(xs[ok], zs[ok], color=color, ls="--", lw=1.2, alpha=0.85, zorder=4)
+                self._persisted_extra.append(curve)
+        if self._show_labels and rec.get("anomaly_id"):
+            top = min(pts, key=lambda p: p["depth_m"])
+            text = self._ax.annotate(
+                rec["anomaly_id"], xy=(top["x_m"], top["depth_m"]), xytext=(6, -3),
+                textcoords="offset points", fontsize=7, color="#111111", zorder=8,
+                bbox=dict(boxstyle="round,pad=0.15", fc="#ffffff", ec=color, lw=0.8, alpha=0.85))
+            self._persisted_extra.append(text)
+
     def _refresh_persisted_features(self) -> None:
         """Rilegge dal layer e ridisegna le annotazioni (vedi `_load_features`)."""
         self._load_features()
         self._draw_persisted()
+
+    # -- filtri ("Mostra"), etichette, tooltip ----------------------------------------------
+
+    def _feature_visible(self, rec) -> bool:
+        if rec["class_code"] in self._hidden_classes:
+            return False
+        return not (rec["confidence"] and rec["confidence"] in self._hidden_conf)
+
+    def _rebuild_show_menu(self) -> None:
+        btn = getattr(self, "_btn_show", None)
+        if btn is None:
+            return
+        menu = QMenu(btn)
+        act = menu.addAction("Etichette (codice anomalia)")
+        act.setCheckable(True)
+        act.setChecked(self._show_labels)
+        act.toggled.connect(self._on_labels_toggled)
+        menu.addSeparator()
+        entries = [(c["label"], c["code"], c["color"]) for c in self._classes]
+        entries.append(("Non classificato", "", UNCLASSIFIED_COLOR))
+        for label, code, color in entries:
+            act = menu.addAction(color_icon(color), label)
+            act.setCheckable(True)
+            act.setChecked(code not in self._hidden_classes)
+            act.toggled.connect(lambda on, c=code: self._on_show_class(c, on))
+        menu.addSeparator()
+        for code, label in CONFIDENCE_LEVELS:
+            act = menu.addAction(f"Affidabilità: {label}")
+            act.setCheckable(True)
+            act.setChecked(code not in self._hidden_conf)
+            act.toggled.connect(lambda on, c=code: self._on_show_conf(c, on))
+        menu.addSeparator()
+        menu.addAction("Mostra tutto").triggered.connect(self._show_all)
+        btn.setMenu(menu)
+        self._show_menu = menu           # Qt non tiene il possesso: se lo perdo il menu sparisce
+
+    def _on_labels_toggled(self, on: bool) -> None:
+        self._show_labels = bool(on)
+        self._redraw_annotations()
+
+    def _on_show_class(self, code: str, on: bool) -> None:
+        (self._hidden_classes.discard if on else self._hidden_classes.add)(code)
+        self._redraw_annotations()
+
+    def _on_show_conf(self, code: str, on: bool) -> None:
+        (self._hidden_conf.discard if on else self._hidden_conf.add)(code)
+        self._redraw_annotations()
+
+    def _show_all(self) -> None:
+        self._hidden_classes.clear()
+        self._hidden_conf.clear()
+        self._rebuild_show_menu()
+        self._redraw_annotations()
+
+    def _redraw_annotations(self) -> None:
+        """Ridisegna overlay, selezione e scheda dai record gia' letti (senza rileggere il layer)."""
+        rec = self._selected_rec()
+        if rec is not None and not self._feature_visible(rec):
+            self._sel_id = None
+            self._edit_drag = None
+        self._hover_id = None
+        self._draw_persisted()
+        self._refresh_edit_artists(blit=False)
+        self._populate_card()
+        self._update_tool_context()
+        if self._blit is not None:
+            self._blit.invalidate()
+        if self._canvas is not None:
+            self._canvas.draw_idle()
+
+    def _feature_tooltip(self, rec) -> str:
+        label = label_for(self._classes, rec["class_code"])
+        conf = next((l for c, l in CONFIDENCE_LEVELS if c == rec["confidence"]), "")
+        lines = [f"{label} · {conf}" if conf else label]
+        if rec["anomaly_id"]:
+            lines.append(f"Codice: {rec['anomaly_id']}")
+        if rec["interpretation"]:
+            lines.append(rec["interpretation"])
+        if rec["notes"]:
+            lines.append(rec["notes"])
+        zs = [p["depth_m"] for p in rec["pts"]]
+        scale = float(rec["ctx"].get("depth_scale", 1.0))
+        lo, hi = min(zs) * scale, max(zs) * scale
+        lines.append(f"prof. {lo:.2f} m" if abs(hi - lo) < 0.005 else f"prof. {lo:.2f}–{hi:.2f} m")
+        return "\n".join(lines)
+
+    def _clear_hover(self) -> None:
+        if self._hover_id is not None:
+            self._hover_id = None
+            QToolTip.hideText()
+
+    def _update_hover(self, event) -> None:
+        """Tooltip con classe, codice, note e profondita' passando sopra un'annotazione."""
+        idle = (self._draw_mode is None and not self._vel_mode_active
+                and not self._hyper_mode_active and self._edit_drag is None and self._pan is None)
+        fid = self._hit_feature(float(event.x), float(event.y)) if idle else None
+        if fid == self._hover_id:
+            return
+        self._hover_id = fid
+        rec = next((r for r in self._features if r["id"] == fid), None) if fid else None
+        if rec is None:
+            QToolTip.hideText()
+            return
+        pos = self._canvas.mapToGlobal(QPoint(int(event.x), int(self._canvas.height() - event.y)))
+        QToolTip.showText(pos, self._feature_tooltip(rec), self._canvas)
 
     # ------------------------------------------------------------------
     # Tempo doppio <-> profondita'
@@ -2299,6 +2633,7 @@ class RadargramDock(QDockWidget):
         for cls in self._classes:
             card.addItem(color_icon(cls["color"]), cls["label"], cls["code"])
         card.blockSignals(False)
+        self._rebuild_show_menu()
 
     def _on_class_activated(self, i: int) -> None:
         code = self._cb_class.itemData(i)
@@ -2334,7 +2669,10 @@ class RadargramDock(QDockWidget):
         except Exception:
             pass
         if arm and not self._draw_vertices:
-            btn = self._draw_mode_buttons.get(cls["geometry"])
+            geometry = cls["geometry"]
+            if geometry == "polygon" and self._draw_mode == "rect":
+                geometry = "rect"           # chi sta disegnando rettangoli (attenuazione) continua cosi'
+            btn = self._draw_mode_buttons.get(geometry)
             if btn is not None and not btn.isChecked():
                 btn.setChecked(True)
         self._show_message(f"Segnale: {cls['label']}")
@@ -2494,7 +2832,7 @@ class RadargramDock(QDockWidget):
     def _hit_feature(self, ex: float, ey: float):
         best = None
         for rec in self._features:
-            if not rec["id"]:
+            if not rec["id"] or not self._feature_visible(rec):
                 continue
             hit = self._feature_hit(rec, ex, ey)
             if hit is not None and (best is None or hit < best[0]):
@@ -2536,6 +2874,10 @@ class RadargramDock(QDockWidget):
         p = rec["pts"][drag["index"]]
         p["x_m"] = float(np.clip(event.xdata, 0.0, max(ch.length_m, 1e-6)))
         p["depth_m"] = float(np.clip(event.ydata, 0.0, ch.depth_max_m))
+        if self._chk_snap.isChecked():
+            trace = ch.trace_at_distance(p["x_m"])
+            if ch.position(trace) is not None:
+                p["depth_m"] = self._snap_depth(trace, p["depth_m"])
         self._refresh_edit_artists(blit=False)
 
     def _edit_finish_drag(self) -> None:
@@ -2595,7 +2937,9 @@ class RadargramDock(QDockWidget):
             self._show_message("Modifica non disponibile: apri questo pannello da GeoSurvey Studio.")
             return False
         try:
-            self._feature_update(fid, vertices=self._vertices_payload(pts), epsg=ctx["epsg"])
+            self._feature_update(
+                fid, vertices=self._vertices_payload(pts, float(ctx.get("depth_scale", 1.0))),
+                epsg=ctx["epsg"])
             return True
         except Exception as exc:
             self._show_message(f"Errore nella modifica: {exc}")
@@ -2683,10 +3027,11 @@ class RadargramDock(QDockWidget):
         try:
             self._feature_sink(
                 kind=snap["kind"], variant_name=ctx["variant_name"], profile_stem=ctx["profile_stem"],
-                channel=ctx["channel"], epsg=ctx["epsg"], vertices=self._vertices_payload(snap["pts"]),
+                channel=ctx["channel"], epsg=ctx["epsg"],
+                vertices=self._vertices_payload(snap["pts"], float(ctx.get("depth_scale", 1.0))),
                 velocity_m_ns=snap.get("velocity_m_ns"), rdp=snap.get("rdp"),
                 class_code=snap["class_code"], class_label=snap["class_label"],
-                confidence=snap["confidence"], trace_id=snap["id"],
+                confidence=snap["confidence"], trace_id=snap["id"], source=snap.get("source") or None,
                 attributes={k: snap[k] for k in ("anomaly_id", "interpretation", "notes")})
             ok = True
         except Exception as exc:

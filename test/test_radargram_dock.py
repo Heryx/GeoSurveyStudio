@@ -1045,6 +1045,7 @@ class _FakeAnnotationLayer:
         self.n += 1
         fid = kw.get("trace_id") or f"tr_fake_{self.n}"
         rec = {"id": fid, "kind": kw["kind"], "variant": kw["variant_name"], "stem": kw["profile_stem"],
+               "source": kw.get("source") or "radargramma",
                "channel": kw["channel"], "velocity_m_ns": kw.get("velocity_m_ns"), "rdp": kw.get("rdp"),
                "class_code": kw.get("class_code") or "", "class_label": kw.get("class_label") or "",
                "confidence": kw.get("confidence") or "", "anomaly_id": "", "interpretation": "", "notes": "",
@@ -1489,6 +1490,394 @@ class AnnotationTest(_DockBase):
         self.assertEqual(d._result_feature_id(fake_feat), "tr_x")
         self.assertEqual(d._result_feature_id({"id": "tr_y"}), "tr_y")
         self.assertEqual(d._result_feature_id(None), "")
+
+
+def _wavelet(n, center, width=2.0):
+    x = np.arange(n, dtype=np.float64)
+    return np.exp(-0.5 * ((x - center) / width) ** 2)
+
+
+@unittest.skipUnless(HAS_ENV, "QGIS/matplotlib non disponibili")
+class AnnotationToolsTest(_DockBase):
+    """Rettangolo, aggancio al picco, tracciamento (Maiusc+clic), iperbole annotata, filtri, tooltip."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = _FakeAnnotationLayer()
+        d = self.dock
+        d._feature_sink = self.fake.sink
+        d._feature_query = self.fake.query
+        d._feature_update = self.fake.update
+        d._feature_delete = self.fake.delete
+
+    def _ev(self, name, x_m, z_m, button=1, key=None):
+        cv = self.dock._canvas
+        cv.draw()
+        px, py = self.dock._ax.transData.transform((x_m, z_m))
+        return MouseEvent(name, cv, px, py, button=button, key=key)
+
+    def _key(self, key):
+        self.dock._on_key(types.SimpleNamespace(key=key))
+
+    def _press(self, x, z, **kw):
+        self.dock._on_mouse_press(self._ev("button_press_event", x, z, **kw))
+
+    def _release(self, x, z):
+        self.dock._on_mouse_release(self._ev("button_release_event", x, z))
+
+    def _move(self, x, z):
+        self.dock._on_mouse_move(self._ev("motion_notify_event", x, z))
+
+    def _draw(self, key, pts):
+        self._key(key)
+        for x, z in pts:
+            self._press(x, z)
+        self._key("enter")
+
+    def _only(self):
+        return next(iter(self.fake.items.values()))
+
+    # -- rettangolo ---------------------------------------------------------------------
+
+    def test_rectangle_takes_two_clicks_and_is_saved_as_a_four_vertex_polygon(self):
+        d = self.dock
+        self._key("3")                                  # attenuazione
+        d._btn_draw_rect.setChecked(True)
+        self.assertEqual(d._draw_mode, "rect")
+        self._press(2.5, 0.12)
+        self.assertEqual(len(d._draw_vertices), 1)
+        self._move(1.0, 0.05)
+        self.assertTrue(d._draw_preview_fill.get_visible())            # anteprima del rettangolo
+        self.assertEqual(len(d._draw_preview_line.get_xdata()), 5)
+        self.assertEqual(self.fake.items, {})                           # ancora nulla di salvato
+        self._press(1.0, 0.05)
+        rec = self._only()
+        self.assertEqual(rec["kind"], "polygon")
+        self.assertEqual(rec["class_code"], "attenuazione")
+        self.assertEqual(len(rec["vertices"]), 4)
+        zs = sorted({round(v["depth_m"], 3) for v in rec["vertices"]})
+        self.assertEqual(zs, [0.05, 0.12])
+        self.assertEqual(d._draw_mode, "rect")                          # pronto per il prossimo
+        self.assertEqual(d._draw_vertices, [])
+
+    def test_rectangle_with_no_width_or_height_is_refused(self):
+        d = self.dock
+        d._btn_draw_rect.setChecked(True)
+        self._press(1.0, 0.05)
+        self._press(2.0, 0.05)                          # stessa profondita'
+        self.assertEqual(self.fake.items, {})
+        self.assertEqual(len(d._draw_vertices), 1)
+        self.assertIn("nulla", d._lbl_status.text())
+
+    def test_class_key_keeps_rectangle_mode_for_polygon_classes_and_escape_cancels(self):
+        d = self.dock
+        d._btn_draw_rect.setChecked(True)
+        self._key("3")
+        self.assertEqual(d._draw_mode, "rect")
+        self._key("4")                                  # anomalia di ampiezza: poligono
+        self.assertEqual(d._draw_mode, "rect")
+        self._press(1.0, 0.05)
+        self._key("escape")
+        self.assertEqual(d._draw_vertices, [])
+        self.assertIsNone(d._draw_mode)
+
+    def test_finishing_a_rectangle_early_says_how_to_close_it(self):
+        d = self.dock
+        d._btn_draw_rect.setChecked(True)
+        self._press(1.0, 0.05)
+        self._key("enter")
+        self.assertIn("secondo clic", d._lbl_status.text())
+
+    # -- aggancio al picco --------------------------------------------------------------
+
+    def _peak_trace(self, x, row=20):
+        ch = self.dock._cur
+        t = ch.trace_at_distance(x)
+        ch.data[:, t] = _wavelet(ch.data.shape[0], row).astype(ch.data.dtype)
+        return t
+
+    def test_snap_is_off_by_default_and_remembered(self):
+        from qgis.PyQt.QtCore import QSettings
+        d = self.dock
+        self.assertFalse(d._chk_snap.isChecked())
+        d._chk_snap.setChecked(True)
+        self.assertEqual(str(QSettings().value("GeoSurveyStudio/radargram_dock/snap")), "1")
+
+    def test_snap_moves_the_vertex_to_the_nearest_phase_peak(self):
+        d = self.dock
+        ch = d._cur
+        self._peak_trace(1.5)
+        clicked = (20 - 3 + 0.5) * ch.dz_m
+        self._key("1")
+        self._press(1.5, clicked)                       # senza aggancio: resta dove e' caduto
+        self.assertAlmostEqual(self._only()["vertices"][0]["depth_m"], clicked, places=6)
+        self.fake.items.clear()
+        d._chk_snap.setChecked(True)
+        self._press(1.5, clicked)
+        self.assertAlmostEqual(self._only()["vertices"][0]["depth_m"], (20 + 0.5) * ch.dz_m, places=6)
+
+    def test_snap_leaves_the_vertex_alone_when_there_is_no_peak_nearby(self):
+        d = self.dock
+        ch = d._cur
+        t = ch.trace_at_distance(1.5)
+        ch.data[:, t] = np.linspace(0, 1, ch.data.shape[0]).astype(ch.data.dtype)    # monotono
+        d._chk_snap.setChecked(True)
+        self._key("1")
+        self._press(1.5, 0.1)
+        self.assertAlmostEqual(self._only()["vertices"][0]["depth_m"], 0.1, places=6)
+
+    def test_snap_applies_while_dragging_a_vertex_in_edit_mode(self):
+        d = self.dock
+        ch = d._cur
+        self._peak_trace(2.5, row=24)
+        self._draw("2", [(1.0, 0.05), (2.0, 0.10)])
+        rid = self._only()["id"]
+        d._btn_edit.setChecked(True)
+        d._select_feature(None)
+        self._press(1.5, 0.075)
+        self._release(1.5, 0.075)
+        d._chk_snap.setChecked(True)
+        self._press(2.0, 0.10)
+        self._move(2.5, (24 - 2 + 0.5) * ch.dz_m)
+        self._release(2.5, (24 - 2 + 0.5) * ch.dz_m)
+        self.assertAlmostEqual(self.fake.items[rid]["vertices"][1]["depth_m"], (24 + 0.5) * ch.dz_m, places=6)
+
+    # -- Maiusc+clic: tracciamento del riflettore ---------------------------------------
+
+    def test_shift_click_follows_the_reflector_between_two_clicks(self):
+        d = self.dock
+        ch = d._cur
+        t0, t1 = ch.trace_at_distance(1.0), ch.trace_at_distance(3.0)
+        centre = lambda t: 15 + 0.2 * (t - t0)
+        for t in range(t0, t1 + 1):
+            ch.data[:, t] = _wavelet(ch.data.shape[0], centre(t)).astype(ch.data.dtype)
+        self._key("2")
+        self._press(1.0, (15 + 0.5) * ch.dz_m)
+        self._press(3.0, (centre(t1) + 0.5) * ch.dz_m, key="shift")
+        self._key("enter")
+        verts = self._only()["vertices"]
+        self.assertGreater(len(verts), 3)               # i vertici intermedi sono stati aggiunti
+        self.assertLessEqual(len(verts), 2 + _DOCK._FOLLOW_MAX_VERTICES)
+        depths = [v["depth_m"] for v in verts]
+        self.assertAlmostEqual(depths[0], (15 + 0.5) * ch.dz_m, places=6)
+        self.assertAlmostEqual(depths[-1], (round(centre(t1)) + 0.5) * ch.dz_m, delta=ch.dz_m)
+        self.assertTrue(all(b >= a - 1e-9 for a, b in zip(depths, depths[1:])))   # il riflettore scende
+
+    def test_plain_click_adds_only_the_clicked_vertex(self):
+        d = self.dock
+        self._draw("2", [(1.0, 0.05), (3.0, 0.10)])
+        self.assertEqual(len(self._only()["vertices"]), 2)
+
+    # -- iperbole annotata ------------------------------------------------------------
+
+    def _fit_hyperbola(self, x=2.0, z=0.08, dv=-0.02):
+        d = self.dock
+        d._btn_hyper.setChecked(True)
+        self._press(x, z)
+        d._adjust_hyper_velocity(dv)
+        return d._hyper_v_mns
+
+    def test_annotate_button_follows_the_apex(self):
+        d = self.dock
+        d._btn_hyper.setChecked(True)
+        self.assertFalse(d._btn_hyper_note.isEnabled())
+        self._press(2.0, 0.08)
+        self.assertTrue(d._btn_hyper_note.isEnabled())
+        d._clear_hyper_apex()
+        self.assertFalse(d._btn_hyper_note.isEnabled())
+
+    def test_hyperbola_is_saved_as_an_annotation_with_velocity_and_true_top_depth(self):
+        d = self.dock
+        v_mns = self._fit_hyperbola()
+        v_ref = d._reference_velocity_m_s()
+        d._btn_hyper_note.click()
+        rec = self._only()
+        self.assertEqual(rec["source"], "iperbole_fit")
+        self.assertEqual(rec["kind"], "point")
+        self.assertEqual(rec["class_code"], "iperbole")
+        self.assertAlmostEqual(rec["velocity_m_ns"], v_mns, places=6)
+        self.assertGreater(rec["rdp"], 1.0)
+        self.assertIn("top a", rec["interpretation"])
+        vx = rec["vertices"][0]
+        z0 = 0.08                                            # profondita' mostrata dell'apice (clic)
+        self.assertAlmostEqual(vx["depth_m"], z0 * (v_mns * 1e9) / v_ref, places=6)
+        self.assertAlmostEqual(vx["twt_ns"], d._depth_to_twt(z0), places=6)
+        self.assertIsNone(d._hyper_apex)                    # apice pulito: niente duplicati
+        self.assertEqual(d._sel_id, rec["id"])
+
+    def test_annotated_hyperbola_redraws_its_curve_and_survives_a_velocity_change(self):
+        d = self.dock
+        self._fit_hyperbola()
+        d._btn_hyper_note.click()
+        d._select_feature(None)
+        curves = [a for a in d._persisted_extra if a.get_linestyle() == "--"]
+        self.assertEqual(len(curves), 1)
+        xs, zs = curves[0].get_data()
+        self.assertGreater(len(xs), 10)
+        self.assertAlmostEqual(min(zs), d._features[0]["pts"][0]["depth_m"], delta=0.005)   # il minimo e' l'apice
+        d._spin_vel_mns.setValue(0.05)
+        curves = [a for a in d._persisted_extra if a.get_linestyle() == "--"]
+        self.assertEqual(len(curves), 1)
+
+    def test_manual_point_has_no_curve(self):
+        d = self.dock
+        self._draw("1", [(2.0, 0.08)])
+        d._select_feature(None)
+        self.assertEqual([a for a in d._persisted_extra if a.get_linestyle() == "--"], [])
+
+    def test_moving_a_fitted_hyperbola_keeps_the_true_depth_scale(self):
+        d = self.dock
+        v_mns = self._fit_hyperbola()
+        d._btn_hyper_note.click()
+        rid = self._only()["id"]
+        scale = (v_mns * 1e9) / d._reference_velocity_m_s()
+        d._btn_edit.setChecked(True)
+        d._select_feature(rid)
+        self._press(2.0, 0.08)
+        self._move(2.5, 0.10)
+        self._release(2.5, 0.10)
+        self.assertAlmostEqual(self.fake.items[rid]["vertices"][0]["depth_m"], 0.10 * scale, places=2)
+
+    def test_deleting_and_restoring_a_fitted_hyperbola_keeps_its_source_and_fit(self):
+        d = self.dock
+        v_mns = self._fit_hyperbola()
+        d._btn_hyper_note.click()
+        rid = self._only()["id"]
+        before = dict(self._only())
+        d._btn_edit.setChecked(True)
+        d._select_feature(rid)
+        self._key("delete")
+        self.assertEqual(self.fake.items, {})
+        self._key("ctrl+z")
+        back = self.fake.items[rid]
+        self.assertEqual(back["source"], "iperbole_fit")
+        self.assertAlmostEqual(back["velocity_m_ns"], v_mns, places=6)
+        self.assertAlmostEqual(back["vertices"][0]["depth_m"], before["vertices"][0]["depth_m"], places=6)
+
+    def test_annotating_without_an_apex_or_a_sink_says_so(self):
+        d = self.dock
+        d._save_hyper_fit_as_annotation()
+        self.assertIn("apice", d._lbl_status.text())
+        d._btn_hyper.setChecked(True)
+        self._press(2.0, 0.08)
+        d._feature_sink = None
+        d._save_hyper_fit_as_annotation()
+        self.assertIn("non disponibile", d._lbl_status.text())
+
+    # -- filtri, etichette, tooltip ---------------------------------------------------
+
+    def _two_features(self):
+        self._draw("2", [(1.0, 0.05), (2.0, 0.10)])
+        line_id = self._only()["id"]
+        self._draw("3", [(2.5, 0.14), (3.5, 0.14), (3.5, 0.22), (2.5, 0.22)])
+        poly_id = [k for k in self.fake.items if k != line_id][0]
+        self._key("escape")                             # fuori dal disegno
+        self.dock._select_feature(None)
+        return line_id, poly_id
+
+    def test_show_menu_lists_every_class_and_confidence_and_acts_as_a_legend(self):
+        d = self.dock
+        texts = [a.text() for a in d._btn_show.menu().actions() if not a.isSeparator()]
+        self.assertTrue(any("Etichette" in t for t in texts))
+        for cls in d._classes:
+            self.assertIn(cls["label"], texts)
+        self.assertIn("Non classificato", texts)
+        self.assertTrue(any("Certo" in t for t in texts))
+        self.assertIn("Mostra tutto", texts)
+        class_actions = [a for a in d._btn_show.menu().actions() if a.text() == d._classes[0]["label"]]
+        self.assertFalse(class_actions[0].icon().isNull())
+
+    def test_hiding_a_class_removes_its_overlay_and_makes_it_unselectable(self):
+        d = self.dock
+        line_id, poly_id = self._two_features()
+        self.assertEqual(len(d._persisted_artists), 2)
+        d._on_show_class("riflettore", False)
+        self.assertEqual(len(d._persisted_artists), 1)
+        px = d._ax.transData.transform((1.5, 0.075))
+        self.assertIsNone(d._hit_feature(float(px[0]), float(px[1])))
+        px2 = d._ax.transData.transform((3.0, 0.18))
+        self.assertEqual(d._hit_feature(float(px2[0]), float(px2[1])), poly_id)
+        d._show_all()
+        self.assertEqual(len(d._persisted_artists), 2)
+        self.assertTrue(all(a.isChecked() for a in d._btn_show.menu().actions() if a.isCheckable()))
+
+    def test_hiding_the_selected_class_deselects_it(self):
+        d = self.dock
+        line_id, _poly = self._two_features()
+        d._btn_edit.setChecked(True)
+        d._select_feature(line_id)
+        d._on_show_class("riflettore", False)
+        self.assertIsNone(d._sel_id)
+        self.assertTrue(d._card.isHidden())
+
+    def test_hiding_a_confidence_level_hides_those_annotations(self):
+        d = self.dock
+        self._two_features()
+        d._on_show_conf("probabile", False)               # tutte le annotazioni sono "probabile"
+        self.assertEqual(d._persisted_artists, [])
+        d._on_show_conf("probabile", True)
+        self.assertEqual(len(d._persisted_artists), 2)
+
+    def test_annotations_without_confidence_stay_visible_when_a_level_is_hidden(self):
+        d = self.dock
+        ch = d._cur
+        p0, p1 = ch.position(ch.trace_at_distance(1.0)), ch.position(ch.trace_at_distance(2.0))
+        self.fake.items["old"] = {
+            "id": "old", "kind": "line", "stem": d._store.profiles[d._pi].stem, "channel": d._ci,
+            "class_code": "", "class_label": "", "confidence": "", "anomaly_id": "", "interpretation": "",
+            "notes": "", "vertices": [{"east": p0[0], "north": p0[1], "depth_m": 0.05},
+                                      {"east": p1[0], "north": p1[1], "depth_m": 0.09}]}
+        d._refresh_persisted_features()
+        d._on_show_conf("certo", False)
+        d._on_show_conf("probabile", False)
+        d._on_show_conf("possibile", False)
+        self.assertEqual(len(d._persisted_artists), 1)
+
+    def test_labels_show_the_anomaly_code_and_can_be_switched_off(self):
+        d = self.dock
+        line_id, _poly = self._two_features()
+        d._btn_edit.setChecked(True)
+        d._select_feature(line_id)
+        d._ed_code.setText("M12")
+        d._on_card_text_finished()
+        d._select_feature(None)
+        texts = [a.get_text() for a in d._persisted_extra if hasattr(a, "get_text")]
+        self.assertEqual(texts, ["M12"])
+        d._on_labels_toggled(False)
+        self.assertEqual([a for a in d._persisted_extra if hasattr(a, "get_text")], [])
+
+    def test_tooltip_text_has_class_confidence_code_notes_and_depth(self):
+        d = self.dock
+        line_id, _poly = self._two_features()
+        d._btn_edit.setChecked(True)
+        d._select_feature(line_id)
+        d._ed_code.setText("M12")
+        d._ed_interp.setText("piano d'uso")
+        d._ed_notes.setText("continua a nord")
+        d._on_card_text_finished()
+        text = d._feature_tooltip(d._selected_rec())
+        for part in ("Riflettore / interfaccia", "Probabile", "M12", "piano d'uso", "continua a nord", "prof. "):
+            self.assertIn(part, text)
+
+    def test_hover_sets_and_clears_the_hovered_annotation(self):
+        d = self.dock
+        line_id, _poly = self._two_features()
+        self._move(1.5, 0.075)
+        self.assertEqual(d._hover_id, line_id)
+        self._move(4.5, 0.02)
+        self.assertIsNone(d._hover_id)
+        d._btn_draw_line.setChecked(True)                 # disegnando non ci sono tooltip
+        self._move(1.5, 0.075)
+        self.assertIsNone(d._hover_id)
+
+    def test_tooltip_depth_of_a_fitted_hyperbola_is_the_true_top(self):
+        d = self.dock
+        v_mns = self._fit_hyperbola()
+        d._btn_hyper_note.click()
+        rec = d._selected_rec()
+        scale = (v_mns * 1e9) / d._reference_velocity_m_s()
+        want = f"prof. {rec['pts'][0]['depth_m'] * scale:.2f} m"
+        self.assertIn(want, d._feature_tooltip(rec))
 
 
 @unittest.skipUnless(HAS_ENV, "QGIS/matplotlib non disponibili")

@@ -1215,7 +1215,7 @@ class TraceCaptureCoreMixin:
 
     def capture_radargram_feature(self, kind, variant_name, profile_stem, channel, epsg, vertices,
                                    velocity_m_ns=None, rdp=None, class_code=None, class_label=None,
-                                   confidence=None, attributes=None, trace_id=None):
+                                   confidence=None, attributes=None, trace_id=None, source=None):
         """Crea una feature (punto/linea/poligono) disegnata sul radargramma.
 
         Chiamata dal `feature_sink` passato a `RadargramDock`: i vertici arrivano
@@ -1231,6 +1231,9 @@ class TraceCaptureCoreMixin:
         e quanto e' sicura l'interpretazione; `attributes` porta gli altri campi di
         testo (vedi `_RADARGRAM_EDITABLE_ATTRS`) e `trace_id` permette di
         ricreare una feature cancellata con lo stesso identificativo (annulla).
+        `source` dice come e' nata: "radargramma" (disegnata a mano, default) o
+        "iperbole_fit" (punto salvato dal fit dell'iperbole: `velocity_m_ns`/`rdp`
+        sono allora quelli del fit e il pannello ne ridisegna la curva).
         """
         geom_kind = str(kind or "").strip().lower()
         if geom_kind not in ("point", "line", "polygon"):
@@ -1266,7 +1269,7 @@ class TraceCaptureCoreMixin:
             "channel": int(channel) if channel is not None else None,
             "velocity_m_ns": float(velocity_m_ns) if velocity_m_ns is not None else None,
             "rdp": float(rdp) if rdp is not None else None,
-            "source": "radargramma",
+            "source": str(source or "radargramma"),
             "anomaly_id": "",
             "class_code": str(class_code or ""),
             "class_label": str(class_label or ""),
@@ -1482,6 +1485,7 @@ class TraceCaptureCoreMixin:
                         "anomaly_id": text_attr(feat, "anomaly_id"),
                         "interpretation": text_attr(feat, "interpretation"),
                         "notes": text_attr(feat, "notes"),
+                        "source": text_attr(feat, "source"),
                         "velocity_m_ns": num_attr(feat, "velocity_m_ns"),
                         "rdp": num_attr(feat, "rdp"),
                         "vertices": [
