@@ -30,16 +30,21 @@ from qgis.PyQt.QtWidgets import (
     QComboBox,
     QDockWidget,
     QDoubleSpinBox,
+    QFormLayout,
+    QFrame,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPlainTextEdit,
-    QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
@@ -263,76 +268,92 @@ class FenceDock(QDockWidget):
         self._side = side
         sl = QVBoxLayout(side)
         sl.setContentsMargins(0, 0, 0, 0)
-        sl.addWidget(QLabel("Zone e processi GPR da mostrare"))
+        tabs = QTabWidget()
+        self._tabs = tabs
+        tabs.setUsesScrollButtons(False)
+        sl.addWidget(tabs)
+
+        # --- scheda "Dati": cosa caricare (1) e cosa mostrare (2) --------------------------------------------
+        data = QWidget()
+        dl = QVBoxLayout(data)
+        dl.setContentsMargins(4, 6, 4, 4)
+        dl.setSpacing(6)
+
+        box_src = QGroupBox("1 · Zone e processi GPR")
+        bl = QVBoxLayout(box_src)
+        bl.addWidget(self._hint("Spunta i processi di cui vuoi i profili; puoi sceglierne più d'uno."))
         self._src_tree = QTreeWidget()
         self._src_tree.setHeaderHidden(True)
-        self._src_tree.setMaximumHeight(130)
-        self._src_tree.setToolTip("Spunta le varianti processate (zona › processo) di cui vuoi i profili: "
-                                  "se ne possono vedere più insieme.")
+        self._src_tree.setMinimumHeight(60)
+        self._src_tree.setMaximumHeight(150)
+        self._src_tree.setToolTip("Varianti processate (zona › processo): ogni variante spuntata porta i suoi "
+                                  "profili nell'elenco qui sotto.")
         self._src_tree.itemChanged.connect(self._on_source_changed)
-        sl.addWidget(self._src_tree)
+        bl.addWidget(self._src_tree)
+        dl.addWidget(box_src)
+
+        box_items = QGroupBox("2 · Cosa mostrare")
+        il = QVBoxLayout(box_items)
+        il.addWidget(self._hint("Scorri con i cursori sotto la vista, oppure spunta a mano le voci."))
+        frow = QHBoxLayout()
         self._ed_filter = QLineEdit()
-        self._ed_filter.setPlaceholderText("Filtra i profili…")
+        self._ed_filter.setPlaceholderText("Filtra…")
+        self._ed_filter.setClearButtonEnabled(True)
+        self._ed_filter.setMinimumWidth(40)
         self._ed_filter.textChanged.connect(self._apply_filter)
-        sl.addWidget(self._ed_filter)
+        frow.addWidget(self._ed_filter, 1)
+        self._btn_pick = QToolButton()
+        self._btn_pick.setText("Spunta ▾")
+        self._btn_pick.setPopupMode(QToolButton.InstantPopup)
+        self._btn_pick.setToolTip("Spunta o toglie la spunta a più voci insieme (solo quelle visibili nel filtro).")
+        menu = QMenu(self._btn_pick)
+        menu.addAction("Tutti i profili GPR", lambda: self._check_kind("gpr", True))
+        menu.addAction("Nessun profilo GPR", lambda: self._check_kind("gpr", False))
+        menu.addSeparator()
+        menu.addAction("Togli tutte le spunte", lambda: [self._check_kind(k, False) for k in ("gpr", "ert", "slice")])
+        self._btn_pick.setMenu(menu)
+        frow.addWidget(self._btn_pick)
+        b_ert = QToolButton()
+        b_ert.setText("＋ ERT")
+        b_ert.setToolTip("Importa una sezione ERT invertita (CSV di ResIPY) e georiferiscila.")
+        b_ert.clicked.connect(self._import_ert)
+        frow.addWidget(b_ert)
+        il.addLayout(frow)
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(True)
         self._tree.itemChanged.connect(self._on_item_changed)
-        sl.addWidget(self._tree, 1)
-        row = QHBoxLayout()
-        for text, tip, slot in (("Tutti i GPR", "Spunta tutti i profili GPR visibili nel filtro.", lambda: self._check_kind("gpr", True)),
-                                ("Nessun GPR", "Toglie la spunta a tutti i profili GPR.", lambda: self._check_kind("gpr", False)),
-                                ("+ ERT", "Importa una sezione ERT invertita (CSV di ResIPY) e georiferiscila.", self._import_ert),
-                                ("↻", "Rilegge zone, varianti, profili GPR, sezioni ERT e time-slice.", self.refresh_variants)):
-            b = QPushButton(text)
-            b.setToolTip(tip)
-            b.clicked.connect(slot)
-            row.addWidget(b)
-        sl.addLayout(row)
+        il.addWidget(self._tree, 1)
+        dl.addWidget(box_items, 1)
+        tabs.addTab(data, "Dati")
 
-        form = QWidget()
-        fl = QVBoxLayout(form)
-        fl.setContentsMargins(0, 0, 0, 0)
-
-        def _line(label, widget):
-            r = QHBoxLayout()
-            r.addWidget(QLabel(label))
-            r.addWidget(widget, 1)
-            fl.addLayout(r)
-
+        # --- scheda "Aspetto" -------------------------------------------------------------------------------
         self._spin_ch = QSpinBox()
         self._spin_ch.setRange(0, 63)
         self._spin_ch.setToolTip("Canale del profilo GPR mostrato (uno per profilo).")
         self._spin_ch.valueChanged.connect(self._schedule)
-        _line("Canale GPR", self._spin_ch)
         self._spin_gain = QDoubleSpinBox()
         self._spin_gain.setRange(0.2, 30.0)
         self._spin_gain.setSingleStep(0.5)
         self._spin_gain.setValue(1.7)
         self._spin_gain.valueChanged.connect(self._schedule)
-        _line("Gain GPR", self._spin_gain)
         self._cb_gpr = QComboBox()
         self._cb_gpr.addItems(_GPR_CMAPS)
         self._cb_gpr.currentIndexChanged.connect(self._schedule)
-        _line("Palette GPR", self._cb_gpr)
         self._cb_ert = QComboBox()
         self._cb_ert.addItems(_ERT_CMAPS)
         self._cb_ert.currentIndexChanged.connect(self._schedule)
-        _line("Palette ERT", self._cb_ert)
         self._cb_slice = QComboBox()
         self._cb_slice.addItem("Stile del file", "")
         for name in _SLICE_CMAPS:
             self._cb_slice.addItem(name, name)
         self._cb_slice.setToolTip("Palette delle time-slice: lo stile salvato nel raster oppure una palette a scelta.")
         self._cb_slice.currentIndexChanged.connect(self._schedule)
-        _line("Palette slice", self._cb_slice)
         self._spin_slice_op = QDoubleSpinBox()
         self._spin_slice_op.setRange(0.1, 1.0)
         self._spin_slice_op.setSingleStep(0.05)
         self._spin_slice_op.setValue(0.85)
         self._spin_slice_op.setToolTip("Opacità dei piani delle time-slice: più bassa, meglio si vedono i profili sotto.")
         self._spin_slice_op.valueChanged.connect(self._schedule)
-        _line("Opacità slice", self._spin_slice_op)
         self._spin_depth = QDoubleSpinBox()
         self._spin_depth.setRange(0.0, 100.0)
         self._spin_depth.setSpecialValueText("tutta")
@@ -341,36 +362,58 @@ class FenceDock(QDockWidget):
         self._spin_depth.setValue(0.0)
         self._spin_depth.setToolTip("Profondità massima mostrata, uguale per GPR ed ERT (0 = tutta).")
         self._spin_depth.valueChanged.connect(self._schedule)
-        _line("Profondità max", self._spin_depth)
         self._spin_ve = QDoubleSpinBox()
         self._spin_ve.setRange(0.5, 20.0)
         self._spin_ve.setSingleStep(0.5)
         self._spin_ve.setValue(2.0)
         self._spin_ve.setToolTip("Esagerazione verticale: le profondità sono piccole rispetto alla lunghezza dei profili.")
         self._spin_ve.valueChanged.connect(self._apply_scale)
-        _line("Esagerazione Z", self._spin_ve)
         self._chk_labels = QCheckBox("Nomi dei profili")
         self._chk_labels.setChecked(True)
         self._chk_labels.toggled.connect(self._schedule)
-        fl.addWidget(self._chk_labels)
-        self._chk_cross = QCheckBox("Incroci GPR × ERT")
+
+        look = QWidget()
+        ll = QVBoxLayout(look)
+        ll.setContentsMargins(4, 6, 4, 4)
+        ll.setSpacing(6)
+        ll.addWidget(self._form_box("Radargrammi GPR", [("Canale", self._spin_ch), ("Gain", self._spin_gain),
+                                                        ("Palette", self._cb_gpr)]))
+        ll.addWidget(self._form_box("Sezioni ERT", [("Palette", self._cb_ert)]))
+        ll.addWidget(self._form_box("Time-slice", [("Palette", self._cb_slice), ("Opacità", self._spin_slice_op)]))
+        ll.addWidget(self._form_box("Scena", [("Profondità max", self._spin_depth), ("Esagerazione Z", self._spin_ve)],
+                                    extra=self._chk_labels))
+        ll.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)       # i campi si stringono, non scorrono di lato
+        for cb in (self._cb_gpr, self._cb_ert, self._cb_slice):
+            cb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            cb.setMinimumContentsLength(6)
+        scroll.setWidget(look)
+        tabs.addTab(scroll, "Aspetto")
+
+        # --- scheda "Incroci" (e messaggi) ---------------------------------------------------------------------
+        cross = QWidget()
+        cl = QVBoxLayout(cross)
+        cl.setContentsMargins(4, 6, 4, 4)
+        self._chk_cross = QCheckBox("Segna gli incroci GPR × ERT")
         self._chk_cross.setChecked(True)
+        self._chk_cross.setToolTip("Marca nella scena i punti in cui un profilo GPR attraversa una sezione ERT.")
         self._chk_cross.toggled.connect(self._schedule)
-        fl.addWidget(self._chk_cross)
-        vrow = QHBoxLayout()
-        for text, slot in (("Dall'alto", self._view_top), ("Reimposta", self._view_iso)):
-            b = QPushButton(text)
-            b.clicked.connect(slot)
-            vrow.addWidget(b)
-        fl.addLayout(vrow)
+        cl.addWidget(self._chk_cross)
         self._txt_cross = QPlainTextEdit()
         self._txt_cross.setReadOnly(True)
-        self._txt_cross.setMaximumHeight(110)
-        self._txt_cross.setPlaceholderText("Gli incroci tra profili GPR ed ERT spuntati compaiono qui.")
-        fl.addWidget(self._txt_cross)
-        sl.addWidget(form)
+        self._txt_cross.setPlaceholderText("Gli incroci tra profili GPR ed ERT mostrati compaiono qui, "
+                                           "con la distanza lungo ciascuno.")
+        # un avviso (importazione fallita, archivio illeggibile...) non deve restare in una scheda nascosta
+        self._txt_cross.textChanged.connect(
+            lambda: tabs.setCurrentWidget(cross) if self._txt_cross.toPlainText().startswith("⚠") else None)
+        cl.addWidget(self._txt_cross, 1)
+        tabs.addTab(cross, "Incroci")
         split.addWidget(side)
 
+        # --- vista 3D e cursori -------------------------------------------------------------------------------
         view = QWidget()
         vl = QVBoxLayout(view)
         vl.setContentsMargins(0, 0, 0, 0)
@@ -383,6 +426,20 @@ class FenceDock(QDockWidget):
         self._btn_side.toggled.connect(lambda on: self._set_side_visible(on, user=True))
         bar.addWidget(self._btn_side)
         bar.addStretch(1)
+        b_view = QToolButton()
+        b_view.setText("Vista ▾")
+        b_view.setPopupMode(QToolButton.InstantPopup)
+        b_view.setToolTip("Punto di vista della scena.")
+        vmenu = QMenu(b_view)
+        vmenu.addAction("Isometrica (reimposta)", self._view_iso)
+        vmenu.addAction("Dall'alto", self._view_top)
+        b_view.setMenu(vmenu)
+        bar.addWidget(b_view)
+        b_refresh = QToolButton()
+        b_refresh.setText("↻")
+        b_refresh.setToolTip("Rilegge zone, varianti, profili GPR, sezioni ERT e time-slice.")
+        b_refresh.clicked.connect(self.refresh_variants)
+        bar.addWidget(b_refresh)
         vl.addLayout(bar)
         if self._plotter_factory is not None:
             self._plotter, widget = self._plotter_factory(view)
@@ -391,6 +448,10 @@ class FenceDock(QDockWidget):
             widget = self._plotter.interactor if hasattr(self._plotter, "interactor") else self._plotter
         widget.setMinimumSize(120, 120)
         vl.addWidget(widget, 1)
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        vl.addWidget(line)
         for kind, title, tip in (
                 ("gpr", "Profili GPR", "Spuntata: mostra solo il profilo GPR sotto il cursore, nel gruppo scelto."),
                 ("ert", "Sezioni ERT", "Spuntata: mostra solo la sezione ERT sotto il cursore."),
@@ -405,8 +466,28 @@ class FenceDock(QDockWidget):
         split.addWidget(view)
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
-        split.setSizes([260, 700])
+        split.setSizes([280, 700])
         self._split = split
+
+    @staticmethod
+    def _hint(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)     # va a capo: non impone larghezza alla colonna
+        lbl.setStyleSheet("color: gray;")
+        return lbl
+
+    @staticmethod
+    def _form_box(title: str, rows, extra=None) -> QGroupBox:
+        box = QGroupBox(title)
+        form = QFormLayout(box)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        for label, widget in rows:
+            form.addRow(label, widget)
+        if extra is not None:
+            form.addRow(extra)
+        return box
 
     def _set_side_visible(self, on: bool, user: bool = False) -> None:
         if self._side is None:
@@ -493,7 +574,6 @@ class FenceDock(QDockWidget):
                 if not single:
                     parent = QTreeWidgetItem(self._src_tree, [z["name"] or "-"])
                     parent.setFlags(Qt.ItemIsEnabled)
-                    parent.setExpanded(True)
                 default = next((r for r in refs if r.name == "Lavoro"), refs[0])
                 for r in refs:
                     it = QTreeWidgetItem(parent, [f"{r.name}  ({r.n_files})"])
@@ -504,6 +584,8 @@ class FenceDock(QDockWidget):
                     # la prima volta si spunta la variante di lavoro dell'area attiva
                     seed = (not self._sources_seeded) and z["active"] and r is default
                     it.setCheckState(0, Qt.Checked if (sid in prev or seed) else Qt.Unchecked)
+                if not single:
+                    parent.setExpanded(True)      # dopo i figli, altrimenti l'espansione si perde
             self._sources_seeded = True
         finally:
             self._updating = False

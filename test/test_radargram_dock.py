@@ -3122,6 +3122,50 @@ class FenceDockTest(_DockBase):
             import shutil
             shutil.rmtree(other, ignore_errors=True)
 
+    # -- organizzazione dei comandi ------------------------------------------------------------------------
+    def test_controls_are_split_in_three_tabs(self):
+        tabs = self.fence._tabs
+        self.assertEqual([tabs.tabText(i) for i in range(tabs.count())], ["Dati", "Aspetto", "Incroci"])
+        data = tabs.widget(0)
+        for w in (self.fence._src_tree, self.fence._tree, self.fence._ed_filter):
+            self.assertTrue(data.isAncestorOf(w))
+        self.assertFalse(data.isAncestorOf(self.fence._spin_gain))           # gain e palette stanno in "Aspetto"
+        self.assertTrue(tabs.widget(1).isAncestorOf(self.fence._spin_gain))
+
+    def test_the_two_steps_are_named_and_zones_are_open(self):
+        titles = [g.title() for g in self.fence._tabs.widget(0).findChildren(_FD.QGroupBox)]
+        self.assertEqual(titles, ["1 · Zone e processi GPR", "2 · Cosa mostrare"])
+        other = tempfile.mkdtemp()
+        try:
+            _write_variant(other, "Solo", ["Alfa"])
+            zones = [{"name": "Zona1", "base": self.root, "active": True},
+                     {"name": "Zona2", "base": other, "active": False}]
+            fence = self._make_fence(zones_provider=lambda: zones)
+            try:
+                for i in range(fence._src_tree.topLevelItemCount()):
+                    self.assertTrue(fence._src_tree.topLevelItem(i).isExpanded())   # le varianti si vedono subito
+            finally:
+                fence.cleanup()
+        finally:
+            import shutil
+            shutil.rmtree(other, ignore_errors=True)
+
+    def test_bulk_selection_lives_in_one_menu(self):
+        actions = [a.text() for a in self.fence._btn_pick.menu().actions() if a.text()]
+        self.assertEqual(actions, ["Tutti i profili GPR", "Nessun profilo GPR", "Togli tutte le spunte"])
+        self.fence._btn_pick.menu().actions()[0].trigger()
+        self.assertEqual(len(self.fence.checked("gpr")), 2)
+        self.fence._btn_pick.menu().actions()[-1].trigger()
+        self.assertEqual(self.fence.checked("gpr"), [])
+
+    def test_a_warning_brings_its_tab_forward(self):
+        self.fence._tabs.setCurrentIndex(1)
+        self.fence._txt_cross.setPlainText("⚠ qualcosa non va")
+        self.assertEqual(self.fence._tabs.tabText(self.fence._tabs.currentIndex()), "Incroci")
+        self.fence._tabs.setCurrentIndex(1)
+        self.fence._txt_cross.setPlainText("T × Swath10 a 3 m")              # un incrocio normale non ruba la scheda
+        self.assertEqual(self.fence._tabs.tabText(self.fence._tabs.currentIndex()), "Aspetto")
+
     def test_import_button_adds_and_checks_the_new_section(self):
         csv = os.path.join(self.root, "export.csv")
         g = _G.ErtGeoref.from_endpoints((500003.0, -20.0), (500003.0, 20.0), 40.0, "EPSG:32632")
