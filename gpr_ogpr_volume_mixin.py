@@ -28,6 +28,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.PyQt.QtCore import Qt
 from qgis.core import QgsProject
+from . import gpr_debug_log as _dbg
 from .project_catalog import parse_depth_from_filename
 
 _DEPTH_PARSE_CONF_THRESHOLD = 0.8
@@ -215,7 +216,8 @@ class GprOgprVolumeMixin:
 
             def _toggle(checked: bool):
                 content_widget.setVisible(bool(checked))
-                btn.setText(f"{'\u25bc' if checked else '\u25b6'}  {title}")
+                arrow = "\u25bc" if checked else "\u25b6"
+                btn.setText(f"{arrow}  {title}")
 
             btn.toggled.connect(_toggle)
             return btn, content_widget
@@ -404,7 +406,7 @@ class GprOgprVolumeMixin:
         if not profiles:
             QMessageBox.information(
                 getattr(self, "dlg", None), "Nessun profilo",
-                "Importa almeno un file .ogpr prima di creare le timeslice.",
+                "Importa almeno un profilo (.ogpr o .DT) prima di creare le timeslice.",
             )
             return
         if bool(getattr(self, "_ogpr_slice_task_active", False)):
@@ -431,7 +433,7 @@ class GprOgprVolumeMixin:
             else "gpr_slices"
         )
         candidate_dir = os.path.join(
-            project_root, "GPR_Processing", "timeslices", default_group
+            project_root, "Processing", "timeslices", default_group
         )
         saved = load_ogpr_slicer_params(candidate_dir)
         is_reslice = saved is not None
@@ -439,43 +441,64 @@ class GprOgprVolumeMixin:
         depth_max  = max(p.depth_max_m for p in profiles)
         n_channels = max(p.n_channels  for p in profiles)
 
-        params = self._ask_ogpr_slice_params(
-            profiles=profiles,
-            n_channels  = n_channels,
-            depth_max_m = depth_max,
-            default_group = default_group,
-            saved = saved,
-            slice_params=slice_params,
-        )
-        if params is None:
-            return
-        params = dict(params or {})
-        dialog_extra_slice_params = dict(params.pop("advanced", {}) or {})
+        # Fase D: when the caller already carries a SliceSpec (from the single
+        # SliceSpecPanel form), skip the legacy parameter dialog entirely - the
+        # form is always visible and complete.
+        active_spec = (slice_params or {}).get("_spec")
+        if active_spec is not None:
+            from .slice_params_compat import spec_to_build_params
+
+            resolved_spec = (
+                active_spec if active_spec.is_resolved()
+                else active_spec.resolve(profiles)
+            )
+            params = spec_to_build_params(
+                resolved_spec,
+                channel=int((slice_params or {}).get("channel", -1)),
+                combine_method=str((slice_params or {}).get("combine_method", "mean")),
+                group_name=default_group,
+            )
+            dialog_extra_slice_params = {}
+        else:
+            resolved_spec = None
+            params = self._ask_ogpr_slice_params(
+                profiles=profiles,
+                n_channels  = n_channels,
+                depth_max_m = depth_max,
+                default_group = default_group,
+                saved = saved,
+                slice_params=slice_params,
+            )
+            if params is None:
+                return
+            params = dict(params or {})
+            dialog_extra_slice_params = dict(params.pop("advanced", {}) or {})
 
         group_name = params["group_name"]
-        output_dir = os.path.join(project_root, "GPR_Processing", "timeslices", group_name)
+        output_dir = os.path.join(project_root, "Processing", "timeslices", group_name)
         out_override = str((slice_params or {}).get("output_dir") or "").strip()
         if out_override:
             if not os.path.isabs(out_override):
                 out_override = os.path.normpath(os.path.join(project_root, out_override))
             output_dir = out_override
-        epsg = QgsProject.instance().crs().postgisSrid() or None
-        if not epsg:
-            epsg_vals = []
-            for p in profiles:
-                try:
-                    v = int(getattr(p, "epsg", 0) or 0)
-                except Exception:
-                    v = 0
-                if v > 0:
-                    epsg_vals.append(v)
-            if epsg_vals:
-                epsg = int(Counter(epsg_vals).most_common(1)[0][0])
-                if hasattr(self, "_notify_info"):
-                    self._notify_info(
-                        f"CRS progetto non impostato: uso EPSG:{epsg} dai profili OGPR.",
-                        duration=8,
-                    )
+        # Le coordinate dei profili sono nel CRS del dato: quello va scritto nei
+        # raster. Il CRS del progetto QGIS (es. EPSG:4326) descrive solo la
+        # visualizzazione e marchierebbe come gradi delle coordinate in metri.
+        epsg = None
+        epsg_vals = []
+        if resolved_spec is not None and getattr(resolved_spec, "crs_epsg", None):
+            epsg_vals.append(int(resolved_spec.crs_epsg))
+        for p in profiles:
+            try:
+                v = int(getattr(p, "epsg", 0) or 0)
+            except Exception:
+                v = 0
+            if v > 0:
+                epsg_vals.append(v)
+        if epsg_vals:
+            epsg = int(Counter(epsg_vals).most_common(1)[0][0])
+        else:
+            epsg = QgsProject.instance().crs().postgisSrid() or None
 
         ch_label = (
             f"tutti ({params['combine_method']})"
@@ -608,6 +631,9 @@ class GprOgprVolumeMixin:
                     sidecar_params["task_timing_s"] = dict(task_timing_s)
                 if extra_slice_params.get("amplitude_sigma") is not None:
                     sidecar_params["amplitude_sigma"] = extra_slice_params.get("amplitude_sigma")
+                if resolved_spec is not None:
+                    # Fase D: keep the exact SliceSpec so a re-slice restores it verbatim.
+                    sidecar_params["slice_spec"] = resolved_spec.to_dict()
                 save_ogpr_slicer_params(output_dir, sidecar_params)
 
                 # --- registra nel catalogo (riusa GprVolumeMixin) ---
@@ -654,6 +680,7 @@ class GprOgprVolumeMixin:
                                         ch0 = prof.channel(0)
                                     except Exception:
                                         continue
+                                    _dbg.log("VOLUME", f"estensione da {os.path.basename(str(getattr(prof, 'path', '?')))}: " + _dbg.describe_track(getattr(ch0, "easting", []), getattr(ch0, "northing", [])))
                                     for x in list(getattr(ch0, "easting", []) or []):
                                         try:
                                             xf = float(x)
@@ -728,6 +755,17 @@ class GprOgprVolumeMixin:
                     QMessageBox.information(
                         getattr(self, "dlg", None), "Slice completate", msg
                     )
+                # Radargrammi processati sempre a portata di mano mentre si lavora con le
+                # time-slice sul canvas, anche a Profile Viewer chiuso.
+                if hasattr(self, "open_radargram_dock"):
+                    try:
+                        src_variant = str(getattr(resolved_spec, "source_variant", "") or "").strip()
+                        self.open_radargram_dock(
+                            variant=None if src_variant.lower() in ("", "raw") else src_variant,
+                            activate=False,
+                        )
+                    except Exception as exc:
+                        _dbg.log("VOLUME", f"pannello radargrammi non aperto: {exc}")
                 cb_ok = True
                 cb_payload.update(
                     {
@@ -762,6 +800,11 @@ class GprOgprVolumeMixin:
             extra_slice_params=extra_slice_params,
             output_dir=output_dir,
             epsg=epsg,
+            spec=resolved_spec,
+            source_variant=(
+                str(getattr(resolved_spec, "source_variant", "raw"))
+                if resolved_spec is not None else "raw"
+            ),
         )
         self._ogpr_slice_task_active = True
         start_task_with_progress_dialog(

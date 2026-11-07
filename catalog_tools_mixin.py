@@ -373,6 +373,13 @@ class CatalogToolsMixin:
                         pass
 
         frame_geom = self._atlas_build_frame_geometry(rows, page_opts)
+        if isinstance(page_opts, dict):
+            # Stamp the settings this frame was built with, so a later "Use
+            # existing" export can detect a changed Scale/Page/Orientation
+            # and warn instead of silently ignoring it.
+            set_layer_property(layer, "atlas_frame_scale_denominator", float(page_opts.get("scale_denominator") or 0.0))
+            set_layer_property(layer, "atlas_frame_page_token", str(page_opts.get("page_token") or ""))
+            set_layer_property(layer, "atlas_frame_orientation_token", str(page_opts.get("orientation_token") or ""))
         missing_depth_count = len([r for r in rows if int(r.get("missing_depth") or 0) == 1])
         crs_mismatch_count = len([r for r in rows if int(r.get("crs_mismatch") or 0) == 1])
         has_any_raster = 1 if any(int(r.get("raster_exists") or 0) == 1 for r in rows) else 0
@@ -2028,6 +2035,30 @@ class CatalogToolsMixin:
                 continue
         self.iface.messageBar().pushInfo("GeoSurvey Studio", f"Group style loaded: {applied}/{len(layers)} layers.")
 
+    def _atlas_coverage_frame_is_stale(self, layer, page_opts):
+        """True if `layer`'s stored frame was built under a different
+        Scale/Page/Orientation than `page_opts` currently holds. Coverage
+        layers built before this stamp existed have no metadata to compare
+        against and are treated as not stale (nothing to warn about)."""
+        if not isinstance(page_opts, dict) or layer is None:
+            return False
+        stored_page = str(get_layer_property(layer, "atlas_frame_page_token", "") or "")
+        stored_orient = str(get_layer_property(layer, "atlas_frame_orientation_token", "") or "")
+        try:
+            stored_scale = float(get_layer_property(layer, "atlas_frame_scale_denominator", 0.0) or 0.0)
+        except Exception:
+            stored_scale = 0.0
+        if not stored_page and not stored_orient and stored_scale <= 0:
+            return False
+        current_scale = float(page_opts.get("scale_denominator") or 0.0)
+        current_page = str(page_opts.get("page_token") or "")
+        current_orient = str(page_opts.get("orientation_token") or "")
+        return (
+            stored_page != current_page
+            or stored_orient != current_orient
+            or abs(stored_scale - current_scale) > 0.01
+        )
+
     def _atlas_export_coverage_mode(self):
         combo = getattr(self, "export_coverage_mode_combo", None)
         if combo is None:
@@ -2083,6 +2114,27 @@ class CatalogToolsMixin:
         if mode == "use_existing":
             if existing is None:
                 mode = "refresh_existing"
+            elif self._atlas_coverage_frame_is_stale(existing, page_opts):
+                answer = QMessageBox.question(
+                    self.dlg,
+                    "Atlas Coverage",
+                    (
+                        "The existing Atlas coverage frame was built with a different "
+                        "Scale / Page size / Orientation than what is currently selected, "
+                        "so those settings would have no effect.\n\n"
+                        "Refresh the coverage frame with the current settings now?"
+                    ),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if answer == QMessageBox.Yes:
+                    mode = "refresh_existing"
+                else:
+                    self.iface.messageBar().pushInfo(
+                        "GeoSurvey Studio",
+                        f"Using existing Atlas coverage: {existing.name()}",
+                    )
+                    return
             else:
                 self.iface.messageBar().pushInfo(
                     "GeoSurvey Studio",
@@ -2134,6 +2186,25 @@ class CatalogToolsMixin:
         if cov_mode == "use_existing":
             if existing_coverage is None:
                 cov_mode = "refresh_existing"
+            elif self._atlas_coverage_frame_is_stale(existing_coverage, page_opts):
+                answer = QMessageBox.question(
+                    self.dlg,
+                    "Atlas Coverage",
+                    (
+                        "The existing Atlas coverage frame was built with a different "
+                        "Scale / Page size / Orientation than what is currently selected "
+                        "in the Export tab, so those settings would have no effect on the "
+                        "printed extent.\n\n"
+                        "Refresh the coverage frame with the current settings now?"
+                    ),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if answer == QMessageBox.Yes:
+                    cov_mode = "refresh_existing"
+                else:
+                    coverage_layer = existing_coverage
+                    coverage_rows = ts_rows
             else:
                 coverage_layer = existing_coverage
                 coverage_rows = ts_rows

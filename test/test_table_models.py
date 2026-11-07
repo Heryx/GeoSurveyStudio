@@ -24,6 +24,7 @@ class TableModelsTest(unittest.TestCase):
                 "fid": 7,
                 "trace_id": "tr_007",
                 "timeslice": "slice_01",
+                "radar_ref": "Lavoro · Swath2 ch0",
                 "depth_text": "0.1 - 0.2 m",
                 "z_mode": "depth_range",
                 "length_text": "12.45",
@@ -32,10 +33,13 @@ class TableModelsTest(unittest.TestCase):
         model.set_rows(rows)
 
         self.assertEqual(model.rowCount(), 1)
-        self.assertEqual(model.columnCount(), 6)
+        self.assertEqual(model.columnCount(), 8)
 
         idx_trace = model.index(0, 1)
         self.assertEqual(model.data(idx_trace, Qt.DisplayRole), "tr_007")
+
+        idx_radar_ref = model.index(0, 3)
+        self.assertEqual(model.data(idx_radar_ref, Qt.DisplayRole), "Lavoro · Swath2 ch0")
 
         idx_payload = model.index(0, 0)
         payload = model.data(idx_payload, Qt.UserRole)

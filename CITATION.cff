@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use GeoSurvey Studio in your work, please cite it as below."
+title: "GeoSurvey Studio"
+type: software
+version: "1.2.0"
+date-released: "2026-11-07"
+license: GPL-2.0-or-later
+authors:
+  - family-names: Guarino
+    given-names: Giuseppe
+    email: guarino.archeo@gmail.com
+repository-code: "https://github.com/Heryx/GeoSurveyStudio"
+url: "https://github.com/Heryx/GeoSurveyStudio"
+abstract: "QGIS plugin for the management, processing and 3D visualisation of GPR (ground-penetrating radar) profiles, time-slices and ERT sections, with oriented survey grids generated from drawn areas."
+keywords:
+  - GPR
+  - ground-penetrating radar
+  - QGIS
+  - archaeological geophysics
+  - time-slice

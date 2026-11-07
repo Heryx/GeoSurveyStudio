@@ -1,5 +1,6 @@
 import os
 
+from .raster_io import apply_embedded_style
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QFont
 from qgis.PyQt.QtWidgets import (
@@ -11,6 +12,8 @@ from qgis.PyQt.QtWidgets import (
     QProgressDialog,
 )
 from qgis.core import (
+    Qgis,
+    QgsMessageLog,
     QgsCoordinateTransform,
     QgsLayerTreeLayer,
     QgsProject,
@@ -32,6 +35,17 @@ from .background_tasks import (
     start_task_with_progress_dialog,
 )
 from .timeslice_validation_dialog import choose_timeslice_import_action
+
+
+class _GroupRef:
+    """Segnaposto con la stessa interfaccia di un item della lista gruppi
+    (``data(Qt.UserRole)`` = id gruppo), per caricare gruppi senza pannello."""
+
+    def __init__(self, group_id):
+        self._gid = group_id
+
+    def data(self, _role):
+        return self._gid
 
 
 class CatalogGroupMixin:
@@ -878,7 +892,7 @@ class CatalogGroupMixin:
             self.on_group_selection_changed()
         return found
 
-    def _quick_import_timeslices_for_group(self, project_root, group, on_finished=None):
+    def _quick_import_timeslices_for_group(self, project_root, group, on_finished=None, file_paths=None):
         def _finish(result):
             if callable(on_finished):
                 try:
@@ -888,12 +902,13 @@ class CatalogGroupMixin:
                 return None
             return result
 
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self.dlg,
-            "Select Time-slice raster files",
-            "",
-            "Rasters (*.tif *.tiff *.png *.jpg *.jpeg *.asc *.img);;All files (*.*)",
-        )
+        if file_paths is None:
+            file_paths, _ = QFileDialog.getOpenFileNames(
+                self.dlg,
+                "Select Time-slice raster files",
+                "",
+                "Rasters (*.tif *.tiff *.png *.jpg *.jpeg *.asc *.img);;All files (*.*)",
+            )
         if not file_paths:
             return _finish({"cancelled": False, "imported": 0, "skipped": 0})
 
@@ -963,6 +978,7 @@ class CatalogGroupMixin:
             project_root,
             records,
             description="GeoSurvey Studio: Importing selected images",
+            name_prefix=str(group.get("name") or ""),
         )
         def _finalize(done_task):
             cancelled = bool(done_task.cancelled)
@@ -1014,7 +1030,7 @@ class CatalogGroupMixin:
                 QMessageBox.warning(self.dlg, "Import running", "A group import is already running.")
                 return _finish({"cancelled": True, "imported": 0, "skipped": skipped})
             self._group_import_active = True
-            if hasattr(self.dlg, "createGroupButton"):
+            if self.dlg is not None and hasattr(self.dlg, "createGroupButton"):
                 self.dlg.createGroupButton.setEnabled(False)
 
             def _on_task_done(done_task, _ok):
@@ -1023,7 +1039,7 @@ class CatalogGroupMixin:
                     _finish(result)
                 finally:
                     self._group_import_active = False
-                    if hasattr(self.dlg, "createGroupButton"):
+                    if self.dlg is not None and hasattr(self.dlg, "createGroupButton"):
                         self.dlg.createGroupButton.setEnabled(True)
 
             start_task_with_progress_dialog(
@@ -1046,6 +1062,45 @@ class CatalogGroupMixin:
             "Create Group - Import Images",
         )
         return _finish(_finalize(import_task))
+
+    def import_slice_files_as_group(self, project_root, group_name, file_paths, on_done=None):
+        """Registra dei GeoTIFF gia' pronti (es. dal profile viewer) come gruppo
+        del catalogo e li carica sotto "GeoSurvey Studio" nel layer tree, dove
+        lo slider li pilota come tutti gli altri gruppi."""
+        group, _created = create_raster_group(project_root, group_name)
+
+        # Il pannello deve esistere: se non e' mai stato aperto (o e' stato
+        # distrutto) il gruppo importato non comparirebbe finche' non lo si ricarica.
+        if not self._dock_alive() and hasattr(self, "run"):
+            try:
+                self.run()
+            except Exception as exc:
+                QgsMessageLog.logMessage(f"Apertura pannello fallita: {exc}", "GeoSurvey Studio", Qgis.Warning)
+
+        def _on_result(result):
+            imported = int((result or {}).get("imported", 0))
+            try:
+                if imported > 0:
+                    # prima i layer nel layer tree (indipendente dal pannello)...
+                    self._get_or_create_plugin_qgis_group(group_name)
+                    self.load_raster(show_message=False, group_ids=[group.get("id")])
+                    # ...poi lista del pannello, con il nuovo gruppo selezionato
+                    if self._dock_alive():
+                        self.populate_group_list()
+                        self._select_group_item_by_id(group.get("id"))
+                elif self._dock_alive():
+                    self.populate_group_list()
+            except Exception as exc:
+                QgsMessageLog.logMessage(
+                    f"Import gruppo '{group_name}': aggiornamento pannello fallito: {exc}",
+                    "GeoSurvey Studio", Qgis.Warning,
+                )
+            if callable(on_done):
+                on_done(result or {})
+
+        self._quick_import_timeslices_for_group(
+            project_root, group, on_finished=_on_result, file_paths=list(file_paths)
+        )
 
     def create_group(self):
         group_name = self.dlg.groupNameEdit.text().strip()
@@ -1115,13 +1170,21 @@ class CatalogGroupMixin:
     def add_group_with_button(self, group_name):
         self.populate_group_list()
 
-    def load_raster(self, show_message=True):
-        """Load imported time-slices from selected plugin groups into QGIS layer tree."""
+    def load_raster(self, show_message=True, group_ids=None):
+        """Load imported time-slices from selected plugin groups into QGIS layer tree.
+
+        ``group_ids``: carica questi gruppi del catalogo invece di quelli
+        selezionati nella lista (non serve che il pannello esista)."""
         try:
-            project_root = self._require_project_root()
+            project_root = self._require_project_root(notify=show_message)
             if not project_root:
                 return
-            selected_groups = self.dlg.groupListWidget.selectedItems()
+            if group_ids is not None:
+                selected_groups = [
+                    _GroupRef(gid) for gid in group_ids if gid
+                ]
+            else:
+                selected_groups = self.dlg.groupListWidget.selectedItems()
             if not selected_groups:
                 if show_message:
                     QMessageBox.warning(self.dlg, "Error", "Select at least one plugin group.")
@@ -1131,6 +1194,12 @@ class CatalogGroupMixin:
             groups_by_id = {g.get("id"): g for g in catalog.get("raster_groups", [])}
             timeslices_by_id = {t.get("id"): t for t in catalog.get("timeslices", [])}
             existing_sources = {layer.source() for layer in QgsProject.instance().mapLayers().values()}
+            # layers che mostrano il raster derivato delle ampiezze: la sorgente
+            # originale conta come gia' caricata (niente duplicati)
+            for _lyr in QgsProject.instance().mapLayers().values():
+                _orig = _lyr.customProperty("rl_amp_src") if hasattr(_lyr, "customProperty") else None
+                if _orig:
+                    existing_sources.add(str(_orig))
             target_crs = self._get_preferred_import_crs()
             loaded_count = 0
 
@@ -1170,17 +1239,34 @@ class CatalogGroupMixin:
                             raster_layer.loadNamedStyle(style_path)
                         except Exception:
                             pass
+                    else:
+                        apply_embedded_style(raster_layer)
                     QgsProject.instance().addMapLayer(raster_layer, False)
                     qgis_group.addLayer(raster_layer)
                     existing_sources.add(path)
                     loaded_count += 1
 
-            self.populate_raster_list_from_selected_groups()
+            try:
+                self._amp_reconcile_project_layers()
+            except Exception as exc:
+                QgsMessageLog.logMessage(f"Ampiezze: ripristino fallito: {exc}", "GeoSurvey Studio", Qgis.Warning)
+            if self._dock_alive():
+                self.populate_raster_list_from_selected_groups()
             if show_message:
                 QMessageBox.information(self.dlg, "Success", f"Time-slice caricate dal catalogo plugin: {loaded_count}")
+            return loaded_count
         except Exception as e:
+            QgsMessageLog.logMessage(f"Caricamento gruppi fallito: {e}", "GeoSurvey Studio", Qgis.Warning)
             if show_message:
                 QMessageBox.critical(self.dlg, "Error", f"Error while loading rasters: {e}")
+        return 0
+
+    def _dock_alive(self):
+        dlg = getattr(self, "dlg", None)
+        checker = getattr(self, "_qt_widget_alive", None)
+        if dlg is None:
+            return False
+        return bool(checker(dlg)) if callable(checker) else True
 
     def get_selected_group(self):
         selected_group_item = self.dlg.groupListWidget.currentItem()

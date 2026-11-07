@@ -173,11 +173,24 @@ def build_grid_options_controls(
     orientation_status_label.setStyleSheet("color: #505050;")
     orientation_status_label.setMinimumHeight(14)
 
+    crs_warning_label = QLabel("")
+    crs_warning_label.setWordWrap(True)
+    crs_warning_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    crs_warning_label.setStyleSheet(
+        "color: #8f4300; "
+        "background-color: #fff4dd; "
+        "border: 1px solid #f3cf96; "
+        "border-radius: 2px; "
+        "padding: 2px 4px;"
+    )
+    crs_warning_label.setVisible(False)
+
     group_layout.addLayout(flags_grid)
     group_layout.addLayout(form)
     group_layout.addLayout(buttons_row)
     group_layout.addLayout(info_row)
     group_layout.addWidget(orientation_status_label)
+    group_layout.addWidget(crs_warning_label)
 
     wrapper_layout.addWidget(group)
     layout.addWidget(wrapper)
@@ -196,4 +209,5 @@ def build_grid_options_controls(
         angle_label,
         length_label,
         orientation_status_label,
+        crs_warning_label,
     )

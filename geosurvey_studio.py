@@ -3,7 +3,7 @@
 
 import os.path
 
-from qgis.PyQt.QtCore import QSettings, QCoreApplication
+from qgis.PyQt.QtCore import QSettings, QCoreApplication, QTimer
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QMessageBox
 from qgis.core import QgsMessageLog, Qgis
@@ -17,6 +17,7 @@ from .gpr_volume_mixin import GprVolumeMixin
 from .gpr_ogpr_volume_mixin import GprOgprVolumeMixin
 from .grid_workflow_mixin import GridWorkflowMixin
 from .ui_layout_mixin import UiLayoutMixin
+from .slice_amplitude_mixin import SliceAmplitudeMixin
 from .app_runtime_mixin import AppRuntimeMixin
 from .update_checker_mixin import UpdateCheckerMixin
 
@@ -27,10 +28,39 @@ except Exception:
     _HAS_PROFILE_VIEWER = False
 
 try:
+    from .gpr_radargram_dock import RadargramDock
+    _HAS_RADARGRAM_DOCK = True
+except Exception:
+    _HAS_RADARGRAM_DOCK = False
+
+try:
+    from .gpr_fence_dock import FenceDock
+    _HAS_FENCE_DOCK = True
+except Exception:
+    _HAS_FENCE_DOCK = False
+
+try:
     from .resources import *  # noqa: F401,F403
     _HAS_QT_RESOURCES = True
 except Exception:
     _HAS_QT_RESOURCES = False
+
+
+def _active_zone_base(root):
+    """Cartella di lavoro dell'area attiva di ``root`` (Processing/ per l'area
+    principale), cosi' il pannello legge le varianti dell'area giusta anche con
+    il viewer chiuso. Senza ``project.json`` ritorna ``root`` invariata."""
+    if not root:
+        return root
+    try:
+        from . import project_zones
+        if os.path.isfile(project_zones.project_json_path(root)):
+            base = project_zones.zone_base(root)
+            if os.path.isdir(base):
+                return base
+    except Exception:
+        pass
+    return root
 
 
 class GeoSurveyStudioPlugin(
@@ -42,6 +72,7 @@ class GeoSurveyStudioPlugin(
     GprOgprVolumeMixin,
     GridWorkflowMixin,
     UiLayoutMixin,
+    SliceAmplitudeMixin,
     TraceInfoMixin,
     TraceCaptureMixin,
     TraceBuild3DMixin,
@@ -97,6 +128,12 @@ class GeoSurveyStudioPlugin(
 
         # GPR Profile Viewer (finestra indipendente)
         self._gpr_profile_viewer = None
+        # Pannello agganciabile con i radargrammi processati (vive nel canvas di QGIS,
+        # indipendente dal Profile Viewer)
+        self._radargram_dock = None
+        # Finestra agganciabile "Vista 3D profili" (GPR + ERT), indipendente dai radargrammi processati
+        self._fence_dock = None
+        self._fence_plotter_factory = None     # solo per i test: al posto del QtInteractor
 
         # Mixin state initialisation – each mixin owns and resets its own attributes.
         self._init_grid_state()
@@ -168,9 +205,47 @@ class GeoSurveyStudioPlugin(
                 callback=self.open_gpr_profile_viewer,
                 parent=self.iface.mainWindow(),
             )
-            radar_icon = self._qgis_theme_icon("mIconRasterLayer.svg", "mIconRaster.svg")
-            if radar_icon is not None and not radar_icon.isNull():
-                self.gpr_viewer_action.setIcon(radar_icon)
+            viewer_icon_path = os.path.join(self.plugin_dir, "icon_profile_viewer.png")
+            if os.path.exists(viewer_icon_path):
+                self.gpr_viewer_action.setIcon(QIcon(viewer_icon_path))
+            else:
+                radar_icon = self._qgis_theme_icon("mIconRasterLayer.svg", "mIconRaster.svg")
+                if radar_icon is not None and not radar_icon.isNull():
+                    self.gpr_viewer_action.setIcon(radar_icon)
+
+        # --- Radargrammi processati (pannello agganciabile) ---
+        if _HAS_RADARGRAM_DOCK:
+            self.radargram_dock_action = self.add_action(
+                icon_path,
+                text=self.tr(u'Radargram Editing'),
+                callback=self.open_radargram_dock,
+                parent=self.iface.mainWindow(),
+            )
+            self.radargram_dock_action.setToolTip(
+                "Radargram Editing: analisi e annotazione dei radargrammi processati."
+            )
+            editing_icon_path = os.path.join(self.plugin_dir, "icon_radargram_editing.png")
+            if os.path.exists(editing_icon_path):
+                self.radargram_dock_action.setIcon(QIcon(editing_icon_path))
+
+        # --- Vista 3D profili GPR + ERT (finestra agganciabile) ---
+        if _HAS_FENCE_DOCK:
+            self.fence_dock_action = self.add_action(
+                icon_path,
+                text=self.tr(u'Vista 3D profili'),
+                callback=self.open_fence_dock,
+                parent=self.iface.mainWindow(),
+            )
+            self.fence_dock_action.setToolTip(
+                "Vista 3D di profili GPR, sezioni ERT e time-slice."
+            )
+            cube_icon_path = os.path.join(self.plugin_dir, "icon_profile_3d.png")
+            if os.path.exists(cube_icon_path):
+                self.fence_dock_action.setIcon(QIcon(cube_icon_path))
+            else:
+                cube_icon = self._qgis_theme_icon("3d.svg", "mActionNew3DMap.svg")
+                if cube_icon is not None and not cube_icon.isNull():
+                    self.fence_dock_action.setIcon(cube_icon)
 
         self.check_updates_action = self.add_action(
             icon_path,
@@ -192,6 +267,19 @@ class GeoSurveyStudioPlugin(
             self.check_dependencies_action.setIcon(deps_icon)
         self.first_start = True
         self._maybe_run_startup_dependency_check()
+        try:
+            from qgis.core import QgsProject
+            QgsProject.instance().projectRead.connect(self._on_qgis_project_read)
+            # Plugin caricato (o ricaricato) con un progetto gia' aperto:
+            # projectRead non scatta piu', quindi si lega il progetto adesso.
+            if QgsProject.instance().fileName() or QgsProject.instance().mapLayers():
+                QTimer.singleShot(1500, self._on_qgis_project_read)
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                f"Could not connect projectRead signal: {exc}",
+                "GeoSurvey Studio",
+                Qgis.Warning,
+            )
 
     def _plugin_version(self) -> str:
         """Read plugin version from metadata.txt."""
@@ -339,14 +427,236 @@ class GeoSurveyStudioPlugin(
                 self._gpr_profile_viewer.destroyed.connect(lambda *_a: setattr(self, "_gpr_profile_viewer", None))
             except Exception:
                 pass
+        else:
+            # Viewer gia' creato in precedenza: potrebbe essere rimasto sul
+            # progetto di prima se nel frattempo e' stato aperto un altro.
+            try:
+                self._gpr_profile_viewer.sync_with_active_project()
+            except Exception:
+                pass
         self._gpr_profile_viewer.show()
         self._gpr_profile_viewer.raise_()
         self._gpr_profile_viewer.activateWindow()
 
+    # ------------------------------------------------------------------
+    # Radargrammi processati (pannello agganciabile)
+    # ------------------------------------------------------------------
+
+    def _radargram_workspace_root(self) -> str:
+        """Cartella-progetto (o Processing) che contiene `processed/`."""
+        viewer = self._live_profile_viewer()
+        if viewer is not None:
+            try:
+                base = (viewer._gpr_processing_paths() or {}).get("base", "")
+                if base and os.path.isdir(base):
+                    return base
+            except Exception:
+                pass
+        return _active_zone_base(self._radargram_project_root())
+
+    def _radargram_project_root(self) -> str:
+        """Radice del progetto GPR (impostazioni, progetto QGIS legato, cartella del .qgz)."""
+        root = ""
+        try:
+            root = (self.settings.value(self.settings_key_active_project, "", type=str) or "").strip()
+        except Exception:
+            root = ""
+        if not root:
+            try:
+                from . import project_binding
+                root = project_binding.recall_root()
+            except Exception:
+                root = ""
+        if not root:
+            try:
+                from qgis.core import QgsProject
+                qgs = str(QgsProject.instance().fileName() or "").strip()
+                root = os.path.dirname(os.path.normpath(qgs)) if qgs else ""
+            except Exception:
+                root = ""
+        return root
+
+    def _radargram_zones(self) -> list:
+        """Aree indagate del progetto per il pannello dei radargrammi: [{"name","base","active"}].
+        Vuoto se il progetto non ha un project.json (il pannello usa allora la sola cartella di lavoro)."""
+        root = self._radargram_project_root()
+        if not root:
+            return []
+        try:
+            from . import project_zones
+            if not os.path.isfile(project_zones.project_json_path(root)):
+                return []
+            state = project_zones.read_state(root)
+            out = []
+            for name in state["zones"]:
+                base = project_zones.zone_base(root, name)
+                if os.path.isdir(base):
+                    out.append({"name": name, "base": base, "active": name == state["active_zone"]})
+            return out
+        except Exception:
+            return []
+
+    def _live_profile_viewer(self):
+        """Il Profile Viewer se e' aperto e ha profili in memoria, altrimenti None."""
+        viewer = self._gpr_profile_viewer
+        if viewer is None:
+            return None
+        try:
+            viewer.objectName()
+            return viewer if getattr(viewer, "_profiles", None) else None
+        except Exception:
+            return None
+
+    def _radargram_geometry_provider(self, stem: str):
+        """Profilo in memoria del viewer con quel nome: unica fonte del posizionamento."""
+        viewer = self._live_profile_viewer()
+        if viewer is None:
+            return None
+        for prof in viewer._profiles:
+            if os.path.splitext(os.path.basename(str(getattr(prof, "path", "") or "")))[0] == stem:
+                return prof
+        return None
+
+    def _radargram_feature_sink(self, kind, variant_name, profile_stem, channel, epsg, vertices,
+                                 velocity_m_ns=None, rdp=None, **extra):
+        """Ponte verso la pipeline "Line Traces": il RadargramDock non conosce QGIS
+        oltre l'essenziale, tutta la logica di layer/schema vive in TraceCaptureMixin.
+        `extra` porta classe, affidabilita', attributi e identificativo."""
+        return self.capture_radargram_feature(
+            kind=kind, variant_name=variant_name, profile_stem=profile_stem,
+            channel=channel, epsg=epsg, vertices=vertices,
+            velocity_m_ns=velocity_m_ns, rdp=rdp, **extra)
+
+    def _radargram_feature_update(self, trace_id, vertices=None, epsg=None, attributes=None, metrics=None):
+        """Ponte per modificare un'annotazione gia' disegnata (vertici, attributi, misure)."""
+        return self.update_radargram_feature(
+            trace_id, vertices=vertices, epsg=epsg, attributes=attributes, metrics=metrics)
+
+    def _radargram_band_filter(self, band):
+        """Ponte per attenuare sulla mappa le annotazioni fuori dalla fascia della time-slice."""
+        return self.set_radargram_band_filter(band)
+
+    def _radargram_feature_delete(self, trace_id):
+        """Ponte per eliminare un'annotazione disegnata sul radargramma."""
+        return self.delete_radargram_feature(trace_id)
+
+    def _radargram_feature_query(self, variant_name, profile_stem, channel, all_profiles=False):
+        """Ponte verso TraceCaptureMixin per ridisegnare sul radargramma le geometrie
+        gia' digitalizzate su quel profilo/canale (vedi RadargramDock `feature_query`);
+        con `all_profiles` restituisce tutta la variante (profili vicini, anomalie)."""
+        return self.query_radargram_features(variant_name, profile_stem, channel, all_profiles=all_profiles)
+
+    def open_radargram_dock(self, checked=False, variant=None, profile_stem=None, activate=True):
+        """Mostra (creandolo se serve) il pannello dei radargrammi processati.
+
+        `variant` = nome o cartella della variante da aprire; `activate=False` lo mostra
+        senza portarlo in primo piano (uso automatico dopo la generazione delle time-slice).
+        """
+        if not _HAS_RADARGRAM_DOCK:
+            QMessageBox.warning(
+                self.iface.mainWindow(), "Radargram Editing",
+                "Pannello non disponibile (componenti QGIS/matplotlib mancanti).")
+            return None
+        from qgis.PyQt.QtCore import Qt
+        dock = self._radargram_dock
+        alive = False
+        if dock is not None:
+            try:
+                dock.objectName()
+                alive = True
+            except RuntimeError:
+                alive = False
+        if not alive:
+            dock = RadargramDock(
+                self.iface,
+                workspace_provider=self._radargram_workspace_root,
+                zones_provider=getattr(self, "_radargram_zones", None),
+                project_root_provider=getattr(self, "_radargram_project_root", None),
+                geometry_provider=self._radargram_geometry_provider,
+                feature_sink=self._radargram_feature_sink,
+                feature_query=self._radargram_feature_query,
+                feature_update=getattr(self, "_radargram_feature_update", None),
+                feature_delete=getattr(self, "_radargram_feature_delete", None),
+                band_filter=getattr(self, "_radargram_band_filter", None),
+                parent=self.iface.mainWindow(),
+            )
+            self.iface.addDockWidget(Qt.BottomDockWidgetArea, dock)
+            self._radargram_dock = dock
+        else:
+            dock.refresh_variants()
+        dock.show()
+        if variant:
+            dock.open_variant(variant, profile_stem=profile_stem)
+        if activate:
+            dock.raise_()
+        return dock
+
+    def open_fence_dock(self, checked=False):
+        """Mostra (creandola se serve) la finestra "Vista 3D profili" con i profili GPR e le sezioni ERT."""
+        if not _HAS_FENCE_DOCK:
+            QMessageBox.warning(
+                self.iface.mainWindow(), "Vista 3D profili",
+                "Finestra non disponibile (componenti QGIS/matplotlib mancanti).")
+            return None
+        from qgis.PyQt.QtCore import Qt
+        dock = self._fence_dock
+        alive = False
+        if dock is not None:
+            try:
+                dock.objectName()
+                alive = True
+            except RuntimeError:
+                alive = False
+        if not alive:
+            dock = FenceDock(
+                self.iface,
+                workspace_provider=self._radargram_workspace_root,
+                zones_provider=getattr(self, "_radargram_zones", None),
+                project_root_provider=getattr(self, "_radargram_project_root", None),
+                geometry_provider=self._radargram_geometry_provider,
+                parent=self.iface.mainWindow(),
+                plotter_factory=self._fence_plotter_factory,
+            )
+            self.iface.addDockWidget(Qt.RightDockWidgetArea, dock)
+            # la prima volta si apre come finestra mobile di dimensione utile: agganciata nella colonna di
+            # destra (stretta) la vista 3D resterebbe senza spazio. Si puo' agganciare quando si vuole.
+            dock.setFloating(True)
+            dock.resize(1150, 740)
+            win = self.iface.mainWindow()
+            try:
+                dock.move(win.geometry().center() - dock.rect().center())
+            except Exception:
+                pass
+            self._fence_dock = dock
+        dock.show()
+        dock.raise_()
+        return dock
+
     def unload(self):
         """Unload the plugin."""
+        try:
+            from qgis.core import QgsProject
+            QgsProject.instance().projectRead.disconnect(self._on_qgis_project_read)
+        except Exception:
+            pass
         if self.dlg is not None:
             self._save_ui_settings()
+        if self._radargram_dock is not None:
+            try:
+                self._radargram_dock.cleanup()
+                self.iface.removeDockWidget(self._radargram_dock)
+                self._radargram_dock.deleteLater()
+            except Exception:
+                pass
+            self._radargram_dock = None
+        if self._fence_dock is not None:
+            try:
+                self._fence_dock.cleanup()
+                self.iface.removeDockWidget(self._fence_dock)
+                self._fence_dock.deleteLater()
+            except Exception:
+                pass
+            self._fence_dock = None
         # Chiudi viewer GPR se aperto
         if self._gpr_profile_viewer is not None:
             try:
@@ -374,6 +684,14 @@ class GeoSurveyStudioPlugin(
                 QgsMessageLog.logMessage(str(e), "GeoSurvey Studio", Qgis.Warning)
             self.plugin_toolbar.deleteLater()
             self.plugin_toolbar = None
+        tools_dock = getattr(self, "tools_dock_widget", None)
+        if tools_dock is not None:
+            try:
+                self.iface.removeDockWidget(tools_dock)
+                tools_dock.deleteLater()
+            except Exception:
+                pass
+            self.tools_dock_widget = None
         if self.dock_widget is not None:
             self.iface.removeDockWidget(self.dock_widget)
             self.dock_widget.deleteLater()

@@ -967,10 +967,11 @@ class TraceInfoMixin(TraceInfoHelpMixin, TraceInfoStateMixin):
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         table.setColumnWidth(1, 170)
         table.setColumnWidth(2, 240)
-        table.setColumnWidth(3, 90)
+        table.setColumnWidth(3, 180)    # Radargramma
         table.setColumnWidth(4, 90)
-        table.setColumnWidth(5, 80)
-        table.setColumnWidth(6, 70)
+        table.setColumnWidth(5, 90)
+        table.setColumnWidth(6, 80)
+        table.setColumnWidth(7, 70)
         table.setColumnHidden(0, True)
         table.setColumnHidden(1, True)
         table_page_layout.addWidget(table, 1)
@@ -1262,6 +1263,19 @@ class TraceInfoMixin(TraceInfoHelpMixin, TraceInfoStateMixin):
                 hit_count = max(0, total_vertices)
                 no_hit_count = 0
             has_no_raster_hit = no_hit_count > 0
+            # Conteggio vertici: se vertex_depths si e' analizzato (parsed_vertices),
+            # e' la fonte piu' affidabile - copre anche le feature disegnate sul
+            # radargramma, che non hanno il layer companion delle etichette da cui
+            # viene "vertex_counts" (altrimenti sempre 0 per quelle).
+            vertices_total = (hit_count + no_hit_count) if parsed_vertices else int(vertex_counts.get(trace_id or f"fid_{fid}", 0))
+
+            group_name_val = str(group_name or "")
+            channel_val = feat.attribute("channel") if layer.fields().indexOf("channel") >= 0 else None
+            profile_stem_val = feat.attribute("profile_stem") if layer.fields().indexOf("profile_stem") >= 0 else ""
+            radar_ref = ""
+            if profile_stem_val:
+                ch_txt = f" ch{channel_val}" if channel_val not in (None, "") else ""
+                radar_ref = f"{group_name_val} · {profile_stem_val}{ch_txt}".strip(" ·")
 
             if mode_filter == "missing_z" and not missing_z:
                 continue
@@ -1276,10 +1290,11 @@ class TraceInfoMixin(TraceInfoHelpMixin, TraceInfoStateMixin):
                     "fid": str(fid),
                     "trace_id": str(trace_text),
                     "timeslice": str(ts_label),
+                    "radar_ref": str(radar_ref),
                     "depth": str(depth_txt),
                     "z_mode": str(z_mode_text),
                     "length": f"{float(length_val):.2f}",
-                    "vertices": str(vertex_counts.get(trace_text, 0)),
+                    "vertices": str(vertices_total),
                     "no_raster_hit": str(no_hit_count),
                     "notes": str(notes or ""),
                     "interpretation": str(interpretation or ""),
@@ -1297,12 +1312,13 @@ class TraceInfoMixin(TraceInfoHelpMixin, TraceInfoStateMixin):
                     "fid": fid,
                     "trace_id": trace_text,
                     "timeslice": ts_label,
+                    "radar_ref": radar_ref,
                     "depth_text": depth_txt,
                     "depth_num": depth_num,
                     "z_mode": z_mode_text,
                     "length_num": float(length_val),
                     "length_text": f"{float(length_val):.2f}",
-                    "vertices_text": str(vertex_counts.get(trace_text, 0)),
+                    "vertices_text": str(vertices_total),
                     "has_no_raster_hit": has_no_raster_hit,
                     "hit_count": int(hit_count),
                     "no_raster_hit_count": int(no_hit_count),

@@ -11,7 +11,9 @@ from PyQt5.QtWidgets import (
     QDialog,
     QVBoxLayout,
     QHBoxLayout,
-    QGridLayout,
+    QGroupBox,
+    QToolButton,
+    QMenu,
     QTabWidget,
     QLabel,
     QComboBox,
@@ -23,19 +25,31 @@ from PyQt5.QtWidgets import (
     QInputDialog,
     QProgressDialog,
     QApplication,
+    QDialogButtonBox,
+    QListWidget,
+    QListWidgetItem,
 )
 from qgis.core import QgsCoordinateReferenceSystem
 
-from .project_catalog import load_catalog, save_catalog, sanitize_filename, create_raster_group
+from .project_catalog import (
+    load_catalog, save_catalog, sanitize_filename, create_raster_group,
+    assign_timeslices_to_group, remove_timeslices_from_group,
+    detect_timeslice_prefix_groups, move_timeslices_into_group_folder,
+    group_folder_name, rescan_group_folders,
+)
 from .timeslice_group_table_models import TimesliceTableModel, GroupTableModel
 from .unassigned_timeslices_dialog import UnassignedTimeslicesDialog
+from .timeslice_batch_rename import BatchRenameDialog
+from . import group_ordering as _order
 
 
 class TimesliceGroupManagerDialog(QDialog):
-    def __init__(self, project_root, parent=None, on_updated=None, open_catalog_editor_callback=None):
+    def __init__(self, project_root, parent=None, on_updated=None, open_catalog_editor_callback=None,
+                 on_project_transferred=None):
         super().__init__(parent)
         self.project_root = project_root
         self.on_updated = on_updated
+        self.on_project_transferred = on_project_transferred
         self.open_catalog_editor_callback = open_catalog_editor_callback
         self._catalog = {}
         self.setWindowTitle("GeoSurvey Studio Time-slice / Group Manager")
@@ -64,7 +78,7 @@ class TimesliceGroupManagerDialog(QDialog):
         ts_layout.setSpacing(6)
 
         top_filter = QHBoxLayout()
-        top_filter.addWidget(QLabel("Filter by group:"))
+        top_filter.addWidget(QLabel("Show group:"))
         self.filter_group_combo = QComboBox()
         self.filter_group_combo.currentIndexChanged.connect(self._refresh_timeslice_table)
         top_filter.addWidget(self.filter_group_combo, 1)
@@ -72,65 +86,122 @@ class TimesliceGroupManagerDialog(QDialog):
         top_filter.addWidget(QLabel("Search:"))
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("name, id, path, group, CRS, depth...")
+        self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(self._refresh_timeslice_table)
         top_filter.addWidget(self.search_edit, 2)
+
+        select_all_btn = QPushButton("Select all shown")
+        select_all_btn.setToolTip("Select every row currently shown (respects group filter and search).")
+        select_all_btn.clicked.connect(lambda: self.ts_table.selectAll())
+        top_filter.addWidget(select_all_btn)
 
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self._refresh)
         top_filter.addWidget(refresh_btn)
         ts_layout.addLayout(top_filter)
 
-        actions_row1 = QHBoxLayout()
-        self.rename_btn = QPushButton("Rename Selected")
+        # Azioni raggruppate per categoria; tutte agiscono sulle righe selezionate.
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+
+        name_box = QGroupBox("Name")
+        name_lay = QHBoxLayout(name_box)
+        self.rename_btn = QPushButton("Rename...")
+        self.rename_btn.setToolTip("Rename the single selected time-slice.")
         self.rename_btn.clicked.connect(self._rename_selected)
-        actions_row1.addWidget(self.rename_btn)
-
-        self.batch_rename_btn = QPushButton("Batch Rename")
+        name_lay.addWidget(self.rename_btn)
+        self.batch_rename_btn = QPushButton("Batch rename...")
+        self.batch_rename_btn.setToolTip(
+            "Rename the selected time-slices: replace part of the name, "
+            "add prefix/suffix, or number them. Shows a preview first."
+        )
         self.batch_rename_btn.clicked.connect(self._batch_rename_selected)
-        actions_row1.addWidget(self.batch_rename_btn)
+        name_lay.addWidget(self.batch_rename_btn)
+        actions.addWidget(name_box)
 
-        self.remove_btn = QPushButton("Remove From Catalog")
-        self.remove_btn.clicked.connect(self._remove_selected_catalog_only)
-        actions_row1.addWidget(self.remove_btn)
-
-        self.delete_btn = QPushButton("Delete File + Remove")
-        self.delete_btn.clicked.connect(self._delete_selected)
-        actions_row1.addWidget(self.delete_btn)
-        ts_layout.addLayout(actions_row1)
-
-        actions_row2 = QGridLayout()
-        actions_row2.addWidget(QLabel("Group:"), 0, 0)
+        group_box = QGroupBox("Group")
+        group_lay = QHBoxLayout(group_box)
         self.group_action_combo = QComboBox()
-        actions_row2.addWidget(self.group_action_combo, 0, 1, 1, 3)
-
-        self.assign_btn = QPushButton("Assign To Group")
+        self.group_action_combo.setMinimumWidth(160)
+        group_lay.addWidget(self.group_action_combo, 1)
+        self.assign_btn = QPushButton("Add")
+        self.assign_btn.setToolTip("Add the selected time-slices to the chosen group.")
         self.assign_btn.clicked.connect(self._assign_selected_to_group)
-        actions_row2.addWidget(self.assign_btn, 1, 0, 1, 1)
-
-        self.unassign_btn = QPushButton("Remove From Group")
+        group_lay.addWidget(self.assign_btn)
+        self.unassign_btn = QPushButton("Remove")
+        self.unassign_btn.setToolTip("Remove the selected time-slices from the chosen group.")
         self.unassign_btn.clicked.connect(self._remove_selected_from_group)
-        actions_row2.addWidget(self.unassign_btn, 1, 1, 1, 1)
+        group_lay.addWidget(self.unassign_btn)
+        actions.addWidget(group_box, 1)
 
-        self.set_crs_btn = QPushButton("Set Assigned CRS")
-        self.set_crs_btn.clicked.connect(self._set_assigned_crs_single)
-        actions_row2.addWidget(self.set_crs_btn, 1, 2, 1, 1)
+        meta_box = QGroupBox("Depth / CRS")
+        meta_lay = QHBoxLayout(meta_box)
+        depth_btn = QToolButton()
+        depth_btn.setText("Depth")
+        depth_btn.setPopupMode(QToolButton.InstantPopup)
+        depth_menu = QMenu(depth_btn)
+        self.set_depth_btn = depth_menu.addAction("Set depth range...")
+        self.set_depth_btn.triggered.connect(self._set_depth_range_selected)
+        self.sequence_depth_btn = depth_menu.addAction("Auto depth sequence...")
+        self.sequence_depth_btn.triggered.connect(self._auto_depth_sequence_selected)
+        self.clear_depth_btn = depth_menu.addAction("Clear depth")
+        self.clear_depth_btn.triggered.connect(self._clear_depth_range_selected)
+        depth_btn.setMenu(depth_menu)
+        meta_lay.addWidget(depth_btn)
+        crs_btn = QToolButton()
+        crs_btn.setText("Assigned CRS")
+        crs_btn.setPopupMode(QToolButton.InstantPopup)
+        crs_menu = QMenu(crs_btn)
+        self.set_crs_btn = crs_menu.addAction("Set assigned CRS...")
+        self.set_crs_btn.triggered.connect(self._set_assigned_crs_single)
+        self.clear_crs_btn = crs_menu.addAction("Clear assigned CRS")
+        self.clear_crs_btn.triggered.connect(self._clear_assigned_crs_selected)
+        crs_btn.setMenu(crs_menu)
+        meta_lay.addWidget(crs_btn)
+        actions.addWidget(meta_box)
 
-        self.clear_crs_btn = QPushButton("Clear Assigned CRS")
-        self.clear_crs_btn.clicked.connect(self._clear_assigned_crs_selected)
-        actions_row2.addWidget(self.clear_crs_btn, 1, 3, 1, 1)
+        order_box = QGroupBox("Order")
+        order_lay = QHBoxLayout(order_box)
+        order_tip = (
+            "Order inside the group shown in 'Show group'. The first image is on top "
+            "in the QGIS layer panel and is the first step of the navigation dial."
+        )
+        self.move_up_btn = QPushButton("Up")
+        self.move_up_btn.setToolTip("Move the selected images up in the group. " + order_tip)
+        self.move_up_btn.clicked.connect(lambda: self._move_selected_in_group(-1))
+        order_lay.addWidget(self.move_up_btn)
+        self.move_down_btn = QPushButton("Down")
+        self.move_down_btn.setToolTip("Move the selected images down in the group. " + order_tip)
+        self.move_down_btn.clicked.connect(lambda: self._move_selected_in_group(1))
+        order_lay.addWidget(self.move_down_btn)
+        sort_btn = QToolButton()
+        sort_btn.setText("Sort")
+        sort_btn.setToolTip(order_tip)
+        sort_btn.setPopupMode(QToolButton.InstantPopup)
+        sort_menu = QMenu(sort_btn)
+        sort_menu.addAction("By depth: shallowest on top").triggered.connect(
+            lambda: self._sort_shown_group("depth"))
+        sort_menu.addAction("By depth: deepest on top").triggered.connect(
+            lambda: self._sort_shown_group("depth_desc"))
+        sort_menu.addAction("By name").triggered.connect(lambda: self._sort_shown_group("name"))
+        sort_btn.setMenu(sort_menu)
+        order_lay.addWidget(sort_btn)
+        actions.addWidget(order_box)
 
-        self.set_depth_btn = QPushButton("Set Depth Range")
-        self.set_depth_btn.clicked.connect(self._set_depth_range_selected)
-        actions_row2.addWidget(self.set_depth_btn, 2, 0, 1, 1)
-
-        self.clear_depth_btn = QPushButton("Clear Depth")
-        self.clear_depth_btn.clicked.connect(self._clear_depth_range_selected)
-        actions_row2.addWidget(self.clear_depth_btn, 2, 1, 1, 1)
-
-        self.sequence_depth_btn = QPushButton("Auto Depth Sequence")
-        self.sequence_depth_btn.clicked.connect(self._auto_depth_sequence_selected)
-        actions_row2.addWidget(self.sequence_depth_btn, 2, 2, 1, 2)
-        ts_layout.addLayout(actions_row2)
+        del_box = QGroupBox("Remove")
+        del_lay = QHBoxLayout(del_box)
+        del_btn = QToolButton()
+        del_btn.setText("Remove")
+        del_btn.setPopupMode(QToolButton.InstantPopup)
+        del_menu = QMenu(del_btn)
+        self.remove_btn = del_menu.addAction("From catalog only (keep files)")
+        self.remove_btn.triggered.connect(self._remove_selected_catalog_only)
+        self.delete_btn = del_menu.addAction("Delete files from disk too...")
+        self.delete_btn.triggered.connect(self._delete_selected)
+        del_btn.setMenu(del_menu)
+        del_lay.addWidget(del_btn)
+        actions.addWidget(del_box)
+        ts_layout.addLayout(actions)
 
         self.ts_table = QTableView(self)
         self.ts_model = TimesliceTableModel(self)
@@ -138,9 +209,25 @@ class TimesliceGroupManagerDialog(QDialog):
         self.ts_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.ts_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.ts_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.ts_table.setSortingEnabled(True)
+        self.ts_table.setSortingEnabled(False)
+        self.ts_table.verticalHeader().setVisible(True)
         self.ts_table.horizontalHeader().setStretchLastSection(True)
         ts_layout.addWidget(self.ts_table)
+
+        self.ts_count_label = QLabel("")
+        ts_layout.addWidget(self.ts_count_label)
+
+        self.ts_manifest_note = QLabel("")
+        self.ts_manifest_note.setWordWrap(True)
+        self.ts_manifest_note.setStyleSheet("color: #666; font-style: italic;")
+        self.ts_manifest_note.setVisible(False)
+        ts_layout.addWidget(self.ts_manifest_note)
+
+        ts_selection_model = self.ts_table.selectionModel()
+        if ts_selection_model is not None:
+            ts_selection_model.selectionChanged.connect(
+                lambda _sel, _desel: (self._refresh_manifest_note(), self._update_count_label())
+            )
 
         tabs.addTab(ts_tab, "Time-slices")
 
@@ -173,7 +260,36 @@ class TimesliceGroupManagerDialog(QDialog):
         verify_unassigned_btn = QPushButton("Verify Unassigned")
         verify_unassigned_btn.clicked.connect(self._verify_unassigned_clicked)
         grp_actions.addWidget(verify_unassigned_btn)
+
+        detect_groups_btn = QPushButton("Detect Groups")
+        detect_groups_btn.setToolTip(
+            "Raggruppa le time-slice sciolte in timeslices_2d per inizio del nome "
+            "e propone di creare una cartella e un gruppo per ciascun gruppo trovato."
+        )
+        detect_groups_btn.clicked.connect(self._detect_groups_from_names)
+        grp_actions.addWidget(detect_groups_btn)
+        rescan_btn = QPushButton("Rescan Folders")
+        rescan_btn.setToolTip(
+            "Ricollega ai gruppi le time-slice che stanno nelle cartelle "
+            "timeslices_2d/<gruppo> ma non sono nel catalogo."
+        )
+        rescan_btn.clicked.connect(self._rescan_folders_clicked)
+        grp_actions.addWidget(rescan_btn)
+        grp_order = QHBoxLayout()
+        grp_order.addWidget(QLabel("Group order (top of the QGIS panel first):"))
+        up_g = QPushButton("Move Up")
+        up_g.clicked.connect(lambda: self._move_selected_group(-1))
+        grp_order.addWidget(up_g)
+        down_g = QPushButton("Move Down")
+        down_g.clicked.connect(lambda: self._move_selected_group(1))
+        grp_order.addWidget(down_g)
+        sort_all_btn = QPushButton("Sort All Groups' Images By Depth")
+        sort_all_btn.setToolTip("Shallowest image first (on top) in every group.")
+        sort_all_btn.clicked.connect(self._sort_all_groups_by_depth)
+        grp_order.addWidget(sort_all_btn)
+        grp_order.addStretch(1)
         grp_layout.addLayout(grp_actions)
+        grp_layout.addLayout(grp_order)
 
         self.group_table = QTableView(self)
         self.group_model = GroupTableModel(self)
@@ -181,7 +297,8 @@ class TimesliceGroupManagerDialog(QDialog):
         self.group_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.group_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.group_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.group_table.setSortingEnabled(True)
+        self.group_table.setSortingEnabled(False)
+        self.group_table.verticalHeader().setVisible(True)
         self.group_table.horizontalHeader().setStretchLastSection(True)
         group_selection_model = self.group_table.selectionModel()
         if group_selection_model is not None:
@@ -197,6 +314,14 @@ class TimesliceGroupManagerDialog(QDialog):
             open_catalog_btn = QPushButton("Open 3D/Radargram Editor")
             open_catalog_btn.clicked.connect(self._open_catalog_editor)
             footer.addWidget(open_catalog_btn)
+        transfer_btn = QPushButton("Transfer project...")
+        transfer_btn.setToolTip(
+            "Copia (o sposta) l'intero progetto in un'altra cartella e aggiorna "
+            "i metadati (catalogo, project.json, sliceset, progetti QGIS) "
+            "perche' il nuovo percorso venga riconosciuto alla riapertura."
+        )
+        transfer_btn.clicked.connect(self._transfer_project)
+        footer.addWidget(transfer_btn)
         footer.addStretch(1)
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.close)
@@ -299,6 +424,7 @@ class TimesliceGroupManagerDialog(QDialog):
         search_text = (self.search_edit.text() or "").strip().lower()
         selected_tids = set(self._selected_timeslice_ids())
         allowed = None
+        group = None
         if filter_gid:
             group = next((g for g in self._catalog.get("raster_groups", []) if g.get("id") == filter_gid), None)
             allowed = set(group.get("timeslice_ids", []) if group else [])
@@ -355,7 +481,17 @@ class TimesliceGroupManagerDialog(QDialog):
                 }
             )
 
-        model_rows.sort(key=lambda r: (r.get("name") or r.get("id") or "").lower())
+        if filter_gid and group is not None:
+            pos = {t: i for i, t in enumerate(group.get("timeslice_ids", []))}
+            model_rows.sort(key=lambda r: pos.get(r.get("id"), len(pos)))
+        else:
+            # 'All': ordine dei gruppi (come nel catalogo), poi ordine nel gruppo
+            pos = {}
+            for g in self._catalog.get("raster_groups", []):
+                for t in g.get("timeslice_ids", []):
+                    pos.setdefault(t, len(pos))
+            model_rows.sort(key=lambda r: (pos.get(r.get("id"), len(pos)),
+                                           (r.get("name") or r.get("id") or "").lower()))
         self.ts_model.set_rows(model_rows)
         self.ts_table.resizeColumnsToContents()
 
@@ -371,6 +507,16 @@ class TimesliceGroupManagerDialog(QDialog):
                         idx,
                         QItemSelectionModel.Select | QItemSelectionModel.Rows,
                     )
+
+        self._refresh_manifest_note()
+        self._update_count_label()
+
+    def _update_count_label(self):
+        label = getattr(self, "ts_count_label", None)
+        if label is not None:
+            label.setText(
+                f"{len(self._selected_timeslice_ids())} selected of {self.ts_model.rowCount()} shown"
+            )
 
     def _refresh_group_table(self):
         groups = list(self._catalog.get("raster_groups", []))
@@ -392,8 +538,7 @@ class TimesliceGroupManagerDialog(QDialog):
                 }
             )
 
-        model_rows.sort(key=lambda r: (r.get("name") or r.get("id") or "").lower())
-        self.group_model.set_rows(model_rows)
+        self.group_model.set_rows(model_rows)  # ordine del catalogo
         self.group_table.resizeColumnsToContents()
 
         if selected_gid:
@@ -430,6 +575,59 @@ class TimesliceGroupManagerDialog(QDialog):
 
     def _timeslice_record_by_id(self, tid):
         return next((r for r in self._catalog.get("timeslices", []) if r.get("id") == tid), None)
+
+    @staticmethod
+    def _record_dir_has_sliceset(rec):
+        """True se il record vive in una cartella con ``sliceset.json``
+        (la profondita' e' quindi autorevole e non va sovrascritta a mano)."""
+        if not isinstance(rec, dict):
+            return False
+        p = str(rec.get("project_path") or "").strip()
+        if not p:
+            return False
+        d = os.path.dirname(os.path.abspath(p))
+        return os.path.isfile(os.path.join(d, "sliceset.json"))
+
+    def _selected_records_with_sliceset(self):
+        out = []
+        for tid in self._selected_timeslice_ids():
+            rec = self._timeslice_record_by_id(tid)
+            if rec is not None and self._record_dir_has_sliceset(rec):
+                out.append(rec.get("normalized_name") or rec.get("name") or rec.get("id"))
+        return out
+
+    def _refresh_manifest_note(self):
+        note = getattr(self, "ts_manifest_note", None)
+        if note is None:
+            return
+        names = self._selected_records_with_sliceset()
+        if names:
+            note.setText(
+                "Profondita' da sliceset.json (manifesto autorevole) per "
+                f"{len(names)} time-slice selezionate — 'Set Depth Range' e "
+                "'Auto Depth Sequence' sono disabilitati per questa selezione."
+            )
+            note.setVisible(True)
+        else:
+            note.setVisible(False)
+        gated = bool(names)
+        for btn in (getattr(self, "set_depth_btn", None),
+                    getattr(self, "sequence_depth_btn", None)):
+            if btn is not None:
+                btn.setEnabled(not gated)
+
+    def _depth_edit_blocked_by_manifest(self, title):
+        names = self._selected_records_with_sliceset()
+        if not names:
+            return False
+        QMessageBox.information(
+            self, title,
+            "La profondita' di queste time-slice proviene da sliceset.json "
+            "(manifesto autorevole della generazione) e non va modificata a "
+            "mano.\n\nRigenera il set per cambiarla, oppure usa 'Clear Depth' "
+            "e reimporta se devi forzare valori diversi.",
+        )
+        return True
 
     def _group_record_by_id(self, gid):
         return next((g for g in self._catalog.get("raster_groups", []) if g.get("id") == gid), None)
@@ -489,7 +687,7 @@ class TimesliceGroupManagerDialog(QDialog):
         name = str(group_name or "").strip()
         if not name:
             return None
-        candidate = os.path.abspath(os.path.join(root, name))
+        candidate = os.path.abspath(os.path.join(root, group_folder_name(name)))
         if not self._is_within_root(candidate, root):
             return None
         if os.path.normcase(candidate) == os.path.normcase(root):
@@ -524,6 +722,86 @@ class TimesliceGroupManagerDialog(QDialog):
                 warnings.append(f"Sidecar rename failed for {old_side}: {e}")
         return warnings
 
+    @staticmethod
+    def _detach_layers_for_rename(paths):
+        """Toglie dal progetto QGIS i layer dei file in ``paths`` ricordando
+        gruppo padre, posizione, stile, nome e visibilita'."""
+        saved = []
+        try:
+            from qgis.core import QgsProject
+            from qgis.PyQt.QtXml import QDomDocument
+            wanted = {os.path.normcase(os.path.abspath(p)) for p in paths if p}
+            project = QgsProject.instance()
+            tree = project.layerTreeRoot()
+            for layer in list(project.mapLayers().values()):
+                src = os.path.normcase(os.path.abspath(str(layer.source()).split("|")[0]))
+                if src not in wanted:
+                    continue
+                node = tree.findLayer(layer.id())
+                parent_names, index, visible = [], 0, True
+                if node is not None:
+                    visible = bool(node.itemVisibilityChecked())
+                    parent = node.parent()
+                    index = parent.children().index(node) if parent is not None else 0
+                    while parent is not None and parent.parent() is not None:
+                        parent_names.insert(0, parent.name())
+                        parent = parent.parent()
+                doc = QDomDocument("qgis")
+                layer.exportNamedStyle(doc)
+                saved.append({
+                    "path": str(layer.source()).split("|")[0],
+                    "name": layer.name(),
+                    "style": doc.toString(),
+                    "visible": visible,
+                    "parents": parent_names,
+                    "index": index,
+                })
+                project.removeMapLayer(layer.id())
+        except Exception:
+            pass
+        saved.sort(key=lambda s: (s["parents"], s["index"]))
+        return saved
+
+    @staticmethod
+    def _reattach_layers_after_rename(saved, moves):
+        """Ricrea i layer staccati: dal nuovo percorso se il file e' stato
+        rinominato, dal vecchio altrimenti; stessa posizione nell'albero."""
+        if not saved:
+            return
+        try:
+            from qgis.core import QgsLayerTreeGroup, QgsProject, QgsRasterLayer
+            from qgis.PyQt.QtXml import QDomDocument
+            norm = lambda p: os.path.normcase(os.path.abspath(p))
+            new_by_old = {norm(o): n for o, n in moves}
+            project = QgsProject.instance()
+            root = project.layerTreeRoot()
+            for item in saved:
+                old = item["path"]
+                new = new_by_old.get(norm(old), old)
+                name = item["name"]
+                if new != old and name in (os.path.basename(old), os.path.splitext(os.path.basename(old))[0]):
+                    name = os.path.splitext(os.path.basename(new))[0]
+                lyr = QgsRasterLayer(new, name)
+                if not lyr.isValid():
+                    continue
+                try:
+                    doc = QDomDocument()
+                    if doc.setContent(item["style"]):
+                        lyr.importNamedStyle(doc)
+                except Exception:
+                    pass
+                target = root
+                for gname in item["parents"]:
+                    nxt = next((g for g in target.children()
+                                if isinstance(g, QgsLayerTreeGroup) and g.name() == gname), None)
+                    target = nxt if nxt is not None else target.addGroup(gname)
+                project.addMapLayer(lyr, False)
+                node = target.insertLayer(min(item["index"], len(target.children())), lyr)
+                if node is not None:
+                    node.setItemVisibilityChecked(item["visible"])
+        except Exception:
+            pass
+
     def _rename_selected(self):
         tids = self._selected_timeslice_ids()
         if len(tids) != 1:
@@ -549,15 +827,20 @@ class TimesliceGroupManagerDialog(QDialog):
             QMessageBox.warning(self, "Time-slice Manager", "A file with this name already exists.")
             return
 
+        saved_layers = self._detach_layers_for_rename([old_path])
+        moves = []
         try:
             warnings = self._rename_file_with_sidecars(old_path, new_path)
+            moves.append((old_path, new_path))
             rec["project_path"] = new_path
             rec["normalized_name"] = new_name
             rec["name"] = os.path.splitext(new_name)[0]
+            self._reattach_layers_after_rename(saved_layers, moves)
             self._save_and_refresh()
             if warnings:
                 QMessageBox.warning(self, "Rename completed with warnings", "\n".join(warnings[:10]))
         except Exception as e:
+            self._reattach_layers_after_rename(saved_layers, moves)
             QMessageBox.critical(self, "Time-slice Manager", f"Rename failed:\n{e}")
 
     def _batch_rename_selected(self):
@@ -566,59 +849,18 @@ class TimesliceGroupManagerDialog(QDialog):
             QMessageBox.information(self, "Time-slice Manager", "Select one or more time-slices.")
             return
 
-        prefix, ok = QInputDialog.getText(self, "Batch rename", "Filename prefix:", text="timeslice_")
-        if not ok:
-            return
-        prefix = sanitize_filename(prefix.strip())
-        if not prefix:
-            QMessageBox.warning(self, "Time-slice Manager", "Prefix cannot be empty.")
-            return
-
-        start_idx, ok = QInputDialog.getInt(self, "Batch rename", "Start index:", value=1, min=0, max=1000000)
-        if not ok:
-            return
-        padding, ok = QInputDialog.getInt(self, "Batch rename", "Number padding:", value=3, min=1, max=8)
-        if not ok:
-            return
-
-        records = []
-        for tid in tids:
-            rec = self._timeslice_record_by_id(tid)
-            if rec is not None:
-                records.append(rec)
+        records = [r for r in (self._timeslice_record_by_id(t) for t in tids) if r is not None]
+        records = [r for r in records if r.get("project_path") and os.path.exists(r["project_path"])]
         if not records:
-            QMessageBox.warning(self, "Time-slice Manager", "No valid selected records.")
-            return
-
-        records.sort(key=lambda r: (r.get("normalized_name") or r.get("name") or r.get("id") or "").lower())
-        old_paths = {os.path.abspath(r.get("project_path") or "") for r in records}
-        plan = []
-        for i, rec in enumerate(records):
-            old_path = rec.get("project_path") or ""
-            if not old_path or not os.path.exists(old_path):
-                continue
-            _, ext = os.path.splitext(old_path)
-            new_name = f"{prefix}{str(start_idx + i).zfill(padding)}{ext.lower()}"
-            new_name = sanitize_filename(new_name)
-            new_path = os.path.join(os.path.dirname(old_path), new_name)
-            plan.append((rec, old_path, new_path, new_name))
-
-        if not plan:
             QMessageBox.warning(self, "Time-slice Manager", "No selected files are available on disk.")
             return
+        records.sort(key=lambda r: (r.get("normalized_name") or r.get("name") or r.get("id") or "").lower())
 
-        target_paths = [os.path.abspath(p[2]) for p in plan]
-        if len(target_paths) != len(set(target_paths)):
-            QMessageBox.warning(self, "Time-slice Manager", "Batch rename would generate duplicate target names.")
+        dlg = BatchRenameDialog([(r.get("id"), r["project_path"]) for r in records], parent=self)
+        if dlg.exec_() != QDialog.Accepted or not dlg.plan:
             return
-        for _, old_path, new_path, _ in plan:
-            old_abs = os.path.abspath(old_path)
-            new_abs = os.path.abspath(new_path)
-            if old_abs == new_abs:
-                continue
-            if os.path.exists(new_abs) and new_abs not in old_paths:
-                QMessageBox.warning(self, "Time-slice Manager", f"Target file already exists:\n{new_abs}")
-                return
+        by_id = {r.get("id"): r for r in records}
+        plan = [(by_id[k], old, new, name) for k, old, new, name in dlg.plan if k in by_id]
 
         progress = QProgressDialog("Batch renaming time-slices...", "Cancel", 0, len(plan), self)
         progress.setWindowTitle("Batch Rename")
@@ -628,14 +870,18 @@ class TimesliceGroupManagerDialog(QDialog):
 
         warnings = []
         renamed = 0
+        moves = []
+        # Su Windows un raster aperto in QGIS non si puo' rinominare: si staccano
+        # i layer, si rinomina, e si ricreano (stessa posizione, stile, visibilita').
+        saved_layers = self._detach_layers_for_rename([p[1] for p in plan])
         for idx, (rec, old_path, new_path, new_name) in enumerate(plan, start=1):
             if progress.wasCanceled():
                 break
             progress.setLabelText(f"Renaming {idx}/{len(plan)}: {os.path.basename(old_path)}")
             QApplication.processEvents()
             try:
-                side_warns = self._rename_file_with_sidecars(old_path, new_path)
-                warnings.extend(side_warns)
+                warnings.extend(self._rename_file_with_sidecars(old_path, new_path))
+                moves.append((old_path, new_path))
                 rec["project_path"] = new_path
                 rec["normalized_name"] = new_name
                 rec["name"] = os.path.splitext(new_name)[0]
@@ -646,6 +892,7 @@ class TimesliceGroupManagerDialog(QDialog):
             QApplication.processEvents()
 
         progress.close()
+        self._reattach_layers_after_rename(saved_layers, moves)
         self._save_and_refresh()
 
         msg = f"Batch rename completed: {renamed}/{len(plan)} files."
@@ -713,6 +960,9 @@ class TimesliceGroupManagerDialog(QDialog):
         progress.setMinimumDuration(0)
         progress.setValue(0)
 
+        # Un raster aperto in QGIS blocca il file su Windows: tolgo i layer dal
+        # progetto prima di cancellare (quelli non cancellati tornano sotto).
+        saved_layers = self._detach_layers_for_rename([r.get("project_path") for r in records])
         deleted_ids = set()
         warnings = []
         for idx, rec in enumerate(records, start=1):
@@ -736,6 +986,8 @@ class TimesliceGroupManagerDialog(QDialog):
             QApplication.processEvents()
 
         progress.close()
+        self._reattach_layers_after_rename(
+            [s for s in saved_layers if os.path.exists(s["path"])], [])
 
         if deleted_ids:
             self._catalog["timeslices"] = [
@@ -806,6 +1058,8 @@ class TimesliceGroupManagerDialog(QDialog):
         if not tids:
             QMessageBox.information(self, "Set Depth Range", "Select one or more time-slices.")
             return
+        if self._depth_edit_blocked_by_manifest("Set Depth Range"):
+            return
 
         from_txt, ok = QInputDialog.getText(
             self,
@@ -874,6 +1128,8 @@ class TimesliceGroupManagerDialog(QDialog):
         tids = self._selected_timeslice_ids()
         if len(tids) < 1:
             QMessageBox.information(self, "Auto Depth Sequence", "Select one or more time-slices.")
+            return
+        if self._depth_edit_blocked_by_manifest("Auto Depth Sequence"):
             return
 
         start_txt, ok = QInputDialog.getText(self, "Auto Depth Sequence", "Start depth:", text="0.0")
@@ -969,6 +1225,286 @@ class TimesliceGroupManagerDialog(QDialog):
         if not created:
             QMessageBox.information(self, "Create Group", f"Group '{group.get('name')}' already exists.")
 
+    # ---- ordine gruppi / immagini
+    def _shown_group(self):
+        """Gruppo su cui agisce l'ordine: quello scelto in 'Show group'; con
+        'All', l'unico gruppo che contiene tutte le righe selezionate."""
+        gid = self.filter_group_combo.currentData()
+        if gid:
+            return self._group_record_by_id(gid)
+        tids = set(self._selected_timeslice_ids())
+        if not tids:
+            return None
+        owners = [g for g in self._catalog.get("raster_groups", [])
+                  if tids <= set(g.get("timeslice_ids", []))]
+        non_system = [g for g in owners if g.get("id") != "grp_imported" and not g.get("system")]
+        owners = non_system or owners
+        return owners[0] if len(owners) == 1 else None
+
+    def _apply_slice_order(self, group):
+        recs = {r.get("id"): r for r in self._catalog.get("timeslices", [])}
+        paths = [recs[t].get("project_path") for t in group.get("timeslice_ids", []) if t in recs]
+        _order.apply_slice_order_to_qgis(group.get("name"), paths)
+
+    def _move_selected_in_group(self, delta):
+        group = self._shown_group()
+        if group is None:
+            QMessageBox.information(
+                self, "Order", "Choose a group in 'Show group' first: the order is per group.")
+            return
+        tids = self._selected_timeslice_ids()
+        if not tids:
+            QMessageBox.information(self, "Order", "Select one or more time-slices.")
+            return
+        group["timeslice_ids"] = _order.move_items(group.get("timeslice_ids", []), tids, delta)
+        self._apply_slice_order(group)
+        self._save_and_refresh()
+
+    def _sort_shown_group(self, mode):
+        group = self._shown_group()
+        if group is None:
+            QMessageBox.information(
+                self, "Order",
+                "Choose a group in 'Show group' (or select rows of one group) first: "
+                "the order is per group.")
+            return
+        recs ={r.get("id"): r for r in self._catalog.get("timeslices", [])}
+        group["timeslice_ids"] = _order.sort_ids(group.get("timeslice_ids", []), recs, mode)
+        self._apply_slice_order(group)
+        self._save_and_refresh()
+
+    def _sort_all_groups_by_depth(self):
+        recs = {r.get("id"): r for r in self._catalog.get("timeslices", [])}
+        n = 0
+        for group in self._catalog.get("raster_groups", []):
+            if not group.get("timeslice_ids"):
+                continue
+            group["timeslice_ids"] = _order.sort_ids(group["timeslice_ids"], recs, "depth")
+            self._apply_slice_order(group)
+            n += 1
+        self._save_and_refresh()
+        QMessageBox.information(self, "Order", f"Images sorted by depth (shallowest on top) in {n} group(s).")
+
+    def _move_selected_group(self, delta):
+        gid = self._selected_group_id()
+        if not gid:
+            QMessageBox.information(self, "Order", "Select one group.")
+            return
+        groups = self._catalog.get("raster_groups", [])
+        ids = _order.move_items([g.get("id") for g in groups], [gid], delta)
+        by_id = {g.get("id"): g for g in groups}
+        self._catalog["raster_groups"] = [by_id[i] for i in ids]
+        _order.apply_group_order_to_qgis([g.get("name") for g in self._catalog["raster_groups"]])
+        self._save_and_refresh()
+
+    def _rescan_folders_clicked(self):
+        res = rescan_group_folders(self.project_root)
+        self._refresh()
+        if callable(self.on_updated):
+            try:
+                self.on_updated()
+            except Exception:
+                pass
+        QMessageBox.information(
+            self, "Rescan Folders",
+            f"Time-slice ricollegate: {res['registered']} in {res['groups']} gruppo/i."
+            if res["registered"] else "Nessuna time-slice da ricollegare: le cartelle sono gia' allineate al catalogo.",
+        )
+
+    def _detect_groups_from_names(self):
+        """Cerca nel catalogo le time-slice sciolte in timeslices_2d, le raggruppa
+        per inizio del nome e, su conferma, crea cartella + gruppo per ognuna."""
+        self._dbg_lines = []
+        found = detect_timeslice_prefix_groups(self.project_root)
+        self._dbg(f"project_root={self.project_root}")
+        self._dbg(f"gruppi proposti: {[(e['prefix'], len(e['records'])) for e in found]}")
+        if not found:
+            self._dbg_flush()
+            QMessageBox.information(
+                self, "Detect Groups",
+                "Nessun gruppo da proporre: le time-slice sciolte in timeslices_2d "
+                "non condividono l'inizio del nome (servono almeno 2 file).",
+            )
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Detect Groups")
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel(
+            "Trovati questi gruppi dal nome delle time-slice. Quelli spuntati avranno "
+            "una cartella timeslices_2d/<nome> e un gruppo, e i file vi verranno spostati."
+        )
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+        lst = QListWidget(dlg)
+        for entry in found:
+            suffix = " (il gruppo esiste gia')" if entry["group"] else ""
+            item = QListWidgetItem(f"{entry['prefix']}  -  {len(entry['records'])} file{suffix}")
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            item.setData(Qt.UserRole, entry["prefix"])
+            lst.addItem(item)
+        lay.addWidget(lst)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dlg)
+        buttons.button(QDialogButtonBox.Ok).setText("Crea cartelle e gruppi")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        dlg.resize(520, 360)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        chosen = {
+            lst.item(i).data(Qt.UserRole)
+            for i in range(lst.count()) if lst.item(i).checkState() == Qt.Checked
+        }
+        if not chosen:
+            return
+
+        created, moved_total, failed = 0, 0, []
+        for entry in found:
+            if entry["prefix"] not in chosen:
+                continue
+            group, was_created = create_raster_group(self.project_root, entry["prefix"])
+            created += 1 if was_created else 0
+            ids = [r.get("id") for r in entry["records"] if r.get("id")]
+            self._dbg(f"[{entry['prefix']}] gruppo id={group.get('id')} creato={was_created} ids={len(ids)}")
+            _recs = {r.get("id"): r for r in entry["records"]}
+            saved_layers = self._detach_qgis_layers(
+                [_recs[i].get("project_path") for i in ids if i in _recs], self._dbg)
+            res = move_timeslices_into_group_folder(self.project_root, group.get("name"), ids)
+            moved_total += len(res["moved"])
+            failed.extend(res["failed"])
+            self._dbg(f"[{entry['prefix']}] file spostati={len(res['moved'])} falliti={res['failed'][:5]}")
+            for o, n in res["moved"][:3]:
+                self._dbg(f"    esempio: {o} -> {n}")
+            self._attach_qgis_layers(saved_layers, res["moved"], group.get("name"), self._dbg)
+            moved_ids = {
+                r.get("id") for r in load_catalog(self.project_root).get("timeslices", [])
+                if r.get("id") in set(ids)
+            }
+            assign_timeslices_to_group(self.project_root, group.get("id"), sorted(moved_ids))
+            _g = next((g for g in load_catalog(self.project_root).get("raster_groups", [])
+                       if g.get("id") == group.get("id")), {})
+            self._dbg(f"[{entry['prefix']}] catalogo: {len(_g.get('timeslice_ids', []))} slice nel gruppo")
+            try:
+                remove_timeslices_from_group(self.project_root, "grp_imported", sorted(moved_ids))
+            except Exception:
+                pass
+
+        self._catalog = load_catalog(self.project_root)
+        self._save_and_refresh()
+        msg = f"Gruppi creati: {created}. File spostati nelle cartelle: {moved_total}."
+        if failed:
+            msg += "\n\nNon spostati:\n" + "\n".join(failed[:10])
+        log_path = self._dbg_flush()
+        if log_path:
+            msg += f"\n\nLog di debug: {log_path}"
+        QMessageBox.information(self, "Detect Groups", msg)
+
+    def _dbg(self, text):
+        lines = getattr(self, "_dbg_lines", None)
+        if lines is None:
+            lines = self._dbg_lines = []
+        lines.append(str(text))
+
+    def _dbg_flush(self):
+        """Scrive il log nel progetto e nel pannello Log di QGIS."""
+        lines = list(getattr(self, "_dbg_lines", []) or [])
+        if not lines:
+            return ""
+        path = ""
+        try:
+            from qgis.core import Qgis, QgsMessageLog
+            QgsMessageLog.logMessage("\n".join(lines), "GeoSurvey Detect Groups", Qgis.Info)
+        except Exception:
+            pass
+        try:
+            path = os.path.join(self.project_root, "detect_groups_debug.log")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except Exception:
+            path = ""
+        return path
+
+    @staticmethod
+    def _detach_qgis_layers(paths, dbg=None):
+        """Toglie dal progetto QGIS i layer che puntano a ``paths``: su Windows
+        un raster aperto non si puo' spostare. Ritorna cio' che serve a
+        ricrearli (nome, stile, visibilita', file)."""
+        log = dbg if callable(dbg) else (lambda _t: None)
+        saved = []
+        try:
+            from qgis.core import QgsProject
+            from qgis.PyQt.QtXml import QDomDocument
+            wanted = {os.path.normcase(os.path.abspath(p)) for p in paths if p}
+            project = QgsProject.instance()
+            tree = project.layerTreeRoot()
+            log(f"  layer nel progetto QGIS: {len(project.mapLayers())}; file da spostare: {len(wanted)}")
+            for layer in list(project.mapLayers().values()):
+                src = os.path.normcase(os.path.abspath(str(layer.source()).split("|")[0]))
+                if src not in wanted:
+                    if "timeslices_2d" in src.lower():
+                        log(f"  layer NON abbinato: {layer.name()} src={src}")
+                    continue
+                node = tree.findLayer(layer.id())
+                doc = QDomDocument("qgis")
+                layer.exportNamedStyle(doc)
+                saved.append({
+                    "path": str(layer.source()).split("|")[0],
+                    "name": layer.name(),
+                    "style": doc.toString(),
+                    "visible": bool(node.itemVisibilityChecked()) if node is not None else True,
+                    "crs": layer.crs().authid(),
+                })
+                project.removeMapLayer(layer.id())
+            log(f"  layer staccati dal progetto: {len(saved)}")
+        except Exception:
+            import traceback
+            log("  ERRORE detach: " + traceback.format_exc())
+        return saved
+
+    @staticmethod
+    def _attach_qgis_layers(saved, moves, group_name, dbg=None):
+        """Ricrea i layer staccati dal nuovo percorso nel sottogruppo di
+        "GeoSurvey Studio" (dal vecchio se il file non si e' spostato)."""
+        log = dbg if callable(dbg) else (lambda _t: None)
+        if not saved:
+            return
+        try:
+            from qgis.core import QgsLayerTreeGroup, QgsProject, QgsRasterLayer
+            from qgis.PyQt.QtXml import QDomDocument
+            new_by_old = {os.path.normcase(os.path.abspath(o)): n for o, n in moves}
+            project = QgsProject.instance()
+            root = project.layerTreeRoot()
+            top = next((g for g in root.children()
+                        if isinstance(g, QgsLayerTreeGroup) and g.name() == "GeoSurvey Studio"), None)
+            if top is None:
+                top = root.addGroup("GeoSurvey Studio")
+            target = next((g for g in top.children()
+                           if isinstance(g, QgsLayerTreeGroup) and g.name() == group_name), None)
+            if target is None:
+                target = top.addGroup(group_name)
+            for item in saved:
+                new = new_by_old.get(os.path.normcase(os.path.abspath(item["path"])), item["path"])
+                lyr = QgsRasterLayer(new, item["name"])
+                if not lyr.isValid():
+                    log(f"  layer NON ricreato (non valido): {new}")
+                    continue
+                try:
+                    doc = QDomDocument()
+                    if doc.setContent(item["style"]):
+                        lyr.importNamedStyle(doc)
+                except Exception:
+                    pass
+                project.addMapLayer(lyr, False)
+                node = target.addLayer(lyr)
+                node.setItemVisibilityChecked(item["visible"])
+            log(f"  layer ricreati in '{group_name}': {len(saved)}")
+        except Exception:
+            import traceback
+            log("  ERRORE attach: " + traceback.format_exc())
+
     def _rename_group(self):
         gid = self._selected_group_id()
         if not gid:
@@ -1039,6 +1575,7 @@ class TimesliceGroupManagerDialog(QDialog):
         progress.setMinimumDuration(0)
         progress.setValue(0)
 
+        saved_layers = self._detach_layers_for_rename([r.get("project_path") for r in records])
         deleted_ids = set()
         failed_ids = set()
         warnings = []
@@ -1087,6 +1624,18 @@ class TimesliceGroupManagerDialog(QDialog):
                         deleted_ids.discard(tid)
                         failed_ids.add(tid)
 
+        # layer dei file rimasti su disco tornano nel pannello; il gruppo QGIS
+        # del gruppo eliminato si toglie se e' vuoto
+        self._reattach_layers_after_rename(
+            [s for s in saved_layers if os.path.exists(s["path"])], [])
+        try:
+            top = _order._plugin_root()
+            grp = next((g for g in top.children() if g.name() == name), None) if top else None
+            if grp is not None and not grp.children():
+                top.removeChildNode(grp)
+        except Exception:
+            pass
+
         if deleted_ids:
             self._catalog["timeslices"] = [
                 r for r in self._catalog.get("timeslices", []) if r.get("id") not in deleted_ids
@@ -1134,6 +1683,95 @@ class TimesliceGroupManagerDialog(QDialog):
         idx = self.filter_group_combo.findData(gid)
         if idx >= 0:
             self.filter_group_combo.setCurrentIndex(idx)
+
+    def _transfer_project(self):
+        from PyQt5.QtWidgets import QFileDialog
+        from . import project_transfer as pt
+
+        old_root = self.project_root
+        parent_dir = QFileDialog.getExistingDirectory(
+            self, "Cartella in cui creare il progetto trasferito")
+        if not parent_dir:
+            return
+        default_name = os.path.basename(os.path.normpath(old_root)) or "GeoSurveyStudioProject"
+        name, ok = QInputDialog.getText(
+            self, "Transfer project", "Nome della nuova cartella-progetto:", text=default_name)
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        new_root = os.path.normpath(os.path.join(parent_dir, name))
+        err = pt.validate_transfer(old_root, new_root)
+        if err:
+            QMessageBox.warning(self, "Transfer project", err)
+            return
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Transfer project")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"Trasferire il progetto\n{old_root}\n\nin\n{new_root}?")
+        box.setInformativeText(
+            "Copia: l'originale resta dov'e'. Sposta: l'originale viene cancellato "
+            "solo dopo che la copia e i metadati sono a posto.")
+        copy_btn = box.addButton("Copia", QMessageBox.AcceptRole)
+        move_btn = box.addButton("Sposta", QMessageBox.DestructiveRole)
+        box.addButton("Annulla", QMessageBox.RejectRole)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked not in (copy_btn, move_btn):
+            return
+        move = clicked is move_btn
+
+        progress = QProgressDialog("Copia del progetto...", "Annulla", 0, 100, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        def _progress(i, total, rel):
+            progress.setMaximum(max(1, total))
+            progress.setValue(i)
+            progress.setLabelText(f"Copia ({i}/{total}): {rel}")
+            QApplication.processEvents()
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            report = pt.transfer_project(
+                old_root, new_root, move=move,
+                progress=_progress, should_cancel=progress.wasCanceled)
+        except pt.TransferError as exc:
+            QApplication.restoreOverrideCursor()
+            progress.close()
+            QMessageBox.warning(self, "Transfer project", str(exc))
+            return
+        finally:
+            if QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
+        progress.close()
+
+        if callable(self.on_project_transferred):
+            try:
+                self.on_project_transferred(old_root, new_root)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, "Transfer project",
+                    f"Progetto copiato, ma l'aggiornamento del plugin e' fallito:\n{exc}")
+        self.project_root = new_root
+        self._refresh()
+
+        rw = report["rewrite"]
+        lines = [
+            f"Progetto trasferito in:\n{new_root}",
+            f"\nFile copiati: {report['copied']}",
+            f"File di metadati aggiornati: {rw['files']} ({rw['replacements']} riferimenti)",
+        ]
+        if move:
+            lines.append("Cartella originale cancellata." if report["moved"]
+                         else "ATTENZIONE: non sono riuscito a cancellare la cartella originale.")
+        ext = report["external"]
+        if ext:
+            lines.append(
+                f"\n{len(ext)} file del catalogo stanno fuori dalla cartella-progetto "
+                "e sono rimasti al loro posto (es. " + ext[0] + ").")
+        lines.append("\nSalva il progetto QGIS per fissare i nuovi percorsi dei layer.")
+        QMessageBox.information(self, "Transfer project", "\n".join(lines))
 
     def _open_catalog_editor(self):
         if not callable(self.open_catalog_editor_callback):

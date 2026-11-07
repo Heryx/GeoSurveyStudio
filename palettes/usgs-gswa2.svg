@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg version="1.1" xmlns="http://www.w3.org/2000/svg">
+  <linearGradient id="id-usgs-gswa2" data-name="usgs-gswa2" gradientUnits="objectBoundingBox" spreadMethod="pad" x1="0%" x2="100%" y1="0%" y2="0%">
+    <!--
+      cpt-city: usgs/usgs-gswa2 (cpt)
+
+      A land elevation scheme used by the U.S. Geological Survey
+      with modified variants by Dr. Richard L. Langford for the
+      Geological Survey of Western Australia
+
+      author: U.S. Geological Survey, R. Langford
+      copyright: Creative Commons Attribution-NonCommercial 3.0 unported
+      year: 2021
+      url: https://phillips.shef.ac.uk/pub/cpt-city/usgs
+    -->
+    <stop offset="0.0000%" stop-color="rgb(127, 159, 101)" stop-opacity="1.0000"/>
+    <stop offset="4.8000%" stop-color="rgb(130, 174, 106)" stop-opacity="1.0000"/>
+    <stop offset="9.5000%" stop-color="rgb(160, 194, 122)" stop-opacity="1.0000"/>
+    <stop offset="14.3000%" stop-color="rgb(186, 214, 140)" stop-opacity="1.0000"/>
+    <stop offset="19.0000%" stop-color="rgb(207, 226, 156)" stop-opacity="1.0000"/>
+    <stop offset="23.8000%" stop-color="rgb(224, 233, 166)" stop-opacity="1.0000"/>
+    <stop offset="28.6000%" stop-color="rgb(237, 236, 166)" stop-opacity="1.0000"/>
+    <stop offset="33.3000%" stop-color="rgb(242, 228, 159)" stop-opacity="1.0000"/>
+    <stop offset="38.1000%" stop-color="rgb(240, 210, 144)" stop-opacity="1.0000"/>
+    <stop offset="42.9000%" stop-color="rgb(230, 188, 136)" stop-opacity="1.0000"/>
+    <stop offset="47.6000%" stop-color="rgb(216, 165, 133)" stop-opacity="1.0000"/>
+    <stop offset="52.4000%" stop-color="rgb(197, 149, 138)" stop-opacity="1.0000"/>
+    <stop offset="57.1000%" stop-color="rgb(217, 165, 146)" stop-opacity="1.0000"/>
+    <stop offset="61.9000%" stop-color="rgb(227, 181, 153)" stop-opacity="1.0000"/>
+    <stop offset="66.7000%" stop-color="rgb(233, 196, 160)" stop-opacity="1.0000"/>
+    <stop offset="71.4000%" stop-color="rgb(234, 208, 170)" stop-opacity="1.0000"/>
+    <stop offset="76.2000%" stop-color="rgb(230, 214, 182)" stop-opacity="1.0000"/>
+    <stop offset="81.0000%" stop-color="rgb(228, 218, 194)" stop-opacity="1.0000"/>
+    <stop offset="85.7000%" stop-color="rgb(230, 219, 206)" stop-opacity="1.0000"/>
+    <stop offset="90.5000%" stop-color="rgb(240, 220, 220)" stop-opacity="1.0000"/>
+    <stop offset="95.2000%" stop-color="rgb(250, 230, 237)" stop-opacity="1.0000"/>
+    <stop offset="100.0000%" stop-color="rgb(255, 255, 255)" stop-opacity="1.0000"/>
+  </linearGradient>
+  <metadata>
+    <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:xm="http://jjg.gitlab.io/2025/metadata">
+      <rdf:Description>
+        <xm:creator name="cptutils" version="1.85"/>
+        <xm:created date="2026-02-08"/>
+      </rdf:Description>
+    </rdf:RDF>
+  </metadata>
+</svg>

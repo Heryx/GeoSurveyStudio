@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg version="1.1" xmlns="http://www.w3.org/2000/svg">
+  <linearGradient id="id-Atmospheric-HighGreyClouds" data-name="Atmospheric_HighGreyClouds" gradientUnits="objectBoundingBox" spreadMethod="pad" x1="0%" x2="100%" y1="0%" y2="0%">
+    <!--
+      cpt-city: nd/atmospheric/HighGreyClouds (ggr)
+
+      Extra gradients for the GIMP by Nevit Dilmen
+
+      author: Nevit Dilmen
+      copyright: GPL
+      year: 2007
+      url: https://phillips.shef.ac.uk/pub/cpt-city/nd/atmospheric
+    -->
+    <stop offset="0.0000%" stop-color="rgb(30, 76, 198)" stop-opacity="1.0000"/>
+    <stop offset="10.0000%" stop-color="rgb(87, 143, 221)" stop-opacity="1.0000"/>
+    <stop offset="25.5426%" stop-color="rgb(145, 210, 244)" stop-opacity="1.0000"/>
+    <stop offset="33.7229%" stop-color="rgb(186, 232, 244)" stop-opacity="1.0000"/>
+    <stop offset="35.3923%" stop-color="rgb(228, 255, 245)" stop-opacity="1.0000"/>
+    <stop offset="47.2454%" stop-color="rgb(195, 222, 231)" stop-opacity="1.0000"/>
+    <stop offset="70.0000%" stop-color="rgb(162, 188, 217)" stop-opacity="1.0000"/>
+    <stop offset="85.0000%" stop-color="rgb(150, 164, 179)" stop-opacity="1.0000"/>
+    <stop offset="100.0000%" stop-color="rgb(138, 140, 141)" stop-opacity="1.0000"/>
+  </linearGradient>
+  <metadata>
+    <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:xm="http://jjg.gitlab.io/2025/metadata">
+      <rdf:Description>
+        <xm:creator name="cptutils" version="1.85"/>
+        <xm:created date="2026-02-08"/>
+      </rdf:Description>
+    </rdf:RDF>
+  </metadata>
+</svg>

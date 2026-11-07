@@ -7,3 +7,10 @@ tmp_test_project/
 
 # Auto-generated Qt resources - regenerate with: make resources
 resources.py
+
+# Claude Code session data / worktrees
+.claude/
+
+# QGIS runtime leftovers
+ext.json
+symbology-style.db

@@ -285,10 +285,10 @@ of the geolocations record.
 
 If GeoSurvey Studio supports your work, please cite it as:
 
-> Guarino, G. (2026). *GeoSurvey Studio* (v1.1.0) [QGIS plugin]. GitHub.
-> https://github.com/Heryx/rasterlinker
+> Guarino, G. (2026). *GeoSurvey Studio* (v1.2.0) [QGIS plugin]. Zenodo.
+> https://github.com/Heryx/GeoSurveyStudio
 
 Suggested in-text citation: (Guarino, 2026)
 
-- Plugin source code: GPL-2.0-or-later
+- Plugin source code: GPL-2.0-or-later (full text in [`LICENSE`](LICENSE))
 - Documentation: CC BY 4.0 (recommended for reuse with attribution)

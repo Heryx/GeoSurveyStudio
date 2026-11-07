@@ -6,8 +6,10 @@ from qgis.PyQt.QtGui import QColor
 
 
 class TraceInfoTableModel(QAbstractTableModel):
-    HEADERS = ["FID", "Trace ID", "Time-slice", "Depth", "Z mode", "Length", "Vertices"]
-    COLUMN_KEYS = ("fid", "trace_id", "timeslice", "depth_text", "z_mode", "length_text", "vertices_text")
+    HEADERS = ["FID", "Trace ID", "Time-slice", "Radargramma", "Depth", "Z mode", "Length", "Vertices"]
+    COLUMN_KEYS = (
+        "fid", "trace_id", "timeslice", "radar_ref", "depth_text", "z_mode", "length_text", "vertices_text",
+    )
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -78,7 +80,7 @@ class TraceInfoTableModel(QAbstractTableModel):
                     "Depth/time-slice metadata is excluded for those vertices."
                 )
 
-        if role == Qt.TextAlignmentRole and col_idx in (0, 3, 5, 6):
+        if role == Qt.TextAlignmentRole and col_idx in (0, 4, 6, 7):   # fid, depth, length, vertices
             return int(Qt.AlignRight | Qt.AlignVCenter)
 
         return None

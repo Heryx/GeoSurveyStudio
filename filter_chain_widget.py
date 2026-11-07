@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from qgis.PyQt.QtCore import pyqtSignal
+from qgis.PyQt.QtCore import QEvent, QMimeData, Qt, pyqtSignal
+from qgis.PyQt.QtGui import QDrag
 from qgis.PyQt.QtWidgets import (
+    QApplication,
     QCheckBox,
     QFrame,
     QHBoxLayout,
@@ -19,12 +21,14 @@ class FilterBlockWidget(QWidget):
     moved_up = pyqtSignal(str)
     moved_down = pyqtSignal(str)
     toggled = pyqtSignal(str, bool)
+    drag_started = pyqtSignal(str)
 
     def __init__(self, step_id: str, label: str, help_text: str = "", parent=None):
         super().__init__(parent)
         self.step_id = str(step_id)
         self._label_text = str(label)
         self._help_text = str(help_text or "")
+        self._drag_start_pos = None
         self._build_ui()
 
     def _build_ui(self):
@@ -33,6 +37,7 @@ class FilterBlockWidget(QWidget):
         outer.setSpacing(0)
 
         header = QFrame(self)
+        self._header = header
         header.setFrameShape(QFrame.StyledPanel)
         h = QHBoxLayout(header)
         h.setContentsMargins(6, 3, 6, 3)
@@ -61,6 +66,8 @@ class FilterBlockWidget(QWidget):
         self._btn_expand.setChecked(False)
         self._btn_expand.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._btn_expand.toggled.connect(self._on_expand_toggled)
+        self._btn_expand.setCursor(Qt.OpenHandCursor)
+        self._btn_expand.installEventFilter(self)
 
         h.addWidget(self._btn_up)
         h.addWidget(self._btn_down)
@@ -108,6 +115,37 @@ class FilterBlockWidget(QWidget):
             self._params_widget = widget
             self._content_layout.addWidget(widget)
 
+    def eventFilter(self, source, event):
+        if source is self._btn_expand:
+            et = int(event.type())
+            if et == int(QEvent.MouseButtonPress):
+                if event.button() == Qt.LeftButton:
+                    self._drag_start_pos = event.pos()
+            elif et == int(QEvent.MouseMove):
+                if (event.buttons() & Qt.LeftButton) and (self._drag_start_pos is not None):
+                    if (event.pos() - self._drag_start_pos).manhattanLength() >= QApplication.startDragDistance():
+                        self._start_drag()
+                        self._drag_start_pos = None
+                        return True
+            elif et == int(QEvent.MouseButtonRelease):
+                self._drag_start_pos = None
+        return super().eventFilter(source, event)
+
+    def _start_drag(self):
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData("application/x-rasterlinker-filter-step", self.step_id.encode("utf-8"))
+        drag.setMimeData(mime)
+        try:
+            drag.setPixmap(self.grab())
+        except Exception:
+            pass
+        self.drag_started.emit(self.step_id)
+        try:
+            drag.exec_(Qt.MoveAction)
+        except Exception:
+            drag.exec(Qt.MoveAction)
+
 
 class FilterChainWidget(QWidget):
     """Ordered collection of filter blocks with up/down controls."""
@@ -118,6 +156,7 @@ class FilterChainWidget(QWidget):
         super().__init__(parent)
         self._blocks: list[FilterBlockWidget] = []
         self._suspend_emit = False
+        self.setAcceptDrops(True)
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(2)
@@ -185,3 +224,47 @@ class FilterChainWidget(QWidget):
         self._rebuild_layout()
         if emit_signal:
             self._emit_changed()
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat("application/x-rasterlinker-filter-step"):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat("application/x-rasterlinker-filter-step"):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        if not md.hasFormat("application/x-rasterlinker-filter-step"):
+            event.ignore()
+            return
+        try:
+            step_id = bytes(md.data("application/x-rasterlinker-filter-step")).decode("utf-8")
+        except Exception:
+            event.ignore()
+            return
+        current_idx = next((i for i, b in enumerate(self._blocks) if b.step_id == step_id), -1)
+        if current_idx < 0:
+            event.ignore()
+            return
+        target_idx = self._drop_target_index(event.pos().y())
+        if target_idx > current_idx:
+            target_idx -= 1
+        target_idx = max(0, min(target_idx, len(self._blocks) - 1))
+        if target_idx != current_idx:
+            block = self._blocks.pop(current_idx)
+            self._blocks.insert(target_idx, block)
+            self._rebuild_layout()
+            self._emit_changed()
+        event.acceptProposedAction()
+
+    def _drop_target_index(self, y_pos: int) -> int:
+        for i, block in enumerate(self._blocks):
+            center_y = int(block.y() + (block.height() / 2))
+            if y_pos < center_y:
+                return i
+        return len(self._blocks)

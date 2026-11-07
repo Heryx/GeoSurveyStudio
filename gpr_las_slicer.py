@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import os
-import textwrap
 
 import numpy as np
 
@@ -128,16 +127,18 @@ def _read_las_single(las_path: str, value_field: str):
     x      = np.asarray(las.x, dtype=np.float64)
     y      = np.asarray(las.y, dtype=np.float64)
     z      = np.asarray(las.z, dtype=np.float64)
-    values = None
     try:
         raw = np.asarray(getattr(las, value_field), dtype=np.float32)
-        if raw.size == len(x):
-            values = raw
-    except Exception:
-        pass
-    if values is None:
-        values = np.zeros(len(x), dtype=np.float32)
-    return x, y, z, values
+    except Exception as e:
+        raise ValueError(
+            f"Campo '{value_field}' non presente nel file LAS: {e}"
+        )
+    if raw.size != len(x):
+        raise ValueError(
+            f"Campo '{value_field}' ha dimensione incoerente "
+            f"({raw.size} valori per {len(x)} punti)."
+        )
+    return x, y, z, raw
 
 
 def _read_las_rgb(
@@ -155,11 +156,16 @@ def _read_las_rgb(
     def _get(field):
         try:
             arr = np.asarray(getattr(las, field), dtype=np.float32)
-            if arr.size == len(x):
-                return arr
-        except Exception:
-            pass
-        return np.zeros(len(x), dtype=np.float32)
+        except Exception as e:
+            raise ValueError(
+                f"Campo RGB '{field}' non presente nel file LAS: {e}"
+            )
+        if arr.size != len(x):
+            raise ValueError(
+                f"Campo RGB '{field}' ha dimensione incoerente "
+                f"({arr.size} valori per {len(x)} punti)."
+            )
+        return arr
 
     return x, y, z, _get(r_field), _get(g_field), _get(b_field)
 
@@ -167,6 +173,64 @@ def _read_las_rgb(
 # ---------------------------------------------------------------------------
 # IDW binning — isotropic gather with cKDTree
 # ---------------------------------------------------------------------------
+
+def _idw_gather(
+    x_pts: np.ndarray,
+    y_pts: np.ndarray,
+    x_min: float,
+    y_min: float,
+    n_x: int,
+    n_y: int,
+    resolution: float,
+    radius: float,
+    power: float = 2.0,
+    min_points: int = 1,
+) -> list[tuple[int, np.ndarray, np.ndarray]]:
+    """Precompute IDW neighbours and normalized weights per grid cell.
+
+    Only depends on point geometry (x, y), not on the interpolated value,
+    so the result can be reused across several value channels (e.g. R/G/B)
+    without rebuilding the KD-tree. Returns a list of
+    (cell_index, point_indices, normalized_weights).
+    """
+    from scipy.spatial import cKDTree
+
+    gx = x_min + np.arange(n_x) * resolution
+    gy = y_min + np.arange(n_y) * resolution
+    gxx, gyy  = np.meshgrid(gx, gy)
+    grid_pts  = np.column_stack([gxx.ravel(), gyy.ravel()])
+
+    tree    = cKDTree(np.column_stack([x_pts, y_pts]))
+    results = tree.query_ball_point(grid_pts, r=radius, workers=-1)
+
+    gather: list[tuple[int, np.ndarray, np.ndarray]] = []
+    for k, idx_list in enumerate(results):
+        if len(idx_list) < min_points:
+            continue
+        idx = np.asarray(idx_list, dtype=np.int64)
+        cx  = grid_pts[k, 0]
+        cy  = grid_pts[k, 1]
+        d   = np.sqrt((x_pts[idx] - cx) ** 2 + (y_pts[idx] - cy) ** 2)
+        w   = 1.0 / (d ** power + 1e-9)
+        ws  = w.sum()
+        if ws > 0:
+            gather.append((k, idx, w / ws))
+    return gather
+
+
+def _apply_idw(
+    gather: list[tuple[int, np.ndarray, np.ndarray]],
+    values: np.ndarray,
+    n_x: int,
+    n_y: int,
+) -> np.ndarray:
+    """Apply precomputed IDW weights to one value array -> (n_y, n_x) grid."""
+    v    = np.asarray(values, dtype=np.float64)
+    grid = np.full(n_x * n_y, np.nan, dtype=np.float32)
+    for k, idx, wn in gather:
+        grid[k] = float(np.dot(wn, v[idx]))
+    return grid.reshape(n_y, n_x)
+
 
 def _bin_with_idw(
     x_pts: np.ndarray,
@@ -181,168 +245,27 @@ def _bin_with_idw(
     power: float = 2.0,
     min_points: int = 1,
 ) -> np.ndarray:
-    """Isotropic IDW gather via scipy.spatial.cKDTree."""
-    from scipy.spatial import cKDTree
-
-    gx = x_min + np.arange(n_x) * resolution
-    gy = y_min + np.arange(n_y) * resolution
-    gxx, gyy  = np.meshgrid(gx, gy)
-    grid_pts  = np.column_stack([gxx.ravel(), gyy.ravel()])
-
-    tree    = cKDTree(np.column_stack([x_pts, y_pts]))
-    results = tree.query_ball_point(grid_pts, r=radius, workers=-1)
-
-    i_pts_f64 = i_pts.astype(np.float64)
-    grid      = np.full(n_x * n_y, np.nan, dtype=np.float32)
-
-    for k, idx_list in enumerate(results):
-        if len(idx_list) < min_points:
-            continue
-        idx = np.asarray(idx_list, dtype=np.int64)
-        cx  = grid_pts[k, 0]
-        cy  = grid_pts[k, 1]
-        d   = np.sqrt((x_pts[idx] - cx) ** 2 + (y_pts[idx] - cy) ** 2)
-        w   = 1.0 / (d ** power + 1e-9)
-        ws  = w.sum()
-        if ws > 0:
-            grid[k] = float(np.dot(w, i_pts_f64[idx]) / ws)
-
-    return grid.reshape(n_y, n_x)
-
-
-# ---------------------------------------------------------------------------
-# GeoTIFF writers
-# ---------------------------------------------------------------------------
-
-def _make_geotransform(x_min, y_max, resolution):
-    return (x_min - resolution / 2.0, resolution, 0.0,
-            y_max + resolution / 2.0, 0.0, -resolution)
-
-
-def _set_projection(ds, epsg):
-    from osgeo import osr
-    srs = osr.SpatialReference()
-    srs.ImportFromEPSG(int(epsg))
-    ds.SetProjection(srs.ExportToWkt())
-
-
-def _write_tif_singleband(grid, out_path, x_min, y_min, y_max, resolution, epsg):
-    from osgeo import gdal
-    NODATA = -9999.0
-    n_y, n_x = grid.shape
-    data = np.where(np.isnan(grid), NODATA, grid).astype(np.float32)
-    ds = gdal.GetDriverByName("GTiff").Create(
-        out_path, n_x, n_y, 1, gdal.GDT_Float32,
-        options=["COMPRESS=LZW", "TILED=YES"],
+    """Isotropic single-channel IDW (thin wrapper over gather/apply)."""
+    gather = _idw_gather(
+        x_pts, y_pts, x_min, y_min, n_x, n_y,
+        resolution, radius, power, min_points,
     )
-    ds.SetGeoTransform(_make_geotransform(x_min, y_max, resolution))
-    if epsg:
-        _set_projection(ds, epsg)
-    bnd = ds.GetRasterBand(1)
-    bnd.WriteArray(np.flipud(data))
-    bnd.SetNoDataValue(NODATA)
-    bnd.FlushCache()
-    ds.FlushCache()
-    ds = None
-
-
-def _write_tif_rgb(r_grid, g_grid, b_grid, out_path, x_min, y_min, y_max,
-                   resolution, epsg):
-    from osgeo import gdal
-    NODATA = -9999.0
-    n_y, n_x = r_grid.shape
-
-    def _prep(arr):
-        return np.where(np.isnan(arr), NODATA, arr).astype(np.float32)
-
-    bands_data = [_prep(r_grid), _prep(g_grid), _prep(b_grid)]
-    ds = gdal.GetDriverByName("GTiff").Create(
-        out_path, n_x, n_y, 3, gdal.GDT_Float32,
-        options=["COMPRESS=LZW", "TILED=YES"],
-    )
-    ds.SetGeoTransform(_make_geotransform(x_min, y_max, resolution))
-    if epsg:
-        _set_projection(ds, epsg)
-    for idx, data in enumerate(bands_data, start=1):
-        bnd = ds.GetRasterBand(idx)
-        bnd.WriteArray(np.flipud(data))
-        bnd.SetNoDataValue(NODATA)
-        bnd.FlushCache()
-    ds.FlushCache()
-    ds = None
-
-    def _range(arr):
-        v = arr[arr != NODATA]
-        return (float(v.min()), float(v.max())) if v.size else (0.0, 1.0)
-
-    mn_r, mx_r = _range(bands_data[0])
-    mn_g, mx_g = _range(bands_data[1])
-    mn_b, mx_b = _range(bands_data[2])
-    return mn_r, mx_r, mn_g, mx_g, mn_b, mx_b
+    return _apply_idw(gather, i_pts, n_x, n_y)
 
 
 # ---------------------------------------------------------------------------
-# QML sidecar
+# GeoTIFF / QML writers — single source of truth in raster_io.py (Fase A).
+# Aliases keep the historical private names for callers that import them
+# from this module (e.g. gpr_csv_slicer).
 # ---------------------------------------------------------------------------
 
-_QML_TEMPLATE = textwrap.dedent("""\
-    <!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
-    <qgis version="3.0" styleCategories="AllStyleCategories">
-      <flags>
-        <Identifiable>1</Identifiable><Removable>1</Removable>
-        <Searchable>0</Searchable>
-      </flags>
-      <pipe>
-        <provider>
-          <resampling enabled="false" maxOversampling="2"
-                      zoomedInResamplingMethod="nearestNeighbour"
-                      zoomedOutResamplingMethod="nearestNeighbour"/>
-        </provider>
-        <rasterrenderer type="multibandcolor" opacity="1" alphaBand="-1"
-                        redBand="1" greenBand="2" blueBand="3" nodataColor="">
-          <rasterTransparency/>
-          <minMaxOrigin>
-            <limits>MinMax</limits><extent>WholeRaster</extent>
-            <statAccuracy>Estimated</statAccuracy>
-            <cumulativeCutLower>0.02</cumulativeCutLower>
-            <cumulativeCutUpper>0.98</cumulativeCutUpper>
-            <stdDevFactor>2</stdDevFactor>
-          </minMaxOrigin>
-          <redContrastEnhancement>
-            <minValue>{min_r}</minValue><maxValue>{max_r}</maxValue>
-            <algorithm>StretchToMinimumMaximum</algorithm>
-          </redContrastEnhancement>
-          <greenContrastEnhancement>
-            <minValue>{min_g}</minValue><maxValue>{max_g}</maxValue>
-            <algorithm>StretchToMinimumMaximum</algorithm>
-          </greenContrastEnhancement>
-          <blueContrastEnhancement>
-            <minValue>{min_b}</minValue><maxValue>{max_b}</maxValue>
-            <algorithm>StretchToMinimumMaximum</algorithm>
-          </blueContrastEnhancement>
-        </rasterrenderer>
-        <brightnesscontrast brightness="0" contrast="0" gamma="1"/>
-        <huesaturation saturation="0" grayscaleMode="0" colorizeOn="0"
-                       colorizeRed="255" colorizeGreen="128" colorizeBlue="128"
-                       colorizeStrength="100" invertColors="0"/>
-        <rasterresampler maxOversampling="2"/>
-        <resamplingStage>resamplingFilter</resamplingStage>
-      </pipe>
-      <blendMode>0</blendMode>
-    </qgis>
-""")
-
-
-def _write_qml_multiband(tif_path, mn_r, mx_r, mn_g, mx_g, mn_b, mx_b):
-    qml = _QML_TEMPLATE.format(
-        min_r=mn_r, max_r=mx_r,
-        min_g=mn_g, max_g=mx_g,
-        min_b=mn_b, max_b=mx_b,
-    )
-    qml_path = os.path.splitext(tif_path)[0] + ".qml"
-    with open(qml_path, "w", encoding="utf-8") as f:
-        f.write(qml)
-    return qml_path
+from .raster_io import (  # noqa: E402,F401
+    make_geotransform as _make_geotransform,
+    set_projection as _set_projection,
+    write_qml_multiband as _write_qml_multiband,
+    write_tif_rgb as _write_tif_rgb,
+    write_tif_singleband as _write_tif_singleband,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -438,10 +361,15 @@ def slice_las_to_tifs(
                resolution=resolution, radius=radius,
                power=idw_power, min_points=min_points)
 
-    z_levels = np.arange(z_min, z_max + z_step * 0.5, z_step)
+    # Slice centers tile [z_min, z_max]: each window is [c - dz/2, c + dz/2),
+    # so no slice reaches below z_min or above z_max (coherent with the PDAL
+    # path in gpr_slice_generator.generate_slices_pdal).
+    z_centers = np.arange(z_min + z_step / 2.0, z_max, z_step)
+    if z_centers.size == 0:
+        z_centers = np.array([(z_min + z_max) / 2.0])
     results  = []
 
-    for iz, z_lev in enumerate(z_levels):
+    for iz, z_lev in enumerate(z_centers):
         z_from = float(z_lev - z_step / 2.0)
         z_to   = float(z_lev + z_step / 2.0)
         mask   = (z >= z_from) & (z < z_to)
@@ -453,11 +381,11 @@ def slice_las_to_tifs(
         tif_path = os.path.join(output_dir, tif_name)
 
         if use_rgb:
-            def _ch(ch_arr):
-                return _bin_with_idw(x[mask], y[mask], ch_arr[mask], **_kw)
-            r_grid = _ch(r)
-            g_grid = _ch(g)
-            b_grid = _ch(b)
+            # Build the KD-tree / weights once, reuse for the 3 channels.
+            gather = _idw_gather(x[mask], y[mask], **_kw)
+            r_grid = _apply_idw(gather, r[mask], n_x, n_y)
+            g_grid = _apply_idw(gather, g[mask], n_x, n_y)
+            b_grid = _apply_idw(gather, b[mask], n_x, n_y)
             ranges = _write_tif_rgb(
                 r_grid, g_grid, b_grid,
                 tif_path, x_min, y_min, y_max, resolution, epsg,

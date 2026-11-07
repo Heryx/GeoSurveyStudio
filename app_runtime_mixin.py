@@ -1,6 +1,6 @@
 import os
 
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
     QDockWidget,
@@ -8,7 +8,14 @@ from qgis.PyQt.QtWidgets import (
     QSizePolicy,
     QCheckBox,
 )
-from qgis.core import QgsMessageLog, Qgis
+from qgis.core import (
+    QgsMessageLog,
+    Qgis,
+    QgsLayerTreeGroup,
+    QgsLayerTreeLayer,
+    QgsProject,
+    QgsRasterLayer,
+)
 
 from .geosurvey_studio_dialog import GeoSurveyStudioDialog
 from .project_manager_dialog import ProjectManagerDialog
@@ -33,6 +40,16 @@ class AppRuntimeMixin:
         self.dock_widget = None
         self.dlg = None
         self.first_start = True
+        # The separate tools dock is parented to the QGIS main window, so it
+        # outlives the main dock; remove it here so run() rebuilds it cleanly.
+        tools_dock = getattr(self, "tools_dock_widget", None)
+        if tools_dock is not None:
+            try:
+                self.iface.removeDockWidget(tools_dock)
+                tools_dock.deleteLater()
+            except Exception:
+                pass
+            self.tools_dock_widget = None
         # Reset UI references that may still point to deleted Qt objects.
         if hasattr(self, "_init_ui_layout"):
             try:
@@ -230,6 +247,7 @@ class AppRuntimeMixin:
             )
             self.dlg.lineEditAreaNames.setAccessibleName("lineEditAreaNames")
             self._build_tools_tabs()
+            self._build_group_actions_panel()
             self._build_bottom_controls_layout()
             self._load_ui_settings()
             if self.internal_grid_checkbox is not None:
@@ -307,10 +325,234 @@ class AppRuntimeMixin:
             self.populate_group_list()
 
     def _on_project_manager_updated(self):
+        self.remember_active_project_in_qgis()
         if self.dlg is not None:
             self.populate_group_list()
             self.populate_raster_list_from_selected_groups()
             self.refresh_trace_info_table()
+
+    def _on_qgis_project_read(self):
+        """Invoked after QGIS loads a project file.
+
+        Groups saved in the .qgs layer tree are restored by QGIS, but raster
+        layers inside them may have broken data-source paths (e.g. because QGIS
+        stored relative paths that no longer resolve).  This handler:
+          1. Binds the plugin to the GPR project this QGIS project belongs to
+             (stored in the .qgz, or deduced from the loaded rasters).
+          2. Registers in the catalog the rasters already sitting in the
+             plugin groups but unknown to it.
+          3. Repairs broken raster sources using the plugin catalog as the
+             authoritative path database.
+          4. Refreshes the plugin group/raster list widgets.
+        """
+        QTimer.singleShot(500, self._bind_project_and_repair)
+
+    def remember_active_project_in_qgis(self):
+        """Writes the active GPR project root into the open QGIS project, so a
+        later reopen finds the right project instead of "the last one used"."""
+        try:
+            from . import project_binding
+            root = self._active_project_root()
+            if root and os.path.isdir(root):
+                project_binding.remember_root(root)
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                f"remember_active_project_in_qgis: {exc}", "GeoSurvey Studio", Qgis.Warning)
+
+    def _apply_active_project_root(self, root):
+        """Makes ``root`` the active GPR project everywhere (settings, Project
+        Manager, open Profile Viewer, radargram dock)."""
+        root = os.path.normpath(str(root or "").strip())
+        if not root or not os.path.isdir(root):
+            return False
+        current = self._active_project_root()
+        if current and os.path.normcase(os.path.normpath(current)) == os.path.normcase(root):
+            return False
+        self.settings.setValue(self.settings_key_active_project, root)
+        pm = self.project_manager_dialog
+        if pm is not None:
+            try:
+                pm.path_edit.setText(root)
+                pm.project_root = root
+            except Exception:
+                pass
+        viewer = getattr(self, "_gpr_profile_viewer", None)
+        if viewer is not None:
+            try:
+                viewer.on_active_project_changed()
+            except Exception:
+                pass
+        dock = getattr(self, "_radargram_dock", None)
+        if dock is not None:
+            try:
+                dock.refresh_variants()
+            except Exception:
+                pass
+        return True
+
+    def _bind_project_and_repair(self):
+        try:
+            from . import project_binding
+            plugin_root = self._find_plugin_root_group()
+            root = project_binding.resolve_root(plugin_root)
+            if root:
+                if self._apply_active_project_root(root):
+                    QgsMessageLog.logMessage(
+                        f"Progetto GPR attivo dal progetto QGIS: {root}",
+                        "GeoSurvey Studio", Qgis.Info)
+                project_binding.remember_root(root)
+                if plugin_root is not None:
+                    adopted = project_binding.adopt_untracked_timeslices(root, plugin_root)
+                    if adopted.get("registered") or adopted.get("assigned"):
+                        QgsMessageLog.logMessage(
+                            "Time-slice del canvas registrate nel catalogo: "
+                            f"{adopted.get('registered', 0)} nuove, "
+                            f"{adopted.get('assigned', 0)} assegnate a "
+                            f"{adopted.get('groups', 0)} gruppo/i.",
+                            "GeoSurvey Studio", Qgis.Info)
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                f"_bind_project_and_repair: {exc}", "GeoSurvey Studio", Qgis.Warning)
+        self._repair_broken_group_layers_from_catalog()
+        try:
+            self._amp_reconcile_project_layers()
+        except Exception as exc:
+            QgsMessageLog.logMessage(f"Ampiezze: ripristino fallito: {exc}", "GeoSurvey Studio", Qgis.Warning)
+
+    def _repair_broken_group_layers_from_catalog(self):
+        """Repair raster layers with broken sources inside plugin layer-tree groups.
+
+        For each layer node that lives under a plugin group:
+        - If the layer is already valid, leave it untouched.
+        - If the layer is invalid/missing, look up a timeslice record in the
+          catalog whose ``project_path`` matches the stored source path (or
+          whose ``normalized_name`` matches the layer name), then replace the
+          broken layer with a freshly constructed QgsRasterLayer pointing to
+          the correct absolute path.
+        """
+        try:
+            plugin_root = self._find_plugin_root_group()
+            if plugin_root is None:
+                return
+
+            project_root = self._active_project_root()
+            if not project_root:
+                return
+
+            from .project_catalog import load_catalog
+            catalog = load_catalog(project_root)
+            timeslices = catalog.get("timeslices", [])
+
+            # Index timeslices by project_path (normalised) and normalised_name.
+            by_path = {}
+            by_name = {}
+            for ts in timeslices:
+                pth = os.path.normpath(str(ts.get("project_path") or "").strip())
+                if pth and pth != ".":
+                    by_path[pth] = ts
+                nn = str(ts.get("normalized_name") or "").strip().lower()
+                if nn:
+                    by_name.setdefault(nn, ts)
+
+            repaired = 0
+            for group_node in list(plugin_root.children()):
+                if not isinstance(group_node, QgsLayerTreeGroup):
+                    continue
+                for child in list(group_node.children()):
+                    if not isinstance(child, QgsLayerTreeLayer):
+                        continue
+                    layer = child.layer()
+                    if layer is not None and layer.isValid():
+                        continue
+
+                    # Determine stored source path and layer name.
+                    stored_source = ""
+                    layer_name = ""
+                    if layer is not None:
+                        stored_source = str(layer.source() or "").strip()
+                        layer_name = str(layer.name() or "").strip()
+                    else:
+                        try:
+                            stored_source = str(child.layerId() or "").strip()
+                        except Exception:
+                            pass
+
+                    ts_rec = None
+                    # Try to match by stored source path.
+                    if stored_source:
+                        norm_src = os.path.normpath(stored_source)
+                        ts_rec = by_path.get(norm_src)
+                        if ts_rec is None:
+                            basename = os.path.basename(norm_src).lower()
+                            ts_rec = next(
+                                (t for t in timeslices
+                                 if os.path.basename(str(t.get("project_path") or "")).lower() == basename),
+                                None,
+                            )
+                    # Fall back to layer name match.
+                    if ts_rec is None and layer_name:
+                        ts_rec = by_name.get(layer_name.lower())
+
+                    if ts_rec is None:
+                        continue
+
+                    correct_path = str(ts_rec.get("project_path") or "").strip()
+                    if not correct_path or not os.path.exists(correct_path):
+                        continue
+
+                    # Skip if source is already correct.
+                    if stored_source and os.path.normpath(stored_source) == os.path.normpath(correct_path):
+                        continue
+
+                    display_name = str(ts_rec.get("normalized_name") or layer_name or os.path.basename(correct_path))
+                    new_layer = QgsRasterLayer(correct_path, display_name)
+                    if not new_layer.isValid():
+                        continue
+
+                    assigned_authid = str(ts_rec.get("assigned_crs") or "").strip()
+                    if assigned_authid:
+                        try:
+                            from qgis.core import QgsCoordinateReferenceSystem
+                            crs = QgsCoordinateReferenceSystem(assigned_authid)
+                            if crs.isValid():
+                                new_layer.setCrs(crs)
+                        except Exception:
+                            pass
+
+                    # Replace the broken node with the repaired layer.
+                    try:
+                        parent_group = child.parent()
+                        idx = parent_group.children().index(child)
+                        QgsProject.instance().addMapLayer(new_layer, False)
+                        parent_group.insertLayer(idx, new_layer)
+                        parent_group.removeChildNode(child)
+                        repaired += 1
+                    except Exception as exc:
+                        QgsMessageLog.logMessage(
+                            f"_repair_broken_group_layers: could not replace layer '{display_name}': {exc}",
+                            "GeoSurvey Studio",
+                            Qgis.Warning,
+                        )
+
+            if repaired:
+                QgsMessageLog.logMessage(
+                    f"Repaired {repaired} broken raster layer(s) after project load.",
+                    "GeoSurvey Studio",
+                    Qgis.Info,
+                )
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                f"_repair_broken_group_layers_from_catalog error: {exc}",
+                "GeoSurvey Studio",
+                Qgis.Warning,
+            )
+        finally:
+            # Always refresh the plugin UI regardless of repair outcome.
+            if self.dlg is not None:
+                try:
+                    self.populate_group_list()
+                except Exception:
+                    pass
 
     def _apply_dock_constraints(self):
         if self.dock_widget is None or self.dlg is None:
@@ -349,46 +591,34 @@ class AppRuntimeMixin:
             return
 
         gl3 = self.dlg.gridLayout_3
-        if is_narrow:
-            # Stack sections to avoid clipping on narrow/half-screen layouts.
-            # Keep tool tabs at the very top even in narrow mode.
-            if getattr(self, "tools_panel_widget", None) is not None:
-                gl3.addWidget(self.tools_panel_widget, 0, 0, 1, 1, Qt.AlignTop)
-            gl3.addLayout(self.dlg.verticalLayout_3, 1, 0, 1, 1, Qt.AlignTop)
-            if getattr(self, "bottom_controls_widget", None) is not None:
-                gl3.addWidget(self.bottom_controls_widget, 2, 0, 1, 1, Qt.AlignTop)
-            if hasattr(self.dlg, "line"):
-                self.dlg.line.hide()
-            gl3.setColumnStretch(0, 1)
-            gl3.setColumnStretch(1, 0)
-            gl3.setColumnStretch(2, 0)
-            gl3.setColumnStretch(3, 0)
-            # Keep main blocks compact; use row 3 as elastic filler.
-            gl3.setRowStretch(0, 0)
-            gl3.setRowStretch(1, 0)
-            gl3.setRowStretch(2, 0)
-            gl3.setRowStretch(3, 1)
-            # Heights/sizes are managed in ui_layout_mixin (single source of truth).
-        else:
-            # Restore wide two-column layout.
-            gl3.addLayout(self.dlg.verticalLayout_3, 0, 0, 1, 1, Qt.AlignTop)
-            if getattr(self, "tools_panel_widget", None) is not None:
-                gl3.addWidget(self.tools_panel_widget, 0, 2, 1, 2, Qt.AlignTop)
-            if getattr(self, "bottom_controls_widget", None) is not None:
-                gl3.addWidget(self.bottom_controls_widget, 2, 0, 1, 4, Qt.AlignTop)
-            if hasattr(self.dlg, "line"):
-                self.dlg.line.show()
-                gl3.addWidget(self.dlg.line, 0, 1, 1, 1)
-            gl3.setColumnStretch(0, 8)
-            gl3.setColumnStretch(1, 0)
-            gl3.setColumnStretch(2, 6)
-            gl3.setColumnStretch(3, 0)
-            # Keep main blocks compact; use row 3 as elastic filler.
-            gl3.setRowStretch(0, 0)
-            gl3.setRowStretch(1, 0)
-            gl3.setRowStretch(2, 0)
-            gl3.setRowStretch(3, 1)
-            # Heights/sizes are managed in ui_layout_mixin (single source of truth).
+        # Single stacked layout at every width: the lists/dial sit on top
+        # (row 0), a small elastic gap (row 1), and the "open tools panel"
+        # bar button (row 2). The tools panel itself lives in its own dock.
+        gl3.addLayout(self.dlg.verticalLayout_3, 0, 0, 1, 4)
+        if getattr(self, "tools_collapse_button", None) is not None:
+            gl3.addWidget(self.tools_collapse_button, 2, 0, 1, 4)
+        if hasattr(self.dlg, "line"):
+            self.dlg.line.hide()
+        gl3.setColumnStretch(0, 1)
+        gl3.setColumnStretch(1, 0)
+        gl3.setColumnStretch(2, 0)
+        gl3.setColumnStretch(3, 0)
+        # Row 0 claims most vertical growth so the raster/group lists expand
+        # toward the bottom; row 1 stays a small elastic gap.
+        gl3.setRowStretch(0, 3)
+        gl3.setRowStretch(1, 1)
+        gl3.setRowStretch(2, 0)
+        gl3.setRowStretch(3, 0)
+        if hasattr(self, "_distribute_left_column_stretch"):
+            self._distribute_left_column_stretch()
+
+        # Re-assert the tools-panel collapsed state (row stretches above
+        # would otherwise re-expand a collapsed panel).
+        if hasattr(self, "_apply_tools_panel_collapsed"):
+            self._apply_tools_panel_collapsed(
+                getattr(self, "_tools_panel_collapsed", True), persist=False
+            )
+
         self._is_narrow_layout = is_narrow
         self._is_short_layout = is_short
         self._layout_debug_log("responsive-applied")

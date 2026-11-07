@@ -29,6 +29,11 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    from . import gpr_debug_log as _dbg
+except ImportError:  # esecuzione fuori pacchetto (test/script)
+    import gpr_debug_log as _dbg
+
 GEO_DOUBLES_PER_CHANNEL = 8   # east, north, alt, heading, pitch, roll, spare x2
 _UTM_MIN = 1_000.0            # soglia minima plausibile per coordinate proiettate (m)
 _MAX_PLAUSIBILITY_SAMPLE = 250_000
@@ -204,6 +209,34 @@ def _radar_data_is_suspicious(arr: np.ndarray, kind: str) -> bool:
     return False
 
 
+def _check_radar_volume_content(radar_3d: np.ndarray) -> None:
+    """Rifiuta volumi radar privi di informazione (esportazione difettosa).
+
+    radar_3d ha shape (n_slices, n_channels, n_samples).  Due casi:
+    - tutto zero;
+    - una sola traccia per canale ripetuta identica su tutte le slice
+      (con piu' di una slice): nessuna variazione lungo il profilo.
+    """
+    if radar_3d.size == 0:
+        return
+    if not np.any(radar_3d):
+        raise OgprReadError(
+            f"il volume radar e' interamente a zero. Il file ha la dimensione "
+            "attesa ma non contiene dati radar: l'esportazione OGPR e' difettosa, "
+            "riesportare il file da GeosurveyStudio (o usare i dati grezzi originali)."
+        )
+    n_slices = radar_3d.shape[0]
+    if n_slices > 1 and all(
+        np.array_equal(radar_3d[:, ch, :], np.broadcast_to(radar_3d[0, ch, :], radar_3d[:, ch, :].shape))
+        for ch in range(radar_3d.shape[1])
+    ):
+        raise OgprReadError(
+            f"tutte le {n_slices} slice del volume radar sono identiche "
+            "(una sola traccia ripetuta per canale). Nessun segnale utilizzabile: "
+            "l'esportazione OGPR e' difettosa, riesportare il file da GeosurveyStudio."
+        )
+
+
 def _decode_radar_volume(
     radar_raw: bytes,
     exp_count: int,
@@ -225,10 +258,12 @@ def _decode_radar_volume(
             arr = np.frombuffer(radar_raw, dtype=dtype)
             if arr.size != exp_count:
                 continue
-            arr_f32 = arr.astype(np.float32, copy=False)
-            suspicious = _radar_data_is_suspicious(arr_f32, base.kind)
+            # Plausibility check on raw-typed view — avoids allocating a float32
+            # copy (up to 1 GiB) for every candidate on large files.  The
+            # float32 conversion happens only once, on the winning candidate.
+            suspicious = _radar_data_is_suspicious(arr, base.kind)
             candidates.append({
-                "arr": arr_f32,
+                "arr": arr,          # raw dtype; converted to float32 at return time
                 "raw_dtype": dtype.str,
                 "byte_order": byte_order,
                 "base": base,
@@ -244,7 +279,7 @@ def _decode_radar_volume(
     # 1) preferisci il tipo dichiarato little-endian se plausibile
     for cand in candidates:
         if cand["base"] == base_dtype and cand["byte_order"] == "<" and not cand["suspicious"]:
-            return cand["arr"], value_type_norm, cand["raw_dtype"], cand["byte_order"], warnings
+            return cand["arr"].astype(np.float32), value_type_norm, cand["raw_dtype"], cand["byte_order"], warnings
 
     # 2) altrimenti prova tipo dichiarato big-endian se è l'unico plausibile
     little_declared = None
@@ -261,7 +296,7 @@ def _decode_radar_volume(
             f"Endian fallback applicato per Radar Volume: valueType='{value_type_raw}' letto come big-endian."
         )
         return (
-            big_declared["arr"],
+            big_declared["arr"].astype(np.float32),
             value_type_norm,
             big_declared["raw_dtype"],
             big_declared["byte_order"],
@@ -275,7 +310,7 @@ def _decode_radar_volume(
                 warnings.append(
                     f"valueType='{value_type_raw}' non coerente; usato fallback dtype {cand['raw_dtype']}."
                 )
-            return cand["arr"], value_type_norm, cand["raw_dtype"], cand["byte_order"], warnings
+            return cand["arr"].astype(np.float32), value_type_norm, cand["raw_dtype"], cand["byte_order"], warnings
 
     # 4) ultimo fallback: tipo dichiarato little-endian (comportamento storico)
     if little_declared is not None:
@@ -286,7 +321,7 @@ def _decode_radar_volume(
                 f"Controllo plausibilita' radar inconclusivo; mantenuta lettura dichiarata {little_declared['raw_dtype']}."
             )
         return (
-            little_declared["arr"],
+            little_declared["arr"].astype(np.float32),
             value_type_norm,
             little_declared["raw_dtype"],
             little_declared["byte_order"],
@@ -297,7 +332,7 @@ def _decode_radar_volume(
     warnings.append(
         f"Dati radar plausibilita' bassa; usato fallback dtype {first['raw_dtype']}."
     )
-    return first["arr"], value_type_norm, first["raw_dtype"], first["byte_order"], warnings
+    return first["arr"].astype(np.float32), value_type_norm, first["raw_dtype"], first["byte_order"], warnings
 
 
 def _is_valid_md5_hex(txt: str) -> bool:
@@ -577,13 +612,22 @@ def read_ogpr(path: str, verify_md5: bool = False) -> OgprProfile:
             radar_raw = raw[r_offset: r_offset + r_bytesize]
 
             exp = n_samples * n_channels * n_slices
-            radar_flat, value_type, raw_dtype, byte_order, radar_warnings = _decode_radar_volume(
-                radar_raw=radar_raw,
-                exp_count=exp,
-                value_type_raw=value_type_raw,
-            )
+            needed_gib = exp * 4 / 1024 ** 3
+            try:
+                radar_flat, value_type, raw_dtype, byte_order, radar_warnings = _decode_radar_volume(
+                    radar_raw=radar_raw,
+                    exp_count=exp,
+                    value_type_raw=value_type_raw,
+                )
+            except MemoryError:
+                raise OgprReadError(
+                    f"Memoria insufficiente per caricare il Radar Volume "
+                    f"({n_slices} slice × {n_channels} ch × {n_samples} campioni = "
+                    f"{needed_gib:.2f} GiB float32 richiesti)."
+                )
             parse_warnings.extend(radar_warnings)
             radar_3d = radar_flat.reshape((n_slices, n_channels, n_samples))
+            _check_radar_volume_content(radar_3d)
 
             # Sample Geolocations
             g_offset = int(geo_desc["byteOffset"])
@@ -600,6 +644,16 @@ def read_ogpr(path: str, verify_md5: bool = False) -> OgprProfile:
                 md5_candidates: dict[str, str] = {}
 
                 ordered_checks = [
+                    # Schema IDS GeoRadar (Aladdin/Stream): l'MD5 e' calcolato su
+                    # tutto il file ESCLUSI il magic, i 32 char dell'MD5 di header
+                    # e i 32 char dell'MD5 replicato in coda. I newline restano
+                    # inclusi. Verificato su file .ogpr v1.0 int16 multi-canale.
+                    (
+                        "ids_payload_excl_md5",
+                        lambda: _md5_hexdigest_range(
+                            raw, start=pos_after_magic + 32, end=file_size - 32
+                        ),
+                    ),
                     ("payload_after_json", lambda: _md5_hexdigest_range(raw, start=pos, end=file_size)),
                     ("full_file", lambda: _md5_hexdigest_range(raw, start=0, end=file_size)),
                     ("after_magic", lambda: _md5_hexdigest_range(raw, start=pos_after_magic, end=file_size)),
@@ -660,7 +714,7 @@ def read_ogpr(path: str, verify_md5: bool = False) -> OgprProfile:
                             md5_scope = "all_blocks_sorted"
 
                 if md5_verified:
-                    if md5_scope != "payload_after_json":
+                    if md5_scope not in ("payload_after_json", "ids_payload_excl_md5"):
                         parse_warnings.append(
                             f"MD5 verificato con scope '{md5_scope}' (non payload_after_json)."
                         )
@@ -693,11 +747,29 @@ def read_ogpr(path: str, verify_md5: bool = False) -> OgprProfile:
                 dps=dps,
             )
             parse_warnings.extend(geo_warnings)
+            _dbg.log(
+                "READ",
+                f"{Path(str(path)).name}: geo_bytesize={g_bytesize} slices={n_slices} "
+                f"canali={n_channels} extra_doubles={extra_doubles} dtype={geo_raw_dtype} "
+                f"score={_geo_data_score(geo_ch):.2f} epsg={epsg}"
+                + (f" warning={geo_warnings}" if geo_warnings else ""),
+            )
 
             # Costruisci canali
             channels = []
             for ch_i in range(n_channels):
                 data_ch = radar_3d[:, ch_i, :].T.copy()   # (n_samples, n_slices)
+                # Il campione 0 e' un artefatto di trigger (outlier ~10x): dewow e
+                # bandpass lo spargono sui campioni vicini e falsano time-zero.
+                if data_ch.shape[0] > 8:
+                    # Artefatto = campione 0 quasi costante tra le tracce e molto piu'
+                    # grande del resto (vale anche se l'onda diretta parte subito).
+                    _c0 = data_ch[0].astype(np.float64)
+                    _m0 = float(np.median(_c0))
+                    _ref = float(np.median(np.abs(data_ch[1:min(40, data_ch.shape[0])])))
+                    if (abs(_m0) > 3.0 * max(_ref, 1.0)
+                            and float(np.std(_c0)) < 0.1 * abs(_m0)):
+                        data_ch[0] = data_ch[1]
                 east_ch = geo_ch[:, ch_i, 0].copy()
                 north_ch = geo_ch[:, ch_i, 1].copy()
                 alt_ch = geo_ch[:, ch_i, 2].copy()
@@ -726,6 +798,12 @@ def read_ogpr(path: str, verify_md5: bool = False) -> OgprProfile:
                 if (not np.isfinite(dist).all()) or (dist[-1] < 1e-3):
                     dist = np.arange(n_slices, dtype=np.float64) * sampling_step
 
+                _dbg.log(
+                    "READ",
+                    f"{Path(str(path)).name} ch{ch_i}: {_dbg.describe_track(east_ch, north_ch)} "
+                    f"dist_tot={float(dist[-1]):.3f}m "
+                    f"({'da coordinate' if dist[-1] >= 1e-3 and np.isfinite(dist).all() else 'FALLBACK sampling_step'})",
+                )
                 channels.append(OgprChannel(
                     channel_idx = ch_i,
                     data        = data_ch,
@@ -790,8 +868,17 @@ def read_ogpr_cached(path: str, verify_md5: bool = False) -> OgprProfile:
     st = p.stat()
     mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
     size = int(st.st_size)
-    return _read_ogpr_cached_impl(str(p), mtime_ns, size, bool(verify_md5))
+    _before = _read_ogpr_cached_impl.cache_info().hits
+    prof = _read_ogpr_cached_impl(str(p), mtime_ns, size, bool(verify_md5))
+    if _read_ogpr_cached_impl.cache_info().hits > _before:
+        _dbg.log(
+            "READ",
+            f"{p.name}: CACHE HIT (oggetto riusato, comprese eventuali coordinate "
+            "gia' sovrascritte dal posizionamento manuale). Usa 'Pulisci cache' per rileggere dal file.",
+        )
+    return prof
 
 
 def clear_ogpr_cache() -> None:
     _read_ogpr_cached_impl.cache_clear()
+    _dbg.log("CACHE", "cache OGPR svuotata")

@@ -23,6 +23,7 @@ class TraceBuild3DMixin:
             ("Constant Z (from depth/z_value)", "constant"),
             ("From linked z-grid", "linked_grid"),
             ("Orthometric (DTM - depth)", "orthometric"),
+            ("Per-vertex (from vertex_depths)", "vertex_depths"),
         ]
 
     def _default_build3d_output_name(self, source_layer, mode):
@@ -30,6 +31,7 @@ class TraceBuild3DMixin:
             "constant": "_3D",
             "linked_grid": "_3D_grid",
             "orthometric": "_3D_ortho",
+            "vertex_depths": "_3D_vertex",
         }
         return f"{source_layer.name()}{suffix_map.get(mode, '_3D')}"
 
@@ -341,6 +343,82 @@ class TraceBuild3DMixin:
             return QgsGeometry.fromWkt(f"LINESTRING Z {part_wkts[0]}")
         return QgsGeometry.fromWkt(f"MULTILINESTRING Z ({', '.join(part_wkts)})")
 
+    def _geometry_with_vertex_depths_z(self, geometry, vertex_depths_json):
+        """Z reale per ogni vertice, letta da `vertex_depths` (vedi
+        capture_radargram_feature/_serialize_vertex_depths): a differenza di
+        `_geometry_with_constant_z`, la profondita' non e' la stessa per tutta
+        la linea ma varia punto per punto, come disegnato sul radargramma.
+        Stessa convenzione di `_geometry_with_constant_z`: Z = profondita' (non
+        capovolta), coerente quando si mescolano le due modalita' nello stesso
+        progetto. I vertici senza profondita' valida spezzano la linea in piu'
+        segmenti invece di scartare l'intera traccia (come per il DTM).
+        """
+        if geometry is None or geometry.isEmpty():
+            return None
+        try:
+            items = json.loads(str(vertex_depths_json or ""))
+        except Exception:
+            return None
+        if not isinstance(items, list) or not items:
+            return None
+
+        depth_by_index = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                i = int(item.get("i"))
+            except (TypeError, ValueError):
+                continue
+            if str(item.get("s") or "").strip().lower() == "no_raster_hit":
+                continue
+            d = item.get("d")
+            if d in (None, ""):
+                d = item.get("dmin") if item.get("dmin") not in (None, "") else item.get("dmax")
+            try:
+                depth_by_index[i] = float(d)
+            except (TypeError, ValueError):
+                continue
+        if not depth_by_index:
+            return None
+
+        def _part_segments_wkt(part, start_index):
+            segments = []
+            coords = []
+            for offset, pt in enumerate(part):
+                depth = depth_by_index.get(start_index + offset)
+                if depth is None:
+                    if len(coords) >= 2:
+                        segments.append(f"({', '.join(coords)})")
+                    coords = []
+                    continue
+                coords.append(f"{pt.x()} {pt.y()} {depth}")
+            if len(coords) >= 2:
+                segments.append(f"({', '.join(coords)})")
+            return segments
+
+        if geometry.isMultipart():
+            parts = geometry.asMultiPolyline()
+            part_wkts = []
+            idx = 1
+            for part in parts:
+                part_wkts.extend(_part_segments_wkt(part, idx))
+                idx += len(part)
+            if not part_wkts:
+                return None
+            return QgsGeometry.fromWkt(f"MULTILINESTRING Z ({', '.join(part_wkts)})")
+
+        pts = geometry.asPolyline()
+        if len(pts) < 2:
+            multi = geometry.asMultiPolyline()
+            pts = multi[0] if multi else []
+        part_wkts = _part_segments_wkt(pts, 1)
+        if not part_wkts:
+            return None
+        if len(part_wkts) == 1:
+            return QgsGeometry.fromWkt(f"LINESTRING Z {part_wkts[0]}")
+        return QgsGeometry.fromWkt(f"MULTILINESTRING Z ({', '.join(part_wkts)})")
+
     def _create_3d_output_layer(self, source_layer, output_name):
         crs_authid = source_layer.crs().authid() if source_layer.crs().isValid() else "EPSG:4326"
         mem_layer = QgsVectorLayer(f"LineStringZ?crs={crs_authid}", output_name, "memory")
@@ -518,6 +596,15 @@ class TraceBuild3DMixin:
                 stats["ready"] += 1
                 continue
 
+            if mode == "vertex_depths":
+                vd_idx = source_layer.fields().indexOf("vertex_depths")
+                raw = feat.attribute(vd_idx) if vd_idx >= 0 else None
+                if self._geometry_with_vertex_depths_z(geom, raw) is None:
+                    stats["missing_depth"] += 1
+                    continue
+                stats["ready"] += 1
+                continue
+
         return stats
 
     def _build_3d_with_mode(self, source_layer, out_layer, mode, dtm_layer=None, strict_no_raster_hit=True):
@@ -597,6 +684,14 @@ class TraceBuild3DMixin:
                     skip_reasons["sample_fail"] += 1
                     continue
                 geom3d = self._geometry_with_dtm_minus_depth(geom_in, dtm_layer, depth_val)
+            elif mode == "vertex_depths":
+                vd_idx = source_layer.fields().indexOf("vertex_depths")
+                raw = feat.attribute(vd_idx) if vd_idx >= 0 else None
+                geom3d = self._geometry_with_vertex_depths_z(geom_in, raw)
+                if geom3d is None:
+                    skipped += 1
+                    skip_reasons["missing_depth"] += 1
+                    continue
             else:
                 skipped += 1
                 skip_reasons["other"] += 1
@@ -620,6 +715,7 @@ class TraceBuild3DMixin:
                     "constant": "build3d_constant_depth",
                     "linked_grid": "build3d_linked_grid",
                     "orthometric": "build3d_orthometric",
+                    "vertex_depths": "build3d_vertex_depths",
                 }.get(mode, "build3d")
                 new_feat.setAttribute(z_mode_idx, mode_label)
 
@@ -629,6 +725,7 @@ class TraceBuild3DMixin:
                     "constant": "depth_range",
                     "linked_grid": "surfer_grid",
                     "orthometric": "dtm_minus_depth",
+                    "vertex_depths": "vertex_depths",
                 }.get(mode, "unknown")
                 new_feat.setAttribute(z_source_idx, source_label)
 
@@ -695,6 +792,7 @@ class TraceBuild3DMixin:
                 "constant": "Constant Z (depth/z_value)",
                 "linked_grid": "Linked z-grid",
                 "orthometric": "Orthometric (DTM - depth)",
+                "vertex_depths": "Per-vertex (vertex_depths)",
             }.get(mode, mode)
 
             per_layer = []
@@ -868,6 +966,7 @@ class TraceBuild3DMixin:
             "constant": "Constant Z (depth/z_value)",
             "linked_grid": "Linked z-grid",
             "orthometric": "Orthometric (DTM - depth)",
+            "vertex_depths": "Per-vertex (vertex_depths)",
         }.get(mode, mode)
         extra = ""
         if mode == "orthometric":

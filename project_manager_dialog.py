@@ -12,7 +12,6 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QGridLayout,
-    QGroupBox,
     QLabel,
     QLineEdit,
     QPushButton,
@@ -22,6 +21,11 @@ from PyQt5.QtWidgets import (
     QDialog,
     QProgressDialog,
     QApplication,
+    QTextBrowser,
+    QWidget,
+    QToolButton,
+    QFrame,
+    QSizePolicy,
 )
 from qgis.PyQt.QtCore import QSettings, Qt
 from qgis.core import QgsProject, QgsPointCloudLayer, QgsRasterLayer
@@ -42,6 +46,7 @@ from .project_catalog import (
     assign_timeslices_to_group,
     remove_timeslices_from_group,
     add_timeslice_to_default_group,
+    ensure_system_group,
     validate_catalog,
     link_surfer_grid_into_project,
     utc_now_iso,
@@ -58,12 +63,57 @@ from .radargram_metadata import inspect_radargram
 from .catalog_editor_dialog import CatalogEditorDialog
 from .link_editor_dialog import LinkEditorDialog
 from .timeslice_group_manager_dialog import TimesliceGroupManagerDialog
+from .variant_manager_dialog import VariantManagerDialog
+from .cross_project_import_dialog import CrossProjectImportDialog
 from .project_health_dialog import ProjectHealthDialog
 from .vector_layer_manager_dialog import VectorLayerManagerDialog
 from .project_manager_import_rollback_mixin import ProjectManagerImportRollbackMixin
 from .project_manager_package_mixin import ProjectManagerPackageMixin
 from .project_manager_radargram_validation_mixin import ProjectManagerRadargramValidationMixin
 from .project_manager_timeslice_import_mixin import ProjectManagerTimesliceImportMixin
+
+
+class _CollapsibleSection(QWidget):
+    """A titled section with a disclosure arrow; content shows/hides on click."""
+
+    def __init__(self, title, expanded=False, parent=None):
+        super().__init__(parent)
+        self.toggle_button = QToolButton(self)
+        self.toggle_button.setText(title)
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(bool(expanded))
+        self.toggle_button.setAutoRaise(True)
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle_button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.toggle_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.toggle_button.setStyleSheet(
+            "QToolButton { border: none; font-weight: 600; color: #37474f;"
+            " padding: 5px 2px; text-align: left; }"
+            "QToolButton:hover { color: #1565c0; }"
+        )
+
+        self.content_area = QFrame(self)
+        self.content_area.setObjectName("collapsibleContent")
+        self.content_area.setStyleSheet(
+            "#collapsibleContent { border: 1px solid #cfd8dc; border-radius: 6px;"
+            " background: #fbfcfd; }"
+        )
+        self.content_area.setVisible(bool(expanded))
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+        outer.addWidget(self.toggle_button)
+        outer.addWidget(self.content_area)
+
+        self.toggle_button.toggled.connect(self._on_toggled)
+
+    def _on_toggled(self, checked):
+        self.toggle_button.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self.content_area.setVisible(bool(checked))
+        win = self.window()
+        if win is not None:
+            win.adjustSize()
 
 
 class ProjectManagerDialog(
@@ -92,10 +142,11 @@ class ProjectManagerDialog(
         self.import_manifest_btn = None
         self.cleanup_btn = None
         self.setWindowTitle("GeoSurvey Studio Project Manager")
-        self.resize(760, 300)
+        self.resize(640, 300)
         self._cached_plugin_version = None
         self._build_ui()
         self._apply_styles()
+        self.adjustSize()
         try:
             stored_root = (self.settings.value(self.settings_key_active_project, "", type=str) or "").strip()
             if stored_root:
@@ -110,8 +161,16 @@ class ProjectManagerDialog(
         root_layout.setContentsMargins(10, 10, 10, 10)
         root_layout.setSpacing(8)
 
+        title_row = QHBoxLayout()
         title = QLabel("Create/Open a project folder for 2D/3D geophysics data")
-        root_layout.addWidget(title)
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        help_btn = QPushButton("Help")
+        help_btn.setToolTip("What does each button do?")
+        help_btn.clicked.connect(self._show_help)
+        help_btn.setMinimumHeight(24)
+        title_row.addWidget(help_btn)
+        root_layout.addLayout(title_row)
 
         row = QHBoxLayout()
         self.path_edit = QLineEdit()
@@ -129,14 +188,19 @@ class ProjectManagerDialog(
         create_btn.setMinimumHeight(30)
         root_layout.addWidget(create_btn)
 
-        sections_grid = QGridLayout()
-        sections_grid.setHorizontalSpacing(12)
-        sections_grid.setVerticalSpacing(10)
+        sections_col = QVBoxLayout()
+        sections_col.setSpacing(4)
 
-        import_box = QGroupBox("Import")
-        import_layout = QGridLayout(import_box)
-        import_layout.setHorizontalSpacing(8)
-        import_layout.setVerticalSpacing(8)
+        def _section_grid(section):
+            grid = QGridLayout(section.content_area)
+            grid.setContentsMargins(8, 8, 8, 8)
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(8)
+            return grid
+
+        # --- Import (open by default) ---
+        import_sec = _CollapsibleSection("Import", expanded=True)
+        import_layout = _section_grid(import_sec)
 
         self.import_las_btn = QPushButton("Import LAS/LAZ")
         self.import_las_btn.clicked.connect(self._import_las_laz)
@@ -158,73 +222,109 @@ class ProjectManagerDialog(
         self.import_manifest_btn.setMinimumHeight(28)
         import_layout.addWidget(self.import_manifest_btn, 1, 1)
 
-        catalog_box = QGroupBox("Data Catalog & QA")
-        catalog_layout = QGridLayout(catalog_box)
-        catalog_layout.setHorizontalSpacing(8)
-        catalog_layout.setVerticalSpacing(8)
+        import_cross_btn = QPushButton("Import from another project...")
+        import_cross_btn.setToolTip(
+            "Bring time-slices from another GPR project folder into this\n"
+            "project's canvas as read-only references, without switching\n"
+            "the active processing workspace."
+        )
+        import_cross_btn.clicked.connect(self._open_cross_project_import)
+        import_cross_btn.setMinimumHeight(28)
+        import_layout.addWidget(import_cross_btn, 2, 0, 1, 2)
+        sections_col.addWidget(import_sec)
+
+        # --- Data Catalog & QA (open by default) ---
+        catalog_sec = _CollapsibleSection("Data Catalog & QA", expanded=True)
+        catalog_layout = _section_grid(catalog_sec)
 
         catalog_scope_label = QLabel(
-            "3D/Radargram Editor manages volumes and radargrams.\n"
             "Time-slice Manager handles time-slices and raster groups.\n"
             "Vector Layer Manager handles vector layers in project catalog."
         )
         catalog_scope_label.setWordWrap(True)
         catalog_layout.addWidget(catalog_scope_label, 0, 0, 1, 2)
 
-        view_catalog_btn = QPushButton("View Catalog")
-        view_catalog_btn.clicked.connect(self._view_catalog_summary)
-        view_catalog_btn.setMinimumHeight(28)
-        catalog_layout.addWidget(view_catalog_btn, 1, 0)
-
-        edit_catalog_btn = QPushButton("3D/Radargram Editor")
-        edit_catalog_btn.clicked.connect(self._open_catalog_editor)
-        edit_catalog_btn.setMinimumHeight(28)
-        catalog_layout.addWidget(edit_catalog_btn, 1, 1)
-
         validate_btn = QPushButton("Validate")
         validate_btn.clicked.connect(self._validate_project)
         validate_btn.setMinimumHeight(28)
-        catalog_layout.addWidget(validate_btn, 2, 0)
-
-        crs_btn = QPushButton("Set Import CRS")
-        crs_btn.clicked.connect(self._choose_default_import_crs)
-        crs_btn.setMinimumHeight(28)
-        catalog_layout.addWidget(crs_btn, 2, 1)
-
-        self.cleanup_btn = QPushButton("Cleanup Catalog")
-        self.cleanup_btn.clicked.connect(self._cleanup_catalog)
-        self.cleanup_btn.setMinimumHeight(28)
-        catalog_layout.addWidget(self.cleanup_btn, 3, 0)
-
-        reload_btn = QPushButton("Reload Layers")
-        reload_btn.clicked.connect(self._reload_imported_layers)
-        reload_btn.setMinimumHeight(28)
-        catalog_layout.addWidget(reload_btn, 3, 1)
-
-        links_btn = QPushButton("Link Editor")
-        links_btn.clicked.connect(self._open_link_editor)
-        links_btn.setMinimumHeight(28)
-        catalog_layout.addWidget(links_btn, 4, 0)
+        catalog_layout.addWidget(validate_btn, 1, 0)
 
         ts_mgr_btn = QPushButton("Time-slice/Group Manager")
         ts_mgr_btn.clicked.connect(self._open_timeslice_group_manager)
         ts_mgr_btn.setMinimumHeight(28)
-        catalog_layout.addWidget(ts_mgr_btn, 4, 1)
+        catalog_layout.addWidget(ts_mgr_btn, 1, 1)
 
         vector_mgr_btn = QPushButton("Vector Layer Manager")
         vector_mgr_btn.clicked.connect(self._open_vector_layer_manager)
         vector_mgr_btn.setMinimumHeight(28)
-        catalog_layout.addWidget(vector_mgr_btn, 5, 0)
+        catalog_layout.addWidget(vector_mgr_btn, 2, 0)
 
         health_btn = QPushButton("Project Health")
         health_btn.clicked.connect(self._open_project_health)
         health_btn.setMinimumHeight(28)
-        catalog_layout.addWidget(health_btn, 5, 1)
+        catalog_layout.addWidget(health_btn, 2, 1)
+        sections_col.addWidget(catalog_sec)
 
-        package_box = QGroupBox("Package")
-        package_layout = QGridLayout(package_box)
-        package_layout.setHorizontalSpacing(8)
-        package_layout.setVerticalSpacing(8)
+        # --- 3D & Radargram (closed by default) ---
+        rg3d_sec = _CollapsibleSection("3D & Radargram", expanded=False)
+        rg3d_layout = _section_grid(rg3d_sec)
+
+        edit_catalog_btn = QPushButton("3D/Radargram Editor")
+        edit_catalog_btn.clicked.connect(self._open_catalog_editor)
+        edit_catalog_btn.setMinimumHeight(28)
+        rg3d_layout.addWidget(edit_catalog_btn, 0, 0)
+        sections_col.addWidget(rg3d_sec)
+
+        # --- Variants (closed by default) ---
+        variants_sec = _CollapsibleSection("Variants", expanded=False)
+        variants_layout = _section_grid(variants_sec)
+
+        variants_scope_label = QLabel(
+            "Delete a processing variant (from Processing) together with any\n"
+            "variant derived from it, its time-slices, catalog rows and canvas layers."
+        )
+        variants_scope_label.setWordWrap(True)
+        variants_layout.addWidget(variants_scope_label, 0, 0)
+
+        variant_mgr_btn = QPushButton("Variant Manager")
+        variant_mgr_btn.clicked.connect(self._open_variant_manager)
+        variant_mgr_btn.setMinimumHeight(28)
+        variants_layout.addWidget(variant_mgr_btn, 1, 0)
+        sections_col.addWidget(variants_sec)
+
+        # --- Advanced (closed by default) ---
+        adv_sec = _CollapsibleSection("Advanced", expanded=False)
+        adv_layout = _section_grid(adv_sec)
+
+        view_catalog_btn = QPushButton("View Catalog")
+        view_catalog_btn.clicked.connect(self._view_catalog_summary)
+        view_catalog_btn.setMinimumHeight(28)
+        adv_layout.addWidget(view_catalog_btn, 0, 0)
+
+        crs_btn = QPushButton("Set Import CRS")
+        crs_btn.clicked.connect(self._choose_default_import_crs)
+        crs_btn.setMinimumHeight(28)
+        adv_layout.addWidget(crs_btn, 0, 1)
+
+        self.cleanup_btn = QPushButton("Cleanup Catalog")
+        self.cleanup_btn.clicked.connect(self._cleanup_catalog)
+        self.cleanup_btn.setMinimumHeight(28)
+        adv_layout.addWidget(self.cleanup_btn, 1, 0)
+
+        reload_btn = QPushButton("Reload Layers")
+        reload_btn.clicked.connect(self._reload_imported_layers)
+        reload_btn.setMinimumHeight(28)
+        adv_layout.addWidget(reload_btn, 1, 1)
+
+        links_btn = QPushButton("Link Editor")
+        links_btn.clicked.connect(self._open_link_editor)
+        links_btn.setMinimumHeight(28)
+        adv_layout.addWidget(links_btn, 2, 0)
+        sections_col.addWidget(adv_sec)
+
+        # --- Package (open by default) ---
+        package_sec = _CollapsibleSection("Package", expanded=True)
+        package_layout = _section_grid(package_sec)
 
         export_pkg_btn = QPushButton("Export Package")
         export_pkg_btn.clicked.connect(self._export_package)
@@ -235,39 +335,123 @@ class ProjectManagerDialog(
         import_pkg_btn.clicked.connect(self._import_package)
         import_pkg_btn.setMinimumHeight(28)
         package_layout.addWidget(import_pkg_btn, 0, 1)
+        sections_col.addWidget(package_sec)
 
+        sections_col.addStretch(1)
+        root_layout.addLayout(sections_col)
+
+        ok_row = QHBoxLayout()
+        ok_row.addStretch(1)
         close_btn = QPushButton("OK")
         close_btn.clicked.connect(self.close)
         close_btn.setMinimumHeight(30)
-        package_layout.addWidget(close_btn, 1, 0, 1, 2)
-
-        sections_grid.addWidget(import_box, 0, 0)
-        sections_grid.addWidget(catalog_box, 0, 1)
-        sections_grid.addWidget(package_box, 1, 0, 1, 2)
-        root_layout.addLayout(sections_grid)
+        close_btn.setMinimumWidth(120)
+        ok_row.addWidget(close_btn)
+        root_layout.addLayout(ok_row)
 
     def _apply_styles(self):
         self.setStyleSheet(
             """
-            QGroupBox {
-                border: 1px solid #cfd8dc;
-                border-radius: 6px;
-                margin-top: 10px;
-                font-weight: 600;
-                padding: 8px 6px 6px 6px;
-                background: #fbfcfd;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 8px;
-                padding: 0 4px 0 4px;
-                color: #37474f;
-            }
             QPushButton {
                 padding: 4px 8px;
             }
             """
         )
+
+    def _show_help(self):
+        html = """
+        <h3>GeoSurvey Studio Project Manager &ndash; guida ai pulsanti</h3>
+        <p>Un <b>progetto</b> &egrave; una cartella con una struttura fissa e un
+        <i>catalogo</i> (<code>metadata/project_catalog.json</code>) che tiene
+        traccia di modelli 3D, radargrammi, time-slice, layer vettoriali e dei
+        loro collegamenti.</p>
+        <p>Le sezioni <i>Import</i>, <i>Data Catalog &amp; QA</i>, <i>3D &amp;
+        Radargram</i>, <i>Advanced</i> e <i>Package</i> sono comprimibili:
+        clic sul titolo con la freccia per aprirle o chiuderle. <i>3D &amp;
+        Radargram</i> e <i>Advanced</i> sono chiuse all'avvio.</p>
+
+        <h4>Progetto</h4>
+        <ul>
+          <li><b>Browse</b> &ndash; scegli la cartella del progetto sul disco.</li>
+          <li><b>Create Project</b> &ndash; crea la struttura di cartelle (o apre
+              quella esistente) e la rende progetto attivo. Riconosce i file
+              gi&agrave; presenti e li registra nel catalogo.</li>
+        </ul>
+
+        <h4>Import</h4>
+        <ul>
+          <li><b>Import LAS/LAZ</b> &ndash; importa nuvole di punti 3D
+              (<code>.las</code>/<code>.laz</code>) nel progetto e le carica in QGIS.</li>
+          <li><b>Import Radargrams</b> &ndash; importa radargrammi
+              (<code>.rd3 .rad .dzt .npy .csv</code>, immagini&hellip;) nel catalogo,
+              con georeferenziazione se disponibile.</li>
+          <li><b>Import Time-slices</b> &ndash; importa raster di time-slice con
+              controllo di georeferenziazione/CRS e li assegna a un gruppo raster.</li>
+          <li><b>Import Manifest</b> &ndash; importa in blocco modelli, radargrammi
+              e time-slice elencati in un file <code>manifest.json</code>. Utile per
+              trasferire dati da un altro PC o progetto.</li>
+        </ul>
+
+        <h4>Data Catalog &amp; QA</h4>
+        <ul>
+          <li><b>Validate</b> &ndash; controlla la coerenza del catalogo e segnala
+              errori/avvisi (file mancanti, riferimenti rotti&hellip;).</li>
+          <li><b>Time-slice/Group Manager</b> &ndash; organizza le time-slice in
+              gruppi raster e ne gestisce l'assegnazione.</li>
+          <li><b>Vector Layer Manager</b> &ndash; gestisce i layer vettoriali
+              registrati nel catalogo del progetto.</li>
+          <li><b>Project Health</b> &ndash; diagnosi complessiva dello stato del
+              progetto (file, catalogo, coerenza).</li>
+        </ul>
+
+        <h4>3D &amp; Radargram <span style="font-weight:normal">(sezione chiusa all'avvio)</span></h4>
+        <ul>
+          <li><b>3D/Radargram Editor</b> &ndash; gestisce volumi 3D e radargrammi:
+              metadati, georeferenziazione, rimozione.</li>
+        </ul>
+
+        <h4>Advanced <span style="font-weight:normal">(sezione chiusa all'avvio)</span></h4>
+        <ul>
+          <li><b>View Catalog</b> &ndash; riepilogo dei contenuti del catalogo
+              (numero di modelli, radargrammi, time-slice, link&hellip;).</li>
+          <li><b>Set Import CRS</b> &ndash; imposta il sistema di riferimento
+              predefinito da usare quando i file importati non ne hanno uno.</li>
+          <li><b>Cleanup Catalog</b> &ndash; rimuove dal catalogo le voci che non
+              hanno pi&ugrave; il file corrispondente sul disco.</li>
+          <li><b>Reload Layers</b> &ndash; ricarica in QGIS i layer (nuvole di punti)
+              presenti nel catalogo ma non ancora visibili.</li>
+          <li><b>Link Editor</b> &ndash; gestisce i collegamenti fra time-slice e
+              z-grid (quote) o fra elementi del catalogo.</li>
+        </ul>
+
+        <h4>Package</h4>
+        <ul>
+          <li><b>Export Package</b> &ndash; crea un archivio del progetto
+              (dati + catalogo) per backup o trasferimento.</li>
+          <li><b>Import Package</b> &ndash; ricostruisce un progetto da un archivio
+              creato con <i>Export Package</i>.</li>
+        </ul>
+
+        <h4>Altro</h4>
+        <ul>
+          <li><b>OK</b> &ndash; chiude questa finestra (il progetto attivo resta
+              impostato).</li>
+        </ul>
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Project Manager - Help")
+        dlg.resize(640, 560)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(10, 10, 10, 10)
+        browser = QTextBrowser(dlg)
+        browser.setOpenExternalLinks(False)
+        browser.setHtml(html)
+        layout.addWidget(browser, 1)
+        close_btn = QPushButton("Close", dlg)
+        close_btn.clicked.connect(dlg.accept)
+        close_btn.setMinimumHeight(28)
+        layout.addWidget(close_btn, 0, Qt.AlignRight)
+        dlg.exec_()
 
     def _plugin_version(self):
         cached = str(self._cached_plugin_version or "").strip()
@@ -450,6 +634,7 @@ class ProjectManagerDialog(
         model_dir = os.path.join(self.project_root, "volumes_3d")
 
         # Import existing time-slices
+        new_timeslice_ids = []
         if os.path.isdir(timeslice_dir):
             for name in sorted(os.listdir(timeslice_dir)):
                 project_path = os.path.join(timeslice_dir, name)
@@ -482,10 +667,17 @@ class ProjectManagerDialog(
                     if link_info:
                         meta.update(link_info)
                     register_timeslice(self.project_root, meta)
+                    new_timeslice_ids.append(meta["id"])
                     existing_timeslice_paths.add(norm_path)
                     counts["timeslices"] += 1
                 except Exception:
                     continue
+        if new_timeslice_ids:
+            try:
+                ensure_system_group(self.project_root, "grp_imported", "Unassigned")
+                assign_timeslices_to_group(self.project_root, "grp_imported", new_timeslice_ids)
+            except Exception:
+                pass
 
         # Import existing radargrams
         if os.path.isdir(radargram_dir):
@@ -1432,9 +1624,50 @@ class ProjectManagerDialog(
             self,
             on_updated=self._notify_project_updated,
             open_catalog_editor_callback=self._open_catalog_editor,
+            on_project_transferred=self._on_project_transferred,
         )
         dlg.exec_()
         self._notify_project_updated()
+
+    def _on_project_transferred(self, old_root, new_root):
+        """Dopo il trasferimento: il nuovo percorso diventa il progetto attivo
+        e i layer del progetto QGIS aperto che puntavano nella vecchia cartella
+        vengono ripuntati alla nuova."""
+        from . import project_binding
+        from qgis.core import QgsProject
+        self.path_edit.setText(new_root)
+        self.project_root = new_root
+        self.settings.setValue(self.settings_key_active_project, new_root)
+        old_n = os.path.normcase(os.path.normpath(old_root))
+        for layer in list(QgsProject.instance().mapLayers().values()):
+            try:
+                src = layer.source()
+                base, sep, opts = src.partition("|")
+                if os.path.normcase(os.path.normpath(base)).startswith(old_n + os.sep):
+                    rel = os.path.relpath(os.path.normpath(base), os.path.normpath(old_root))
+                    new_src = os.path.join(new_root, rel) + sep + opts
+                    layer.setDataSource(new_src, layer.name(), layer.providerType())
+            except Exception:
+                continue
+        project_binding.remember_root(new_root)
+        self._notify_project_updated()
+
+    def _open_variant_manager(self):
+        if not self._ensure_project_ready():
+            return
+        dlg = VariantManagerDialog(
+            self.project_root,
+            self,
+            on_updated=self._notify_project_updated,
+        )
+        dlg.exec_()
+        self._notify_project_updated()
+
+    def _open_cross_project_import(self):
+        if not self._ensure_project_ready():
+            return
+        dlg = CrossProjectImportDialog(self.project_root, self, self)
+        dlg.exec_()
 
     def _open_vector_layer_manager(self):
         if not self._ensure_project_ready():

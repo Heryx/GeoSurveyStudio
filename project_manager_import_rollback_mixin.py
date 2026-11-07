@@ -4,8 +4,8 @@
 import os
 
 from PyQt5.QtWidgets import QMessageBox
-from qgis.core import QgsProject
 
+from .layer_source_utils import normalize_source_for_compare, remove_layers_for_paths
 from .project_catalog import load_catalog, save_catalog
 
 
@@ -56,32 +56,10 @@ class ProjectManagerImportRollbackMixin:
 
     @staticmethod
     def _normalize_source_for_compare(source):
-        raw = str(source or "").strip()
-        if not raw:
-            return ""
-        base = raw.split("|", 1)[0].strip()
-        try:
-            return os.path.normcase(os.path.abspath(base))
-        except Exception:
-            return os.path.normcase(base)
+        return normalize_source_for_compare(source)
 
     def _remove_loaded_layers_for_paths(self, paths):
-        wanted = {
-            self._normalize_source_for_compare(p)
-            for p in (paths or [])
-            if self._normalize_source_for_compare(p)
-        }
-        if not wanted:
-            return 0
-        project = QgsProject.instance()
-        to_remove = []
-        for lid, lyr in project.mapLayers().items():
-            src = self._normalize_source_for_compare(lyr.source())
-            if src and src in wanted:
-                to_remove.append(lid)
-        if to_remove:
-            project.removeMapLayers(to_remove)
-        return len(to_remove)
+        return remove_layers_for_paths(paths)
 
     @staticmethod
     def _remove_file_safe(path, warnings):

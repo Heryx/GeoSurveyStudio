@@ -7,6 +7,7 @@ from qgis.PyQt.QtWidgets import QProgressDialog
 from qgis.core import QgsApplication, QgsTask
 
 from .project_catalog import (
+    group_timeslice_subfolder,
     link_surfer_grid_into_project,
     load_catalog,
     normalize_copy_into_project,
@@ -50,9 +51,11 @@ class TimesliceImportTask(CallbackTask):
       }
     """
 
-    def __init__(self, project_root, records, description="GeoSurvey Studio: Importing time-slices"):
+    def __init__(self, project_root, records, description="GeoSurvey Studio: Importing time-slices",
+                 name_prefix=""):
         super().__init__(description)
         self.project_root = project_root
+        self.name_prefix = str(name_prefix or "")
         self.records = list(records or [])
         self.imported_records = []
         self.imported_paths = []
@@ -78,8 +81,13 @@ class TimesliceImportTask(CallbackTask):
                 continue
 
             try:
+                # Le slice di un gruppo vivono in timeslices_2d/<nome gruppo>/
+                subfolder = (
+                    group_timeslice_subfolder(self.name_prefix)
+                    if self.name_prefix.strip() else "timeslices_2d"
+                )
                 project_path, normalized_name = normalize_copy_into_project(
-                    self.project_root, "timeslices_2d", source_path
+                    self.project_root, subfolder, source_path, name_prefix=self.name_prefix
                 )
                 src_meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
                 record = {
@@ -95,6 +103,16 @@ class TimesliceImportTask(CallbackTask):
                     "band_count": src_meta.get("band_count"),
                     "extent": src_meta.get("extent"),
                 }
+                # Profondita' dalla slice (sliceset.json / tag del GeoTIFF / nome file):
+                # senza, il catalogo non sa a che quota sta il raster.
+                try:
+                    from .slice_manifest import depth_window_for_file
+                    window = depth_window_for_file(source_path)
+                except Exception:
+                    window = None
+                if window:
+                    record["depth_from"], record["depth_to"] = window
+                    record["unit"] = "m"
 
                 link_info = link_surfer_grid_into_project(
                     self.project_root,
@@ -274,6 +292,8 @@ class OgprSliceBuildTask(CallbackTask):
         extra_slice_params,
         output_dir,
         epsg=None,
+        spec=None,
+        source_variant="raw",
         description="GeoSurvey Studio: Building OGPR timeslices",
     ):
         super().__init__(description)
@@ -282,6 +302,10 @@ class OgprSliceBuildTask(CallbackTask):
         self.extra_slice_params = dict(extra_slice_params or {})
         self.output_dir = output_dir
         self.epsg = epsg
+        # Fase D: when a SliceSpec is supplied it drives every parameter it
+        # models; the flat extra_slice_params bag is then only a fallback.
+        self.spec = spec
+        self.source_variant = str(source_variant or "raw")
 
         self.meta = {}
         self.grids = []
@@ -310,46 +334,72 @@ class OgprSliceBuildTask(CallbackTask):
 
         try:
             t0 = perf_counter()
-            grids, meta = compute_ogpr_slice_grids(
-                profiles=self.profiles,
-                channel=self.params["channel"],
-                combine_method=self.params["combine_method"],
-                resolution=self.params["resolution"],
-                z_step=self.params["z_step"],
-                z_min=self.params["z_min"],
-                z_max=self.params["z_max"],
-                radius=self.params["radius"],
-                pipeline_params=self.extra_slice_params.get("pipeline_params"),
-                normalize_channels=bool(self.extra_slice_params.get("normalize_channels", False)),
-                extraction_mode=str(self.extra_slice_params.get("extraction_mode", "las_like") or "las_like"),
-                use_hilbert=bool(self.extra_slice_params.get("use_hilbert", True)),
-                use_processing=bool(self.extra_slice_params.get("use_processing", False)),
-                amplitude_sigma=self.extra_slice_params.get("amplitude_sigma"),
-                use_anisotropic_idw=bool(self.extra_slice_params.get("use_anisotropic_idw", False)),
-                idw_mode=str(self.extra_slice_params.get("idw_mode", "quality") or "quality"),
-                idw_power=float(self.extra_slice_params.get("idw_power", 2.0) or 2.0),
-                auto_radius=bool(self.extra_slice_params.get("auto_radius", True)),
-                min_points=int(self.extra_slice_params.get("min_points", 1) or 1),
-                fill_nodata=bool(self.extra_slice_params.get("fill_nodata", True)),
-                overlap_fraction=float(self.extra_slice_params.get("overlap_fraction", 0.5) or 0.0),
-                blanking_distance=float(self.extra_slice_params.get("blanking_distance", 0.0) or 0.0),
-                smooth_sigma=float(self.extra_slice_params.get("smooth_sigma", 0.8) or 0.0),
-                depth_radius_factor=float(self.extra_slice_params.get("depth_radius_factor", 0.6) or 0.0),
-                balance_profiles=bool(self.extra_slice_params.get("balance_profiles", True)),
-                pre_slice_bg_removal=bool(self.extra_slice_params.get("pre_slice_bg_removal", False)),
-                pre_slice_bg_mode=str(self.extra_slice_params.get("pre_slice_bg_mode", "line_by_line") or "line_by_line"),
-                pre_slice_bg_window=int(self.extra_slice_params.get("pre_slice_bg_window", 0) or 0),
-                pre_slice_bg_sample_start=int(self.extra_slice_params.get("pre_slice_bg_sample_start", 0) or 0),
-                pre_slice_bg_sample_end=int(self.extra_slice_params.get("pre_slice_bg_sample_end", 0) or 0),
-                stack_n=int(self.extra_slice_params.get("stack_n", 1) or 1),
-                stack_kernel=str(self.extra_slice_params.get("stack_kernel", "boxcar") or "boxcar"),
-                flip_traces_mode=str(self.extra_slice_params.get("flip_traces_mode", "none") or "none"),
-                topographic_correction=bool(self.extra_slice_params.get("topographic_correction", False)),
-                topo_reference_mode=str(self.extra_slice_params.get("topo_reference_mode", "median") or "median"),
-                topo_reference_elevation=self.extra_slice_params.get("topo_reference_elevation"),
-                parallel_profiles=bool(self.extra_slice_params.get("parallel_profiles", True)),
-                profile_workers=int(self.extra_slice_params.get("profile_workers", 0) or 0),
-            )
+            esp = self.extra_slice_params
+
+            import threading
+            cancel_ev = threading.Event()
+            self._cancel_event = cancel_ev
+
+            def _on_progress(done, total):
+                if self.isCanceled():
+                    cancel_ev.set()
+                if total:
+                    self.setProgress(5.0 + 65.0 * float(done) / float(total))
+
+            if self.spec is not None:
+                # Fase D: the SliceSpec governs geometry, amplitude mode, radius,
+                # blanking and low-pass; channel/combine stay viewer choices.
+                grids, meta = compute_ogpr_slice_grids(
+                    profiles=self.profiles,
+                    channel=self.params["channel"],
+                    combine_method=self.params["combine_method"],
+                    spec=self.spec,
+                    progress_callback=_on_progress,
+                    cancel_event=cancel_ev,
+                )
+            else:
+                grids, meta = compute_ogpr_slice_grids(
+                    profiles=self.profiles,
+                    channel=self.params["channel"],
+                    combine_method=self.params["combine_method"],
+                    resolution=self.params["resolution"],
+                    z_step=self.params["z_step"],
+                    z_min=self.params["z_min"],
+                    z_max=self.params["z_max"],
+                    radius=self.params["radius"],
+                    pipeline_params=esp.get("pipeline_params"),
+                    normalize_channels=bool(esp.get("normalize_channels", False)),
+                    extraction_mode=str(esp.get("extraction_mode", "las_like") or "las_like"),
+                    use_hilbert=bool(esp.get("use_hilbert", True)),
+                    use_processing=bool(esp.get("use_processing", False)),
+                    amplitude_sigma=esp.get("amplitude_sigma"),
+                    use_anisotropic_idw=bool(esp.get("use_anisotropic_idw", False)),
+                    idw_mode=str(esp.get("idw_mode", "quality") or "quality"),
+                    idw_power=float(esp.get("idw_power", 2.0) or 2.0),
+                    auto_radius=bool(esp.get("auto_radius", True)),
+                    min_points=int(esp.get("min_points", 1) or 1),
+                    fill_nodata=bool(esp.get("fill_nodata", True)),
+                    overlap_fraction=float(esp.get("overlap_fraction", 0.5) or 0.0),
+                    blanking_distance=float(esp.get("blanking_distance", 0.0) or 0.0),
+                    smooth_sigma=float(esp.get("smooth_sigma", 0.8) or 0.0),
+                    depth_radius_factor=float(esp.get("depth_radius_factor", 0.6) or 0.0),
+                    balance_profiles=bool(esp.get("balance_profiles", True)),
+                    pre_slice_bg_removal=bool(esp.get("pre_slice_bg_removal", False)),
+                    pre_slice_bg_mode=str(esp.get("pre_slice_bg_mode", "line_by_line") or "line_by_line"),
+                    pre_slice_bg_window=int(esp.get("pre_slice_bg_window", 0) or 0),
+                    pre_slice_bg_sample_start=int(esp.get("pre_slice_bg_sample_start", 0) or 0),
+                    pre_slice_bg_sample_end=int(esp.get("pre_slice_bg_sample_end", 0) or 0),
+                    stack_n=int(esp.get("stack_n", 1) or 1),
+                    stack_kernel=str(esp.get("stack_kernel", "boxcar") or "boxcar"),
+                    flip_traces_mode=str(esp.get("flip_traces_mode", "none") or "none"),
+                    topographic_correction=bool(esp.get("topographic_correction", False)),
+                    topo_reference_mode=str(esp.get("topo_reference_mode", "median") or "median"),
+                    topo_reference_elevation=esp.get("topo_reference_elevation"),
+                    parallel_profiles=bool(esp.get("parallel_profiles", True)),
+                    profile_workers=int(esp.get("profile_workers", 0) or 0),
+                    progress_callback=_on_progress,
+                    cancel_event=cancel_ev,
+                )
             compute_s = max(0.0, perf_counter() - t0)
         except Exception as e:
             self.error_message = str(e)
@@ -401,8 +451,21 @@ class OgprSliceBuildTask(CallbackTask):
                 self.meta,
                 self.output_dir,
                 epsg=epsg_to_write,
+                style=self.extra_slice_params.get("style"),
             )
             write_s = max(0.0, perf_counter() - t0)
+            # Fase D/B: drop a sliceset.json manifest next to the GeoTIFFs so
+            # display / 3D never reconstruct depth from file names again.
+            try:
+                from .gpr_ogpr_slicer import _write_run_sliceset
+                _write_run_sliceset(
+                    self.output_dir, self.meta, self.grids, self.slices,
+                    spec=self.spec, epsg=epsg_to_write,
+                    source_variant=self.source_variant,
+                    n_profiles=len(self.profiles),
+                )
+            except Exception as exc:
+                print(f"[OgprSliceBuildTask][WARN] sliceset.json non scritto: {exc}")
         except Exception as e:
             self.error_message = str(e)
             return False

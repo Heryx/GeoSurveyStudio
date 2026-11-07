@@ -1,0 +1,1608 @@
+# -*- coding: utf-8 -*-
+"""
+GprManualPositioningDialog
+==========================
+Dialog interattivo per la definizione manuale della geometria di acquisizione
+di profili GPR privi di coordinate GPS/GEC.
+
+Caratteristiche:
+  - Definizione griglia bounding box (X0 - X1, Y0 - Y1) in metri.
+  - Spaziatura automatica uniforme dei profili lungo l'asse ortogonale.
+  - Supporto per profili paralleli all'asse X e profili ortogonali all'asse Y.
+  - Tabella profili con rinomina, riordino (Sposta Su / Giu'), offset personalizzato.
+  - Gestione reversing / zig-zag (inversione alternata o manuale della direzione di percorrenza).
+  - Georeferenziazione opzionale su CRS di progetto (Origine E0, N0 + Azimut rotazione).
+  - Anteprima visuale 2D della griglia con frecce direzionali.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import re
+from typing import Any, Callable
+
+import numpy as np
+
+try:
+    from . import gpr_debug_log as _dbg
+except ImportError:  # esecuzione fuori pacchetto (test/script)
+    import gpr_debug_log as _dbg
+
+from qgis.PyQt.QtCore import Qt, pyqtSignal
+from qgis.PyQt.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
+    QLabel, QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox,
+    QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
+    QGroupBox, QSplitter, QWidget, QMessageBox, QDialogButtonBox,
+    QToolButton, QAbstractItemView, QLineEdit, QFileDialog,
+)
+
+try:
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+    from matplotlib.figure import Figure
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+
+try:  # navigazione: primitive marker / dead-reckoning / stagger
+    from .navigation import reverse_along, stagger_shift, dead_reckon_along, build_markers
+except ImportError:  # pragma: no cover
+    from navigation import reverse_along, stagger_shift, dead_reckon_along, build_markers
+
+
+def compute_positions(
+    n_traces: int,
+    x0: float, x1: float, y0: float, y1: float,
+    axis: str,
+    offset: float,
+    grid_span_m: float,
+    length_m: float,
+    use_real_length: bool,
+    reversed_: bool,
+    stagger_m: float = 0.0,
+    geo_on: bool = False,
+    e0: float = 0.0, n0: float = 0.0, az_deg: float = 0.0,
+    elev_mode: str = "none",
+    z_start: float = 0.0, z_end: float = 0.0,
+    elev_ref: "np.ndarray | list | None" = None,
+    elev_ref_kind: str = "x",
+    markers: "list | None" = None,
+    reverse_anchor: str = "near",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Calcola E/N/distanza cumulativa/quota per gli scan di un profilo.
+
+    - ``use_real_length`` : se True il profilo occupa solo ``length_m`` a partire
+      dall'inizio della linea (linee ANG / parziali), altrimenti l'intero span
+      della griglia lungo l'asse.
+    - ``reversed_``        : linea percorsa in direzione opposta (zig-zag).
+    - ``stagger_m``        : traslazione applicata SOLO alle linee invertite,
+      per correggere lo staggering fra andata e ritorno.
+    - ``elev_mode``        : ``"none"`` (quota 0), ``"plane"`` (piano inclinato:
+      ``z_start`` all'inizio linea, ``z_end`` alla fine — interpolazione lineare
+      sulla frazione di linea, tiene conto del verso zig-zag) o ``"file"``
+      (interpola ``elev_ref``, array Nx2, contro la posizione lungo linea in
+      metri se ``elev_ref_kind == "x"`` o contro l'indice di traccia se
+      ``"trace"``).
+    - ``markers``         : se dato (lista di ``navigation.Marker`` con
+      ``pos_m``), le ascisse degli scan vengono da ``dead_reckon_along`` invece
+      che da ``linspace`` — dead-reckoning fra marker (modi interval/artificial).
+    - ``reverse_anchor``  : per le linee invertite più corte dello span griglia,
+      ``"near"`` (default) le àncora al lato di partenza delle linee dirette
+      (x0 / y0); ``"far"`` le àncora al lato opposto — la *baseline di ritorno*
+      dello zig-zag (x1 / y1) — così ogni linea di ritorno parte allineata a
+      destra/in alto invece che rientrata.
+
+    Ritorna ``(east, north, dist, elev)`` (array lunghi ``n_traces``).
+    """
+    n_t = int(n_traces)
+    if n_t <= 0:
+        z = np.zeros(0, dtype=np.float64)
+        return z, z.copy(), z.copy(), z.copy()
+
+    span = float(grid_span_m) if float(grid_span_m) > 1e-9 else 1.0
+    L = float(length_m) if (use_real_length and float(length_m) > 1e-9) else span
+    # ascissa metrica lungo il PROFILO, 0..L (per quota e file quote)
+    if markers:
+        along = np.asarray(dead_reckon_along(markers, n_t), dtype=np.float64)
+        if not np.isfinite(along).all():
+            along = np.linspace(0.0, L, n_t, dtype=np.float64)
+    else:
+        along = np.linspace(0.0, L, n_t, dtype=np.float64)
+    if reversed_:
+        along = reverse_along(along, L)
+    # ascissa nel sistema GRIGLIA (per mappare a X/Y): per le linee invertite
+    # ancorate al lato opposto si somma lo scarto (span - L).
+    along_grid = along
+    if reversed_ and L < span - 1e-9 and str(reverse_anchor).lower().startswith("far"):
+        along_grid = along + (span - L)
+    frac = np.clip(along_grid / span, 0.0, 1.0)
+
+    if str(axis).upper() == "X":
+        lx = float(x0) + frac * (float(x1) - float(x0))
+        ly = np.full(n_t, float(offset), dtype=np.float64)
+    else:
+        lx = np.full(n_t, float(offset), dtype=np.float64)
+        ly = float(y0) + frac * (float(y1) - float(y0))
+
+    # Staggering: trasla l'INTERA linea invertita lungo il suo asse di
+    # percorrenza (senza clamp) per allineare andata e ritorno.
+    if reversed_ and abs(float(stagger_m)) > 1e-12:
+        if str(axis).upper() == "X":
+            lx = stagger_shift(lx, float(stagger_m))
+        else:
+            ly = stagger_shift(ly, float(stagger_m))
+
+    if geo_on:
+        az = math.radians(float(az_deg))
+        ca, sa = math.cos(az), math.sin(az)
+        de = lx * ca + ly * sa
+        dn = -lx * sa + ly * ca
+        east = float(e0) + de
+        north = float(n0) + dn
+    else:
+        east = lx
+        north = ly
+
+    dseg = np.sqrt(np.diff(lx) ** 2 + np.diff(ly) ** 2)
+    dist = np.concatenate([[0.0], np.cumsum(dseg)]) if n_t > 1 else np.zeros(1)
+
+    # quota per traccia
+    elev = np.zeros(n_t, dtype=np.float64)
+    mode = str(elev_mode or "none").lower()
+    # ascissa lungo il profilo, 0..L dall'inizio linea (tiene conto dello zig-zag)
+    frac_line = (along / L) if L > 1e-9 else np.zeros(n_t, dtype=np.float64)
+    if mode == "plane":
+        elev = float(z_start) + frac_line * (float(z_end) - float(z_start))
+    elif mode == "file" and elev_ref is not None:
+        ref = np.asarray(elev_ref, dtype=np.float64)
+        if ref.ndim == 2 and ref.shape[0] >= 1 and ref.shape[1] >= 2:
+            order = np.argsort(ref[:, 0])
+            xr, zr = ref[order, 0], ref[order, 1]
+            if str(elev_ref_kind or "x").lower().startswith("trace"):
+                query = np.arange(n_t, dtype=np.float64)
+            else:
+                query = along  # metri dall'inizio del profilo
+            if xr.size == 1:
+                elev = np.full(n_t, float(zr[0]), dtype=np.float64)
+            else:
+                elev = np.interp(query, xr, zr)
+
+    return east, north, dist, np.asarray(elev, dtype=np.float64)
+
+
+def original_channel_coords(ch) -> tuple[np.ndarray, np.ndarray]:
+    """(easting, northing) ORIGINALI di un canale.
+
+    Dopo un Posizionamento applicato le coordinate del canale sono quelle
+    calcolate (griglia locale); quelle del file restano in ``_geo_orig``.
+    Rilevamento GPS, inferenza dei versi e anteprima devono leggere sempre
+    queste, altrimenti dopo il primo «Applica» il GPS risulta perso.
+    """
+    orig = getattr(ch, "_geo_orig", None)
+    if orig is not None:
+        try:
+            return (np.asarray(orig[0], dtype=np.float64),
+                    np.asarray(orig[1], dtype=np.float64))
+        except Exception:
+            pass
+    return (np.asarray(getattr(ch, "easting", []), dtype=np.float64),
+            np.asarray(getattr(ch, "northing", []), dtype=np.float64))
+
+
+def restore_original_coords(prof) -> bool:
+    """Ripristina easting/northing/distanze/quota originali (file) su tutti i
+    canali del profilo che sono stati sovrascritti. Ritorna True se ha ripristinato."""
+    done = False
+    for ch in getattr(prof, "channels", None) or []:
+        orig = getattr(ch, "_geo_orig", None)
+        if orig is None:
+            continue
+        try:
+            ch.easting = np.array(orig[0], copy=True)
+            ch.northing = np.array(orig[1], copy=True)
+            ch.distances = np.array(orig[2], copy=True)
+            ch.altitude = np.array(orig[3], copy=True)
+            done = True
+        except Exception:
+            pass
+    return done
+
+
+def check_profiles_have_gps(profiles: list) -> bool:
+    """Verifica se almeno un canale dei profili caricati possiede coordinate GPS reali plausibili."""
+    if not profiles:
+        _dbg.log("GPSCHECK", "nessun profilo")
+        return False
+    for prof in profiles:
+        channels = getattr(prof, "channels", []) or []
+        for ch in channels:
+            e, n = original_channel_coords(ch)
+            _dbg.log("GPSCHECK", f"{os.path.basename(str(getattr(prof, 'path', '?')))} "
+                     f"ch{getattr(ch, 'channel_idx', '?')}: {_dbg.describe_track(e, n)}")
+            if e.size > 1 and n.size > 1:
+                fe = e[np.isfinite(e)]
+                fn = n[np.isfinite(n)]
+                if fe.size > 1 and fn.size > 1:
+                    span_e = float(np.ptp(fe))
+                    span_n = float(np.ptp(fn))
+                    # Coordinate reali UTM/proiettate o con estensione metrica non nulla
+                    if (span_e + span_n) > 0.05 and (float(np.nanmax(fe)) > 1000.0 or float(np.nanmax(fn)) > 1000.0):
+                        _dbg.log("GPSCHECK", "esito: GPS PRESENTE")
+                        return True
+    _dbg.log("GPSCHECK", "esito: GPS ASSENTE (soglia: span>0.05 m e max(E|N)>1000)")
+    return False
+
+
+class GprManualPositioningDialog(QDialog):
+    """Dialog per la configurazione della griglia e l'assegnazione coordinate a profili non-GPS."""
+
+    positioning_applied = pyqtSignal(dict)
+
+    def __init__(self, profiles: list, project_crs=None, canvas=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Posizionamento")
+        self.resize(1020, 680)
+
+        self._profiles = list(profiles or [])
+        self._project_crs = project_crs
+        self._canvas = canvas
+        self._syncing_table = False
+
+        # Struttura interna dati per profilo:
+        # dict(prof=prof, orig_name=str, name=str, axis="X"|"Y", offset=float, reversed=bool, n_traces=int, length=float)
+        self._profile_items = self._init_profile_items()
+
+        self._mk_data_cache: dict[int, np.ndarray] = {}
+
+        self._build_ui()
+        if getattr(self, "_inferred_reverse_anchor", None) == "far":
+            # «baseline di ritorno» richiede la lunghezza reale dei profili
+            self._chk_real_length.setChecked(True)
+            self._chk_reverse_far.setChecked(True)
+        self._recalculate_spacing(auto_detect_dims=True)
+        self._update_table_from_items()
+        self._draw_preview()
+        self._on_pos_mode_changed()
+        self._draw_marker_preview()
+        self._update_metadata_panel()
+
+    def _init_profile_items(self) -> list[dict]:
+        items = []
+        for i, prof in enumerate(self._profiles):
+            path = getattr(prof, "path", f"profile_{i + 1}") or f"profile_{i + 1}"
+            orig_name = os.path.splitext(os.path.basename(path))[0]
+            swath = getattr(prof, "swath_name", "") or ""
+            name = swath if swath else orig_name
+
+            n_slices = int(getattr(prof, "n_slices", 0) or 0)
+            if n_slices <= 0 and getattr(prof, "channels", None):
+                n_slices = int(prof.channels[0].data.shape[1]) if prof.channels[0].data.ndim == 2 else 0
+
+            step = float(getattr(prof, "sampling_step_m", 0.05) or 0.05)
+            length = float(max(0, n_slices - 1) * step) if n_slices > 1 else 10.0
+
+            items.append({
+                "prof": prof,
+                "orig_name": orig_name,
+                "name": name,
+                "axis": "X",
+                "offset": float(i * 1.0),
+                "reversed": False,
+                "n_traces": n_slices,
+                "sampling_step": step,
+                "length": max(0.1, length),
+                "has_gps": bool(check_profiles_have_gps([prof])),
+            })
+        self._infer_geometry_from_coords(items)
+        return items
+
+    @staticmethod
+    def _profile_track(prof):
+        """(easting, northing) finiti del primo canale con coordinate plausibili, o None."""
+        for ch in getattr(prof, "channels", None) or []:
+            e, n = original_channel_coords(ch)
+            if e.size < 2 or e.size != n.size:
+                continue
+            ok = np.isfinite(e) & np.isfinite(n)
+            if ok.sum() < 2:
+                continue
+            e, n = e[ok], n[ok]
+            if float(np.ptp(e)) + float(np.ptp(n)) > 0.05:
+                return e, n
+        return None
+
+    def _infer_geometry_from_coords(self, items: list[dict]) -> None:
+        """Se i profili hanno coordinate reali, ricava asse, verso (zig-zag) e offset.
+
+        Il verso "avanti" e' quello del primo profilo di ciascun asse; i profili
+        percorsi in senso opposto risultano ``reversed``. Modifica ``items`` in place.
+        """
+        tracks = [self._profile_track(it["prof"]) for it in items]
+        info = []  # (idx, axis, sign, transverse_mean)
+        for i, tr in enumerate(tracks):
+            if tr is None:
+                continue
+            e, n = tr
+            de, dn = float(e[-1] - e[0]), float(n[-1] - n[0])
+            if abs(de) >= abs(dn):
+                info.append((i, "X", 1 if de >= 0 else -1, float(np.mean(n))))
+            else:
+                info.append((i, "Y", 1 if dn >= 0 else -1, float(np.mean(e))))
+        if not info:
+            return
+        ref_sign = {}
+        min_tr = {}
+        for _, axis, sign, tmean in info:
+            ref_sign.setdefault(axis, sign)
+            min_tr[axis] = min(min_tr.get(axis, tmean), tmean)
+        for i, axis, sign, tmean in info:
+            items[i]["axis"] = axis
+            items[i]["reversed"] = sign != ref_sign[axis]
+            items[i]["offset"] = float(tmean - min_tr[axis])
+            e_, n_ = tracks[i]
+            real_len = float(np.sum(np.hypot(np.diff(e_), np.diff(n_))))
+            if real_len > 0.1:
+                items[i]["length"] = real_len
+            _dbg.log("DIALOG-INIT", f"{items[i]['name']}: da coordinate reali -> asse={axis} "
+                     f"verso={'+' if sign > 0 else '-'} invertito={items[i]['reversed']} "
+                     f"offset={items[i]['offset']:.3f}m lunghezza_reale={items[i]['length']:.3f}m")
+        for i, tr in enumerate(tracks):
+            if tr is None:
+                _dbg.log("DIALOG-INIT", f"{items[i]['name']}: coordinate NON utilizzabili, "
+                         "restano i default (asse X, non invertito)")
+        self._inferred_reverse_anchor = self._infer_reverse_anchor(tracks, info, ref_sign, items)
+        _dbg.log("DIALOG-INIT", f"ancoraggio linee invertite dedotto dal GPS: "
+                 f"{self._inferred_reverse_anchor or 'indeterminato'}")
+
+    @staticmethod
+    def _infer_reverse_anchor(tracks, info, ref_sign, items) -> "str | None":
+        """«near»/«far» dalle tracce GPS reali, o None se non deducibile.
+
+        Ascissa ``u`` lungo il verso "avanti" di ogni asse: le linee dirette
+        partono da ``u`` minimo. Le invertite sono «near» se FINISCONO sulla
+        stessa baseline da cui partono le dirette, «far» se PARTONO dalla
+        baseline opposta comune (il massimo di ``u`` raggiunto dalla griglia).
+        """
+        votes = {"near": 0, "far": 0}
+        for axis in ("X", "Y"):
+            fwd_first, rev_first, rev_last, fwd_last = [], [], [], []
+            for i, ax, sign, _t in info:
+                if ax != axis:
+                    continue
+                e_, n_ = tracks[i]
+                u = (e_ if axis == "X" else n_) * ref_sign[axis]
+                if items[i]["reversed"]:
+                    rev_first.append(float(u[0])); rev_last.append(float(u[-1]))
+                else:
+                    fwd_first.append(float(u[0])); fwd_last.append(float(u[-1]))
+            if not fwd_first or not rev_first:
+                continue
+            fwd_start = float(np.median(fwd_first))
+            u_hi = max(max(fwd_last), max(rev_first))
+            near_err = float(np.median(np.abs(np.asarray(rev_last) - fwd_start)))
+            far_err = float(np.median(np.abs(np.asarray(rev_first) - u_hi)))
+            votes["far" if (far_err < near_err and near_err > 0.2) else "near"] += 1
+        if not (votes["near"] or votes["far"]):
+            return None
+        return "far" if votes["far"] > votes["near"] else "near"
+
+    def _build_ui(self):
+        root_layout = QVBoxLayout(self)
+
+        # Info header
+        n_gps_hdr = sum(1 for it in self._profile_items if it.get("has_gps"))
+        n_all_hdr = len(self._profile_items)
+        if n_gps_hdr == 0:
+            info_html = (
+                "<b>I profili caricati non contengono coordinate GPS/GEC.</b><br>"
+                "Imposta le dimensioni della griglia ($X_0-X_1$, $Y_0-Y_1$) e verifica "
+                "la direzione delle linee (zig-zag). Il plugin calcolerà automaticamente le coordinate di ciascuna traccia."
+            )
+        else:
+            info_html = (
+                f"<b>{n_gps_hdr}/{n_all_hdr} profili hanno coordinate GPS reali.</b><br>"
+                "L'anteprima mostra le tracce vere (Est a destra, Nord in alto, verso di "
+                "percorrenza reale). Con «Mantieni le coordinate GPS originali» attivo, "
+                "«Applica» non le modifica: la sezione «Dimensioni Griglia di Rilievo» e le "
+                "colonne Asse/Offset/Invertito/Lunghezza qui sotto sono ignorate per quei "
+                "profili (appaiono in grigio) — servono solo come griglia locale di riserva "
+                "per profili senza GPS, o se disattivi «Mantieni le coordinate GPS originali»."
+            )
+        lbl_info = QLabel(info_html)
+        lbl_info.setWordWrap(True)
+        root_layout.addWidget(lbl_info)
+
+        splitter = QSplitter(Qt.Horizontal)
+
+        # -------------------------------------------------------------
+        # Pannello Sinistro: Parametri Griglia + Tabella Profili
+        # -------------------------------------------------------------
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Group Box Griglia Bounding Box
+        n_gps_box = sum(1 for it in self._profile_items if it.get("has_gps"))
+        grp_grid_title = (
+            "Dimensioni Griglia di Rilievo (fallback — solo profili senza GPS)"
+            if n_gps_box > 0 else "Dimensioni Griglia di Rilievo"
+        )
+        grp_grid = QGroupBox(grp_grid_title)
+        self._grp_grid = grp_grid
+        if n_gps_box > 0:
+            grp_grid.setToolTip(
+                "Questi limiti definiscono la griglia LOCALE usata solo per i profili\n"
+                "privi di GPS, o per tutti se disattivi 'Mantieni le coordinate GPS\n"
+                "originali' qui sotto. Per i profili con GPS reale non hanno effetto."
+            )
+        grid_form = QGridLayout(grp_grid)
+
+        grid_form.addWidget(QLabel("Asse X (Lunghezza): da"), 0, 0)
+        self._spin_x0 = QDoubleSpinBox()
+        self._spin_x0.setRange(-10000.0, 10000.0)
+        self._spin_x0.setValue(0.0)
+        self._spin_x0.setSuffix(" m")
+        self._spin_x0.valueChanged.connect(self._on_grid_bounds_changed)
+        grid_form.addWidget(self._spin_x0, 0, 1)
+
+        grid_form.addWidget(QLabel("a"), 0, 2)
+        self._spin_x1 = QDoubleSpinBox()
+        self._spin_x1.setRange(-10000.0, 10000.0)
+        self._spin_x1.setValue(10.0)
+        self._spin_x1.setSuffix(" m")
+        self._spin_x1.valueChanged.connect(self._on_grid_bounds_changed)
+        grid_form.addWidget(self._spin_x1, 0, 3)
+
+        grid_form.addWidget(QLabel("Asse Y (Larghezza): da"), 1, 0)
+        self._spin_y0 = QDoubleSpinBox()
+        self._spin_y0.setRange(-10000.0, 10000.0)
+        self._spin_y0.setValue(0.0)
+        self._spin_y0.setSuffix(" m")
+        self._spin_y0.valueChanged.connect(self._on_grid_bounds_changed)
+        grid_form.addWidget(self._spin_y0, 1, 1)
+
+        grid_form.addWidget(QLabel("a"), 1, 2)
+        self._spin_y1 = QDoubleSpinBox()
+        self._spin_y1.setRange(-10000.0, 10000.0)
+        self._spin_y1.setValue(max(1.0, float(len(self._profile_items) - 1)))
+        self._spin_y1.setSuffix(" m")
+        self._spin_y1.valueChanged.connect(self._on_grid_bounds_changed)
+        grid_form.addWidget(self._spin_y1, 1, 3)
+
+        btn_recalc = QPushButton("Ricalcola spaziature uniformi")
+        btn_recalc.setToolTip("Ripartisce uniformemente i profili all'interno dei limiti X0-X1 e Y0-Y1")
+        btn_recalc.clicked.connect(lambda: self._recalculate_spacing(auto_detect_dims=False))
+        grid_form.addWidget(btn_recalc, 2, 0, 1, 4)
+
+        left_layout.addWidget(grp_grid)
+
+        # Group Box Georeferenziazione GIS Opzionale
+        grp_geo = QGroupBox("Georeferenziazione GIS nel Progetto (Opzionale)")
+        grp_geo.setCheckable(True)
+        grp_geo.setChecked(False)
+        self._grp_geo = grp_geo
+        geo_form = QGridLayout(grp_geo)
+
+        geo_form.addWidget(QLabel("Origine Est (E0):"), 0, 0)
+        self._spin_e0 = QDoubleSpinBox()
+        self._spin_e0.setRange(-1e9, 1e9)
+        self._spin_e0.setDecimals(3)
+        self._spin_e0.setValue(0.0)
+        self._spin_e0.valueChanged.connect(self._draw_preview)
+        geo_form.addWidget(self._spin_e0, 0, 1)
+
+        geo_form.addWidget(QLabel("Origine Nord (N0):"), 0, 2)
+        self._spin_n0 = QDoubleSpinBox()
+        self._spin_n0.setRange(-1e9, 1e9)
+        self._spin_n0.setDecimals(3)
+        self._spin_n0.setValue(0.0)
+        self._spin_n0.valueChanged.connect(self._draw_preview)
+        geo_form.addWidget(self._spin_n0, 0, 3)
+
+        geo_form.addWidget(QLabel("Azimut griglia:"), 1, 0)
+        self._spin_azimuth = QDoubleSpinBox()
+        self._spin_azimuth.setRange(-360.0, 360.0)
+        self._spin_azimuth.setValue(0.0)
+        self._spin_azimuth.setSuffix(" °")
+        self._spin_azimuth.setToolTip("Angolo in gradi rispetto al Nord (0° = asse X verso Nord, 90° = asse X verso Est).")
+        self._spin_azimuth.valueChanged.connect(self._draw_preview)
+        geo_form.addWidget(self._spin_azimuth, 1, 1)
+
+        btn_pick_origin = QPushButton("Punta su Mappa QGIS")
+        btn_pick_origin.setToolTip("Clicca sul canvas di QGIS per impostare E0, N0")
+        btn_pick_origin.clicked.connect(self._pick_origin_from_canvas)
+        geo_form.addWidget(btn_pick_origin, 1, 2, 1, 2)
+
+        grp_geo.toggled.connect(self._draw_preview)
+        left_layout.addWidget(grp_geo)
+
+        # Group Box Navigazione / Marker
+        grp_nav = QGroupBox("Navigazione")
+        nav_form = QFormLayout(grp_nav)
+        self._chk_real_length = QCheckBox("Usa la lunghezza reale del profilo (non lo span griglia)")
+        self._chk_real_length.setChecked(False)
+        self._chk_real_length.setToolTip(
+            "Se attivo, ogni profilo occupa solo la sua 'Lunghezza (m)' a partire\n"
+            "dall'inizio della linea (linee ANG / parziali). La colonna Lunghezza\n"
+            "in tabella diventa modificabile."
+        )
+        self._chk_real_length.toggled.connect(self._on_nav_changed)
+        nav_form.addRow(self._chk_real_length)
+
+        self._spin_stagger = QDoubleSpinBox()
+        self._spin_stagger.setRange(-50.0, 50.0)
+        self._spin_stagger.setDecimals(3)
+        self._spin_stagger.setSingleStep(0.05)
+        self._spin_stagger.setValue(0.0)
+        self._spin_stagger.setSuffix(" m")
+        self._spin_stagger.setToolTip(
+            "Correzione staggering: traslazione applicata SOLO alle linee\n"
+            "invertite (zig-zag), per allineare andata e ritorno. 0 = nessuna."
+        )
+        self._spin_stagger.valueChanged.connect(self._on_nav_changed)
+        nav_form.addRow("Stagger (linee invertite):", self._spin_stagger)
+
+        self._chk_reverse_far = QCheckBox(
+            "Linee invertite: parti dalla baseline di ritorno (lato opposto)"
+        )
+        self._chk_reverse_far.setChecked(False)
+        self._chk_reverse_far.setToolTip(
+            "Zig-zag: se una linea di ritorno è più corta dello span griglia,\n"
+            "viene allineata al lato OPPOSTO (x1 / y1) invece che al lato di\n"
+            "partenza (x0 / y0).\n"
+            "Usalo SOLO se tutte le linee di ritorno partono davvero da una\n"
+            "baseline comune a x1 / y1. Se le linee hanno lunghezze diverse e\n"
+            "condividono la baseline di x0 / y0 (area a cuneo: le linee di ritorno\n"
+            "FINISCONO su di essa), lascialo disattivo: altrimenti le linee\n"
+            "invertite partono da x1 e oltrepassano la fine delle linee dirette.\n"
+            "Richiede 'Usa la lunghezza reale del profilo'."
+        )
+        self._chk_reverse_far.toggled.connect(self._on_nav_changed)
+        nav_form.addRow(self._chk_reverse_far)
+
+        n_gps = sum(1 for it in self._profile_items if it.get("has_gps"))
+        self._chk_keep_gps = QCheckBox(
+            f"Mantieni le coordinate GPS originali ({n_gps}/{len(self._profile_items)} profili)"
+        )
+        self._chk_keep_gps.setChecked(n_gps > 0)
+        self._chk_keep_gps.setEnabled(n_gps > 0)
+        self._chk_keep_gps.setToolTip(
+            "Se attivo, 'Applica' NON sovrascrive easting/northing dei profili che\n"
+            "hanno gia' coordinate GPS reali (UTM): vengono applicati solo nome e\n"
+            "impostazioni. Disattiva per forzare la griglia locale su tutti i profili."
+        )
+        self._chk_keep_gps.toggled.connect(self._on_nav_changed)
+        nav_form.addRow(self._chk_keep_gps)
+
+        # --- Modo posizionamento tracce (uniforme / marker + dead-reckoning) ---
+        self._cb_pos_mode = QComboBox()
+        self._cb_pos_mode.addItem("Uniforme (griglia)", "uniform")
+        self._cb_pos_mode.addItem("Interval marker (passo scan fisso)", "interval")
+        self._cb_pos_mode.addItem("Artificial marker (N equidistanti)", "artificial")
+        self._cb_pos_mode.setToolTip(
+            "Uniforme: tracce spalmate uniformemente sulla lunghezza (assume\n"
+            "nessuno slittamento). Interval: un marker ogni N scan, la coda oltre\n"
+            "l'ultimo marker viene scartata (recupero acquisizioni 'sbordate').\n"
+            "Artificial: N marker equidistanti (≈ uniforme senza calibrazione ruota)."
+        )
+        self._cb_pos_mode.currentIndexChanged.connect(self._on_pos_mode_changed)
+        nav_form.addRow("Modo posizionamento:", self._cb_pos_mode)
+
+        self._spin_pos_param = QSpinBox()
+        self._spin_pos_param.setRange(0, 10_000_000)
+        self._spin_pos_param.setValue(0)
+        self._spin_pos_param.setToolTip(
+            "Interval: scan per marker (0 = automatico, ~1 marker/metro).\n"
+            "Artificial: numero di marker (0 = automatico, ~1/metro)."
+        )
+        self._spin_pos_param.valueChanged.connect(self._on_nav_changed)
+        self._lbl_pos_param = QLabel("Passo scan / N marker:")
+        nav_form.addRow(self._lbl_pos_param, self._spin_pos_param)
+
+        self._lbl_pos_info = QLabel("")
+        self._lbl_pos_info.setStyleSheet("color: #666;")
+        self._lbl_pos_info.setWordWrap(True)
+        nav_form.addRow("", self._lbl_pos_info)
+
+        # --- Quota per traccia (per migrazione topografica / correzione statica) ---
+        self._cb_elev_mode = QComboBox()
+        self._cb_elev_mode.addItem("Nessuna quota", "none")
+        self._cb_elev_mode.addItem("Piano inclinato (quota inizio → fine)", "plane")
+        self._cb_elev_mode.addItem("Da file (x,z  oppure  traccia,z)", "file")
+        self._cb_elev_mode.setToolTip(
+            "Assegna una quota (Z) a ogni traccia, usata dalla migrazione\n"
+            "Kirchhoff topografica e dalla correzione statica su rilievi senza GPS."
+        )
+        self._cb_elev_mode.currentIndexChanged.connect(self._on_elev_mode_changed)
+        nav_form.addRow("Quota per traccia:", self._cb_elev_mode)
+
+        self._spin_z_start = QDoubleSpinBox()
+        self._spin_z_start.setRange(-9999.0, 9999.0)
+        self._spin_z_start.setDecimals(3)
+        self._spin_z_start.setSingleStep(0.05)
+        self._spin_z_start.setValue(0.0)
+        self._spin_z_start.setSuffix(" m")
+        self._spin_z_start.valueChanged.connect(self._on_nav_changed)
+        self._lbl_z_start = QLabel("Quota inizio linea:")
+        nav_form.addRow(self._lbl_z_start, self._spin_z_start)
+
+        self._spin_z_end = QDoubleSpinBox()
+        self._spin_z_end.setRange(-9999.0, 9999.0)
+        self._spin_z_end.setDecimals(3)
+        self._spin_z_end.setSingleStep(0.05)
+        self._spin_z_end.setValue(0.0)
+        self._spin_z_end.setSuffix(" m")
+        self._spin_z_end.valueChanged.connect(self._on_nav_changed)
+        self._lbl_z_end = QLabel("Quota fine linea:")
+        nav_form.addRow(self._lbl_z_end, self._spin_z_end)
+
+        elev_file_row = QHBoxLayout()
+        self._le_elev_file = QLineEdit()
+        self._le_elev_file.setPlaceholderText("file .csv/.txt  —  due colonne: posizione, quota")
+        self._le_elev_file.textChanged.connect(self._on_nav_changed)
+        self._btn_elev_file = QPushButton("Sfoglia…")
+        self._btn_elev_file.clicked.connect(self._pick_elev_file)
+        elev_file_row.addWidget(self._le_elev_file, 1)
+        elev_file_row.addWidget(self._btn_elev_file, 0)
+        self._elev_file_widget = QWidget()
+        self._elev_file_widget.setLayout(elev_file_row)
+        self._lbl_elev_file = QLabel("File quote:")
+        nav_form.addRow(self._lbl_elev_file, self._elev_file_widget)
+
+        self._cb_elev_kind = QComboBox()
+        self._cb_elev_kind.addItem("Colonna 1 = metri lungo la linea", "x")
+        self._cb_elev_kind.addItem("Colonna 1 = indice di traccia", "trace")
+        self._cb_elev_kind.currentIndexChanged.connect(self._on_nav_changed)
+        self._lbl_elev_kind = QLabel("Interpretazione colonna 1:")
+        nav_form.addRow(self._lbl_elev_kind, self._cb_elev_kind)
+
+        left_layout.addWidget(grp_nav)
+        self._on_elev_mode_changed()
+
+        # Tabella Profili e Strumenti Rapidi
+        grp_table = QGroupBox("Elenco Profili e Sequenza")
+        tbl_layout = QVBoxLayout(grp_table)
+
+        # Toolbar bottoni rapidi tabella
+        tbl_tools = QHBoxLayout()
+        btn_zigzag = QPushButton("Zig-Zag (Alterna)")
+        btn_zigzag.setToolTip("Inverte la direzione delle linee alternate (0 avanti, 1 indietro, 2 avanti...)")
+        btn_zigzag.clicked.connect(self._apply_zigzag)
+        tbl_tools.addWidget(btn_zigzag)
+
+        btn_inv_all = QPushButton("Inverti tutti")
+        btn_inv_all.clicked.connect(self._invert_all)
+        tbl_tools.addWidget(btn_inv_all)
+
+        btn_reset_inv = QPushButton("Ripristina versi")
+        btn_reset_inv.clicked.connect(self._reset_inversions)
+        tbl_tools.addWidget(btn_reset_inv)
+
+        tbl_tools.addStretch(1)
+
+        btn_up = QPushButton("▲ Su")
+        btn_up.clicked.connect(self._move_selected_up)
+        tbl_tools.addWidget(btn_up)
+
+        btn_down = QPushButton("▼ Giù")
+        btn_down.clicked.connect(self._move_selected_down)
+        tbl_tools.addWidget(btn_down)
+
+        tbl_layout.addLayout(tbl_tools)
+
+        self._table = QTableWidget(0, 7)
+        self._table.setHorizontalHeaderLabels([
+            "#", "Nome Profilo", "Asse", "Offset (m)", "Invertito (Zig-zag)", "N Tracce", "Lunghezza (m)"
+        ])
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.itemChanged.connect(self._on_table_item_changed)
+        self._table.itemSelectionChanged.connect(self._draw_marker_preview)
+        self._table.itemSelectionChanged.connect(self._update_metadata_panel)
+        tbl_layout.addWidget(self._table)
+
+        left_layout.addWidget(grp_table)
+        splitter.addWidget(left_widget)
+
+        # -------------------------------------------------------------
+        # Pannello Destro: Anteprima Schema 2D
+        # -------------------------------------------------------------
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        grp_preview = QGroupBox("Anteprima Schema Geometrico")
+        prev_layout = QVBoxLayout(grp_preview)
+
+        if HAS_MPL:
+            self._fig = Figure(figsize=(5, 4), dpi=100)
+            self._canvas_mpl = FigureCanvasQTAgg(self._fig)
+            self._ax = self._fig.add_subplot(111)
+            prev_layout.addWidget(self._canvas_mpl)
+        else:
+            self._canvas_mpl = None
+            self._ax = None
+            lbl_no_mpl = QLabel("Anteprima non disponibile (matplotlib mancante).")
+            prev_layout.addWidget(lbl_no_mpl)
+
+        right_layout.addWidget(grp_preview)
+
+        grp_marker = QGroupBox("Radargramma + marker (profilo selezionato)")
+        mk_layout = QVBoxLayout(grp_marker)
+        if HAS_MPL:
+            self._fig_mk = Figure(figsize=(5, 2.6), dpi=100)
+            self._canvas_mk = FigureCanvasQTAgg(self._fig_mk)
+            self._ax_mk = self._fig_mk.add_subplot(111)
+            mk_layout.addWidget(self._canvas_mk)
+        else:
+            self._fig_mk = None
+            self._canvas_mk = None
+            self._ax_mk = None
+            mk_layout.addWidget(QLabel("Anteprima non disponibile (matplotlib mancante)."))
+        right_layout.addWidget(grp_marker)
+
+        # Metadati del profilo selezionato in tabella
+        grp_meta = QGroupBox("Profilo Selezionato — Metadati")
+        meta_form = QFormLayout(grp_meta)
+        meta_form.setLabelAlignment(Qt.AlignRight)
+        self._lbl_meta_file = QLabel("—")
+        self._lbl_meta_file.setWordWrap(True)
+        meta_form.addRow("File:", self._lbl_meta_file)
+        self._lbl_meta_ids = QLabel("—")
+        meta_form.addRow("Swath / Array ID:", self._lbl_meta_ids)
+        self._lbl_meta_geom = QLabel("—")
+        meta_form.addRow("Canali / campioni / tracce:", self._lbl_meta_geom)
+        self._lbl_meta_sampling = QLabel("—")
+        meta_form.addRow("Passo campionamento:", self._lbl_meta_sampling)
+        self._lbl_meta_antenna = QLabel("—")
+        meta_form.addRow("Antenna:", self._lbl_meta_antenna)
+        self._lbl_meta_velocity = QLabel("—")
+        meta_form.addRow("Velocità radar:", self._lbl_meta_velocity)
+        self._lbl_meta_gps = QLabel("—")
+        meta_form.addRow("Georeferenziazione:", self._lbl_meta_gps)
+        self._lbl_meta_length = QLabel("—")
+        meta_form.addRow("Lunghezza calcolata:", self._lbl_meta_length)
+        self._lbl_meta_warn = QLabel("")
+        self._lbl_meta_warn.setWordWrap(True)
+        self._lbl_meta_warn.setStyleSheet("color: #b36b00;")
+        meta_form.addRow("Avvisi:", self._lbl_meta_warn)
+        lbl_meta_hint = QLabel(
+            "Nome, asse, offset, verso (zig-zag) e lunghezza si modificano "
+            "direttamente sulla riga evidenziata nella tabella a sinistra."
+        )
+        lbl_meta_hint.setWordWrap(True)
+        lbl_meta_hint.setStyleSheet("color: #666; font-style: italic;")
+        meta_form.addRow(lbl_meta_hint)
+        right_layout.addWidget(grp_meta)
+
+        splitter.addWidget(right_widget)
+
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        root_layout.addWidget(splitter, 1)
+
+        # Dialog Buttons
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.button(QDialogButtonBox.Ok).setText("Applica Geometria")
+        btn_box.accepted.connect(self._apply_and_accept)
+        btn_box.rejected.connect(self.reject)
+        root_layout.addWidget(btn_box)
+
+    # ------------------------------------------------------------------
+    # Calcoli e Azioni Geometria
+    # ------------------------------------------------------------------
+
+    def _on_grid_bounds_changed(self):
+        self._recalculate_spacing(auto_detect_dims=False)
+
+    def _recalculate_spacing(self, auto_detect_dims: bool = False):
+        """Ricalcola gli offset dei profili in base ai limiti correnti."""
+        if not self._profile_items:
+            return
+
+        x_items = [it for it in self._profile_items if it["axis"] == "X"]
+        y_items = [it for it in self._profile_items if it["axis"] == "Y"]
+
+        if auto_detect_dims:
+            # Stima lunghezza max dalle tracce
+            max_len = max([it["length"] for it in self._profile_items], default=10.0)
+            self._spin_x0.blockSignals(True)
+            self._spin_x1.blockSignals(True)
+            self._spin_x0.setValue(0.0)
+            self._spin_x1.setValue(float(round(max_len, 2)))
+            self._spin_x0.blockSignals(False)
+            self._spin_x1.blockSignals(False)
+
+            y_span = float(max(1.0, len(x_items) - 1)) if x_items else 10.0
+            self._spin_y0.blockSignals(True)
+            self._spin_y1.blockSignals(True)
+            self._spin_y0.setValue(0.0)
+            self._spin_y1.setValue(y_span)
+            self._spin_y0.blockSignals(False)
+            self._spin_y1.blockSignals(False)
+
+        x0 = float(self._spin_x0.value())
+        x1 = float(self._spin_x1.value())
+        y0 = float(self._spin_y0.value())
+        y1 = float(self._spin_y1.value())
+
+        # Assegna offset per profili X
+        if x_items:
+            nx = len(x_items)
+            step_y = (y1 - y0) / float(max(1, nx - 1)) if nx > 1 else 0.0
+            for idx, it in enumerate(x_items):
+                it["offset"] = float(round(y0 + idx * step_y, 4))
+
+        # Assegna offset per profili Y (ortogonali)
+        if y_items:
+            ny = len(y_items)
+            step_x = (x1 - x0) / float(max(1, ny - 1)) if ny > 1 else 0.0
+            for idx, it in enumerate(y_items):
+                it["offset"] = float(round(x0 + idx * step_x, 4))
+
+        self._update_table_from_items()
+        self._draw_preview()
+
+    def _apply_zigzag(self):
+        """Inverte la direzione delle linee alternate (0 forward, 1 reversed, 2 forward, ...)."""
+        for i, it in enumerate(self._profile_items):
+            it["reversed"] = (i % 2 == 1)
+        self._update_table_from_items()
+        self._draw_preview()
+
+    def _invert_all(self):
+        for it in self._profile_items:
+            it["reversed"] = True
+        self._update_table_from_items()
+        self._draw_preview()
+
+    def _reset_inversions(self):
+        for it in self._profile_items:
+            it["reversed"] = False
+        self._update_table_from_items()
+        self._draw_preview()
+
+    def _move_selected_up(self):
+        r = self._table.currentRow()
+        if r > 0:
+            self._profile_items[r - 1], self._profile_items[r] = self._profile_items[r], self._profile_items[r - 1]
+            self._recalculate_spacing(auto_detect_dims=False)
+            self._table.selectRow(r - 1)
+
+    def _move_selected_down(self):
+        r = self._table.currentRow()
+        if 0 <= r < len(self._profile_items) - 1:
+            self._profile_items[r + 1], self._profile_items[r] = self._profile_items[r], self._profile_items[r + 1]
+            self._recalculate_spacing(auto_detect_dims=False)
+            self._table.selectRow(r + 1)
+
+    def _pick_origin_from_canvas(self):
+        """Permette di acquisire E0, N0 cliccando sulla mappa QGIS."""
+        if not self._canvas:
+            QMessageBox.information(self, "Punta Origine", "Map canvas di QGIS non disponibile.")
+            return
+        try:
+            from qgis.gui import QgsMapToolEmitPoint
+
+            def _on_canvas_clicked(pt):
+                self._spin_e0.setValue(float(pt.x()))
+                self._spin_n0.setValue(float(pt.y()))
+                self._grp_geo.setChecked(True)
+                if hasattr(self, "_temp_map_tool"):
+                    self._canvas.unsetMapTool(self._temp_map_tool)
+                self.show()
+                self._draw_preview()
+
+            self._temp_map_tool = QgsMapToolEmitPoint(self._canvas)
+            self._temp_map_tool.canvasClicked.connect(_on_canvas_clicked)
+            self._canvas.setMapTool(self._temp_map_tool)
+            self.hide()
+        except Exception as exc:
+            QMessageBox.warning(self, "Punta Origine", f"Impossibile attivare il tool di puntamento:\n{exc}")
+
+    # ------------------------------------------------------------------
+    # Sincronizzazione Tabella
+    # ------------------------------------------------------------------
+
+    def _update_table_from_items(self):
+        self._syncing_table = True
+        try:
+            self._table.setRowCount(len(self._profile_items))
+            keep_gps_on = bool(
+                getattr(self, "_chk_keep_gps", None) and self._chk_keep_gps.isChecked()
+            )
+            gps_ignored_tip = (
+                "Coordinate GPS reali mantenute per questo profilo: campo ignorato\n"
+                "(vale solo per la griglia locale di riserva). Disattiva 'Mantieni le\n"
+                "coordinate GPS originali' per forzarne l'uso."
+            )
+            for r, it in enumerate(self._profile_items):
+                gps_locked = keep_gps_on and bool(it.get("has_gps"))
+
+                # # ID
+                item_id = QTableWidgetItem(str(r + 1))
+                item_id.setFlags(item_id.flags() & ~Qt.ItemIsEditable)
+                item_id.setTextAlignment(Qt.AlignCenter)
+                self._table.setItem(r, 0, item_id)
+
+                # Nome profilo
+                item_name = QTableWidgetItem(str(it["name"]))
+                if it.get("has_gps"):
+                    item_name.setIcon(self.style().standardIcon(
+                        self.style().SP_DialogApplyButton))
+                    item_name.setToolTip("Profilo con coordinate GPS reali")
+                self._table.setItem(r, 1, item_name)
+
+                # Asse combo
+                cb_axis = QComboBox()
+                cb_axis.addItems(["X", "Y"])
+                cb_axis.setCurrentText(it["axis"])
+                cb_axis.currentTextChanged.connect(lambda txt, row=r: self._on_axis_changed(row, txt))
+                cb_axis.setEnabled(not gps_locked)
+                if gps_locked:
+                    cb_axis.setToolTip(gps_ignored_tip)
+                self._table.setCellWidget(r, 2, cb_axis)
+
+                # Offset spin
+                spin_off = QDoubleSpinBox()
+                spin_off.setRange(-10000.0, 10000.0)
+                spin_off.setDecimals(3)
+                spin_off.setValue(float(it["offset"]))
+                spin_off.valueChanged.connect(lambda val, row=r: self._on_offset_changed(row, val))
+                spin_off.setEnabled(not gps_locked)
+                if gps_locked:
+                    spin_off.setToolTip(gps_ignored_tip)
+                self._table.setCellWidget(r, 3, spin_off)
+
+                # Checkbox Reversing
+                chk_rev = QCheckBox()
+                chk_rev.setChecked(bool(it["reversed"]))
+                chk_rev.toggled.connect(lambda chk, row=r: self._on_reversed_changed(row, chk))
+                chk_rev.setEnabled(not gps_locked)
+                if gps_locked:
+                    chk_rev.setToolTip(gps_ignored_tip)
+                chk_container = QWidget()
+                chk_lay = QHBoxLayout(chk_container)
+                chk_lay.addWidget(chk_rev)
+                chk_lay.setAlignment(Qt.AlignCenter)
+                chk_lay.setContentsMargins(0, 0, 0, 0)
+                self._table.setCellWidget(r, 4, chk_container)
+
+                # N Tracce
+                item_tr = QTableWidgetItem(str(it["n_traces"]))
+                item_tr.setFlags(item_tr.flags() & ~Qt.ItemIsEditable)
+                item_tr.setTextAlignment(Qt.AlignCenter)
+                self._table.setItem(r, 5, item_tr)
+
+                # Lunghezza (modificabile solo se "usa lunghezza reale")
+                item_len = QTableWidgetItem(f"{it['length']:.2f}")
+                editable = bool(
+                    getattr(self, "_chk_real_length", None)
+                    and self._chk_real_length.isChecked()
+                    and not gps_locked
+                )
+                if editable:
+                    item_len.setFlags(item_len.flags() | Qt.ItemIsEditable)
+                else:
+                    item_len.setFlags(item_len.flags() & ~Qt.ItemIsEditable)
+                if gps_locked:
+                    item_len.setToolTip(gps_ignored_tip)
+                item_len.setTextAlignment(Qt.AlignCenter)
+                self._table.setItem(r, 6, item_len)
+        finally:
+            self._syncing_table = False
+
+    def _on_nav_changed(self, *_a):
+        self._update_table_from_items()
+        self._draw_preview()
+        self._draw_marker_preview()
+        self._update_metadata_panel()
+
+    # ------------------------------------------------------------------
+    # Modo posizionamento (marker + dead-reckoning) e anteprima radargramma
+    # ------------------------------------------------------------------
+
+    def _pos_mode(self) -> str:
+        cb = getattr(self, "_cb_pos_mode", None)
+        return str(cb.currentData()) if cb is not None else "uniform"
+
+    def _on_pos_mode_changed(self, *_a):
+        lbl = getattr(self, "_lbl_pos_param", None)
+        spin = getattr(self, "_spin_pos_param", None)
+        if lbl is None or spin is None:
+            return
+        mode = self._pos_mode()
+        show_param = mode in ("interval", "artificial")
+        lbl.setVisible(show_param)
+        spin.setVisible(show_param)
+        if mode == "interval":
+            lbl.setText("Scan per marker (0 = auto):")
+        elif mode == "artificial":
+            lbl.setText("N marker (0 = auto):")
+        if getattr(self, "_table", None) is not None:
+            self._on_nav_changed()
+
+    def _markers_for_item(self, it: dict):
+        """(markers, leftover) per un profilo dato il modo posizionamento
+        corrente. ``length_m`` è la lunghezza effettiva usata da compute_positions."""
+        mode = self._pos_mode()
+        if mode == "uniform":
+            return [], 0
+        n_t = int(it.get("n_traces", 0) or 0)
+        use_real = bool(getattr(self, "_chk_real_length", None) and self._chk_real_length.isChecked())
+        span = abs(float(self._spin_x1.value()) - float(self._spin_x0.value())) \
+            if it.get("axis") == "X" else \
+            abs(float(self._spin_y1.value()) - float(self._spin_y0.value()))
+        span = span if span > 1e-9 else 1.0
+        L = float(it.get("length", span) or span) if (use_real and float(it.get("length", 0.0) or 0.0) > 1e-9) else span
+        p = int(self._spin_pos_param.value())
+        return build_markers(
+            mode, n_t, L,
+            scans_per_mark=(p or None) if mode == "interval" else None,
+            n_marks=(p or None) if mode == "artificial" else None,
+        )
+
+    def _selected_profile_index(self) -> int:
+        tbl = getattr(self, "_table", None)
+        if tbl is None:
+            return 0
+        rows = sorted({ix.row() for ix in tbl.selectedIndexes()})
+        if rows and 0 <= rows[0] < len(self._profile_items):
+            return rows[0]
+        return 0
+
+    def _marker_radargram_data(self, prof_idx: int):
+        """Radargramma (canale 0) del profilo, sottocampionato e in cache."""
+        if prof_idx in self._mk_data_cache:
+            return self._mk_data_cache[prof_idx]
+        try:
+            from .radargram_render import downsample_radargram
+        except ImportError:  # pragma: no cover
+            from radargram_render import downsample_radargram
+        arr = None
+        try:
+            prof = self._profiles[prof_idx]
+            chans = getattr(prof, "channels", None) or []
+            if chans and getattr(chans[0], "data", None) is not None:
+                d = np.asarray(chans[0].data, dtype=np.float32)
+                if d.ndim == 2 and d.size:
+                    arr = downsample_radargram(d)
+        except Exception:
+            arr = None
+        self._mk_data_cache[prof_idx] = arr
+        return arr
+
+    def _draw_marker_preview(self, *_a):
+        ax = getattr(self, "_ax_mk", None)
+        if ax is None or not HAS_MPL:
+            return
+        try:
+            from .radargram_render import draw_radargram
+        except ImportError:  # pragma: no cover
+            from radargram_render import draw_radargram
+
+        idx = self._selected_profile_index()
+        it = self._profile_items[idx] if 0 <= idx < len(self._profile_items) else None
+        ax.clear()
+        if it is None:
+            self._canvas_mk.draw_idle()
+            return
+
+        data = self._marker_radargram_data(idx)
+        n_t = int(it.get("n_traces", 0) or 0)
+        markers, leftover = self._markers_for_item(it)
+        mk_traces = [m.trace_idx for m in markers] if markers else None
+
+        if data is None:
+            ax.text(0.5, 0.5, "Dati radargramma non disponibili",
+                    ha="center", va="center", transform=ax.transAxes, color="#888")
+            ax.set_xticks([]); ax.set_yticks([])
+        else:
+            draw_radargram(
+                ax, data, marker_traces=mk_traces, n_traces_full=n_t or data.shape[1],
+                clear=False,
+            )
+            ax.set_xlabel("Traccia")
+            ax.set_ylabel("Campione")
+            title = f"{it.get('name', '')}  —  {n_t} tracce"
+            if self._pos_mode() != "uniform" and markers is not None:
+                title += f"  |  {len(markers)} marker"
+                if leftover > 0:
+                    title += f", coda {leftover} scan scartati"
+            ax.set_title(title, fontsize=9)
+
+        # riepilogo testuale sotto la combo
+        info = getattr(self, "_lbl_pos_info", None)
+        if info is not None:
+            if self._pos_mode() == "uniform":
+                info.setText("")
+            elif markers:
+                msg = f"{it.get('name','?')}: {len(markers)} marker su {n_t} scan"
+                if leftover > 0:
+                    msg += f"  ·  {leftover} scan oltre l'ultimo marker (scartati nello slicing)"
+                info.setText(msg)
+            else:
+                info.setText("Marker non calcolabili (controlla lunghezza / N tracce).")
+
+        try:
+            self._fig_mk.tight_layout()
+        except Exception:
+            pass
+        self._canvas_mk.draw_idle()
+
+    def _update_metadata_panel(self, *_a):
+        """Aggiorna il pannello metadati col profilo evidenziato in tabella."""
+        if not hasattr(self, "_lbl_meta_file"):
+            return
+        idx = self._selected_profile_index()
+        it = self._profile_items[idx] if 0 <= idx < len(self._profile_items) else None
+        if it is None:
+            for w in (self._lbl_meta_file, self._lbl_meta_ids, self._lbl_meta_geom,
+                      self._lbl_meta_sampling, self._lbl_meta_antenna,
+                      self._lbl_meta_velocity, self._lbl_meta_gps, self._lbl_meta_length):
+                w.setText("—")
+            self._lbl_meta_warn.setText("")
+            return
+
+        prof = it["prof"]
+        path = str(getattr(prof, "path", "") or "")
+        self._lbl_meta_file.setText(f"<b>{os.path.basename(path) or it['name']}</b>")
+        self._lbl_meta_file.setToolTip(path)
+
+        swath_id = getattr(prof, "swath_id", "") or "—"
+        array_id = getattr(prof, "array_id", None)
+        array_txt = str(array_id) if array_id not in (None, "") else "—"
+        self._lbl_meta_ids.setText(f"{swath_id} / {array_txt}")
+
+        n_ch = getattr(prof, "n_channels", None) or len(getattr(prof, "channels", []) or [])
+        n_samp = getattr(prof, "n_samples", "—")
+        self._lbl_meta_geom.setText(f"{n_ch} ch · {n_samp} campioni · {it['n_traces']} tracce")
+
+        step = getattr(prof, "sampling_step_m", None)
+        t_ns = getattr(prof, "sampling_time_ns", None)
+        step_txt = f"{step:.4f} m" if isinstance(step, (int, float)) else "—"
+        t_txt = f", {t_ns:.3f} ns" if isinstance(t_ns, (int, float)) else ""
+        self._lbl_meta_sampling.setText(step_txt + t_txt)
+
+        freq = getattr(prof, "frequency_mhz", None)
+        polar = getattr(prof, "polarization", "") or ""
+        freq_txt = f"{freq:.0f} MHz" if isinstance(freq, (int, float)) and freq > 0 else "—"
+        self._lbl_meta_antenna.setText(f"{freq_txt}" + (f"  ({polar})" if polar else ""))
+
+        vel = getattr(prof, "velocity_m_s", None)
+        if isinstance(vel, (int, float)) and vel > 0:
+            self._lbl_meta_velocity.setText(f"{vel * 1e-7:.3f} cm/ns  ({vel:.3e} m/s)")
+        else:
+            self._lbl_meta_velocity.setText("—")
+
+        epsg = getattr(prof, "epsg", None)
+        if it.get("has_gps"):
+            gps_txt = "GPS reale presente"
+            if epsg:
+                gps_txt += f"  (EPSG:{epsg})"
+        else:
+            gps_txt = "assente — coordinate da griglia locale"
+        self._lbl_meta_gps.setText(gps_txt)
+
+        self._lbl_meta_length.setText(f"{it.get('length', 0.0):.2f} m")
+
+        warnings = list(getattr(prof, "parse_warnings", None) or [])
+        self._lbl_meta_warn.setText("; ".join(warnings) if warnings else "nessuno")
+
+    def _elev_mode(self) -> str:
+        cb = getattr(self, "_cb_elev_mode", None)
+        return str(cb.currentData()) if cb is not None else "none"
+
+    def _on_elev_mode_changed(self, *_a):
+        mode = self._elev_mode()
+        is_plane = mode == "plane"
+        is_file = mode == "file"
+        for w in (getattr(self, "_lbl_z_start", None), getattr(self, "_spin_z_start", None),
+                  getattr(self, "_lbl_z_end", None), getattr(self, "_spin_z_end", None)):
+            if w is not None:
+                w.setVisible(is_plane)
+        for w in (getattr(self, "_lbl_elev_file", None), getattr(self, "_elev_file_widget", None),
+                  getattr(self, "_lbl_elev_kind", None), getattr(self, "_cb_elev_kind", None)):
+            if w is not None:
+                w.setVisible(is_file)
+        if getattr(self, "_table", None) is not None:
+            self._on_nav_changed()
+
+    def _pick_elev_file(self):
+        start = os.path.dirname(str(self._le_elev_file.text()).strip() or "") or os.path.expanduser("~")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "File quote per traccia", start,
+            "Tabelle (*.csv *.txt *.dat *.xyz);;Tutti i file (*)",
+        )
+        if path:
+            self._le_elev_file.setText(path)
+
+    @staticmethod
+    def _parse_elev_file(path: str) -> "np.ndarray | None":
+        """Legge un file a due colonne (posizione, quota). Accetta separatori
+        virgola / punto e virgola / tab / spazi, salta righe non numeriche
+        (header inclusi). Ritorna un array Nx2 o None."""
+        try:
+            rows = []
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    parts = [p for p in re.split(r"[,;\t ]+", s) if p != ""]
+                    if len(parts) < 2:
+                        continue
+                    try:
+                        a = float(parts[0].replace(",", "."))
+                        b = float(parts[1].replace(",", "."))
+                    except ValueError:
+                        continue
+                    rows.append((a, b))
+            if len(rows) < 1:
+                return None
+            return np.asarray(rows, dtype=np.float64)
+        except OSError:
+            return None
+
+    def _on_table_item_changed(self, item):
+        if self._syncing_table or not item:
+            return
+        r = item.row()
+        c = item.column()
+        if not (0 <= r < len(self._profile_items)):
+            return
+        if c == 1:
+            self._profile_items[r]["name"] = str(item.text()).strip()
+            self._draw_preview()
+            self._update_metadata_panel()
+        elif c == 6:
+            try:
+                val = float(str(item.text()).replace(",", "."))
+                if val > 0:
+                    self._profile_items[r]["length"] = val
+            except ValueError:
+                pass
+            self._draw_preview()
+            self._update_metadata_panel()
+
+    def _on_axis_changed(self, row: int, axis_text: str):
+        if 0 <= row < len(self._profile_items):
+            self._profile_items[row]["axis"] = str(axis_text).strip()
+            self._draw_preview()
+
+    def _on_offset_changed(self, row: int, val: float):
+        if 0 <= row < len(self._profile_items):
+            self._profile_items[row]["offset"] = float(val)
+            self._draw_preview()
+
+    def _on_reversed_changed(self, row: int, is_reversed: bool):
+        if 0 <= row < len(self._profile_items):
+            self._profile_items[row]["reversed"] = bool(is_reversed)
+            self._draw_preview()
+
+    # ------------------------------------------------------------------
+    # Disegno Anteprima 2D
+    # ------------------------------------------------------------------
+
+    def _draw_real_gps_preview(self) -> bool:
+        """Con «Mantieni coordinate GPS» attivo mostra le tracce REALI dei profili
+        (Est a destra, Nord in alto, verso di percorrenza vero), non lo schema
+        sintetico. Ritorna True se ha disegnato."""
+        if not (getattr(self, "_chk_keep_gps", None) and self._chk_keep_gps.isChecked()):
+            return False
+        tracks = []
+        for idx, it in enumerate(self._profile_items):
+            if not it.get("has_gps"):
+                continue
+            tr = self._profile_track(it["prof"])
+            if tr is not None:
+                tracks.append((idx, it, tr[0], tr[1]))
+        if not tracks:
+            return False
+        e_min = min(float(np.min(t[2])) for t in tracks)
+        n_min = min(float(np.min(t[3])) for t in tracks)
+        for idx, it, e, n in tracks:
+            xs, ys = e - e_min, n - n_min
+            dx, dy = float(xs[-1] - xs[0]), float(ys[-1] - ys[0])
+            color = "#1f77b4" if abs(dx) >= abs(dy) else "#ff7f0e"
+            self._ax.plot(xs, ys, color=color, lw=2.0)
+            k = int(0.6 * (xs.size - 1))
+            k2 = min(xs.size - 1, k + max(1, xs.size // 12))
+            self._ax.annotate(
+                "", xy=(xs[k2], ys[k2]), xytext=(xs[k], ys[k]),
+                arrowprops=dict(arrowstyle="->", color=color, lw=1.8),
+            )
+            self._ax.text(
+                xs[0], ys[0], f"{idx + 1}", color="black", fontsize=8, fontweight="bold",
+                ha="center", va="center",
+                bbox=dict(boxstyle="circle,pad=0.2", fc="white", ec=color, lw=1.0),
+            )
+        _dbg.log_once(("dlg-real-preview", len(tracks)), "DIALOG-PREVIEW",
+                      f"anteprima da coordinate REALI: {len(tracks)} profili, origine E={e_min:.3f} N={n_min:.3f}")
+        self._ax.set_aspect("equal", "datalim")
+        self._ax.grid(True, linestyle=":", alpha=0.5)
+        self._ax.set_xlabel("Est relativo (m)")
+        self._ax.set_ylabel("Nord relativo (m)")
+        self._ax.set_title("Coordinate GPS reali dei profili")
+        self._fig.tight_layout()
+        self._canvas_mpl.draw()
+        return True
+
+    def _draw_preview(self):
+        if not HAS_MPL or not self._ax:
+            return
+
+        self._ax.clear()
+
+        if self._draw_real_gps_preview():
+            return
+
+        x0 = float(self._spin_x0.value())
+        x1 = float(self._spin_x1.value())
+        y0 = float(self._spin_y0.value())
+        y1 = float(self._spin_y1.value())
+
+        geo_on = self._grp_geo.isChecked()
+        e0 = float(self._spin_e0.value()) if geo_on else 0.0
+        n0 = float(self._spin_n0.value()) if geo_on else 0.0
+        az_deg = float(self._spin_azimuth.value()) if geo_on else 0.0
+        az_rad = math.radians(az_deg)
+        cos_a, sin_a = math.cos(az_rad), math.sin(az_rad)
+
+        def _to_display_xy(lx, ly):
+            if not geo_on:
+                return lx, ly
+            # Rotazione azimutale + traslazione
+            de = lx * cos_a + ly * sin_a
+            dn = -lx * sin_a + ly * cos_a
+            return e0 + de, n0 + dn
+
+        # Disegna contorno griglia
+        corners_local = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+        corners_disp = [_to_display_xy(cx, cy) for cx, cy in corners_local]
+        bx = [p[0] for p in corners_disp]
+        by = [p[1] for p in corners_disp]
+        self._ax.plot(bx, by, "k--", lw=1.2, alpha=0.6, label="Limite griglia")
+
+        use_real_len = bool(
+            getattr(self, "_chk_real_length", None) and self._chk_real_length.isChecked()
+        )
+        stagger_m = float(getattr(self, "_spin_stagger", None).value()) if getattr(self, "_spin_stagger", None) else 0.0
+        rev_far = bool(
+            getattr(self, "_chk_reverse_far", None) and self._chk_reverse_far.isChecked()
+        )
+
+        # Disegna linee dei profili con frecce direzionali
+        overshoot: list[tuple[int, float]] = []  # (n. linea, metri oltre la griglia)
+        for idx, it in enumerate(self._profile_items):
+            axis = it["axis"]
+            offset = it["offset"]
+            is_rev = it["reversed"]
+            sh = stagger_m if is_rev else 0.0
+
+            if axis == "X":
+                lo, hi = x0, x1
+            else:
+                lo, hi = y0, y1
+            span = hi - lo
+            frac = 1.0
+            if use_real_len and abs(span) > 1e-9:
+                frac = min(1.0, float(it.get("length", abs(span))) / abs(span))
+            if is_rev and rev_far and frac < 1.0:
+                # linea di ritorno ancorata al lato opposto: parte da hi
+                seg_start, seg_end = hi + sh, hi - frac * span + sh
+            elif is_rev:
+                seg_start, seg_end = lo + frac * span + sh, lo + sh
+            else:
+                seg_start, seg_end = lo + sh, lo + frac * span + sh
+            if axis == "X":
+                p_start_loc = (seg_start, offset)
+                p_end_loc = (seg_end, offset)
+            else:
+                p_start_loc = (offset, seg_start)
+                p_end_loc = (offset, seg_end)
+
+            over = max(max(seg_start, seg_end) - max(lo, hi), min(lo, hi) - min(seg_start, seg_end))
+            if over > 1e-6:
+                overshoot.append((idx + 1, over))
+
+            ps_disp = _to_display_xy(*p_start_loc)
+            pe_disp = _to_display_xy(*p_end_loc)
+
+            color = "#1f77b4" if axis == "X" else "#ff7f0e"
+            self._ax.plot([ps_disp[0], pe_disp[0]], [ps_disp[1], pe_disp[1]], color=color, lw=2.0)
+
+            # Freccia direzionale
+            dx = pe_disp[0] - ps_disp[0]
+            dy = pe_disp[1] - ps_disp[1]
+            arrow_pos_x = ps_disp[0] + 0.6 * dx
+            arrow_pos_y = ps_disp[1] + 0.6 * dy
+            self._ax.annotate(
+                "",
+                xy=(arrow_pos_x + 0.1 * dx, arrow_pos_y + 0.1 * dy),
+                xytext=(arrow_pos_x, arrow_pos_y),
+                arrowprops=dict(arrowstyle="->", color=color, lw=1.8),
+            )
+
+            # Etichetta linea
+            lbl_pos_x = ps_disp[0] - 0.03 * dx
+            lbl_pos_y = ps_disp[1] - 0.03 * dy
+            self._ax.text(
+                lbl_pos_x, lbl_pos_y, f"{idx + 1}",
+                color="black", fontsize=8, fontweight="bold",
+                ha="center", va="center",
+                bbox=dict(boxstyle="circle,pad=0.2", fc="white", ec=color, lw=1.0),
+            )
+
+        self._ax.set_aspect("equal", "datalim")
+        self._ax.grid(True, linestyle=":", alpha=0.5)
+        if geo_on:
+            self._ax.set_xlabel("Est (m)")
+            self._ax.set_ylabel("Nord (m)")
+            self._ax.set_title(f"Griglia orientata (Azimut {az_deg:.1f}°)")
+        else:
+            self._ax.set_xlabel("X (m)")
+            self._ax.set_ylabel("Y (m)")
+            self._ax.set_title("Griglia locale (X0-X1, Y0-Y1)")
+        if rev_far and use_real_len:
+            lens = [float(it.get("length", 0.0) or 0.0) for it in self._profile_items]
+            if lens and max(lens) > 1.2 * max(min(lens), 1e-6):
+                self._ax.set_title(
+                    "Linee invertite ancorate al lato opposto (x1/y1): con linee di lunghezza "
+                    "diversa partono oltre la fine delle dirette",
+                    color="#c0392b", fontsize=8,
+                )
+        if overshoot:
+            worst = max(o for _, o in overshoot)
+            self._ax.set_title(
+                f"{len(overshoot)} linee oltre il limite griglia (max {worst:.2f} m): "
+                f"controlla Stagger ({stagger_m:+.2f} m)",
+                color="#c0392b", fontsize=9,
+            )
+
+        self._fig.tight_layout()
+        self._canvas_mpl.draw()
+
+    # ------------------------------------------------------------------
+    # Applicazione Finale
+    # ------------------------------------------------------------------
+
+    def _apply_and_accept(self):
+        """Calcola le coordinate finali su ciascun OgprProfile e chiude il dialog."""
+        x0 = float(self._spin_x0.value())
+        x1 = float(self._spin_x1.value())
+        y0 = float(self._spin_y0.value())
+        y1 = float(self._spin_y1.value())
+
+        geo_on = self._grp_geo.isChecked()
+        e0 = float(self._spin_e0.value()) if geo_on else 0.0
+        n0 = float(self._spin_n0.value()) if geo_on else 0.0
+        az_deg = float(self._spin_azimuth.value()) if geo_on else 0.0
+
+        use_real_length = bool(
+            getattr(self, "_chk_real_length", None) and self._chk_real_length.isChecked()
+        )
+        stagger_m = float(getattr(self, "_spin_stagger", None).value()) if getattr(self, "_spin_stagger", None) else 0.0
+
+        elev_mode = self._elev_mode()
+        z_start = float(self._spin_z_start.value())
+        z_end = float(self._spin_z_end.value())
+        elev_ref_kind = str(self._cb_elev_kind.currentData() or "x")
+        elev_file = str(self._le_elev_file.text()).strip()
+        pos_mode = self._pos_mode()
+        pos_param = int(self._spin_pos_param.value())
+        reverse_anchor = "far" if (
+            getattr(self, "_chk_reverse_far", None) and self._chk_reverse_far.isChecked()
+        ) else "near"
+
+        elev_ref = None
+        if elev_mode == "file":
+            if not elev_file or not os.path.isfile(elev_file):
+                QMessageBox.warning(self, "Quota per traccia",
+                                    "Modo 'Da file' selezionato ma il file quote non esiste.")
+                return
+            elev_ref = self._parse_elev_file(elev_file)
+            if elev_ref is None:
+                QMessageBox.warning(self, "Quota per traccia",
+                                    "Impossibile leggere due colonne numeriche dal file quote.")
+                return
+
+        configured_records = []
+
+        for idx, it in enumerate(self._profile_items):
+            prof = it["prof"]
+            axis = it["axis"]
+            offset = it["offset"]
+            is_rev = it["reversed"]
+            custom_name = it["name"]
+
+            # Aggiorna nome logico del profilo
+            if hasattr(prof, "swath_name"):
+                prof.swath_name = str(custom_name)
+
+            channels = getattr(prof, "channels", []) or []
+            n_t = it["n_traces"]
+
+            keep_gps = bool(
+                getattr(self, "_chk_keep_gps", None) and self._chk_keep_gps.isChecked()
+                and it.get("has_gps")
+            )
+            if keep_gps:
+                restored = restore_original_coords(prof)
+                _dbg.log("DIALOG-APPLY", f"{custom_name}: coordinate GPS originali "
+                         f"{'RIPRISTINATE' if restored else 'MANTENUTE (non sovrascritte)'}")
+            if n_t > 0 and not keep_gps:
+                grid_span = (x1 - x0) if axis == "X" else (y1 - y0)
+                markers, _leftover = self._markers_for_item(it)
+                final_e, final_n, final_dist, final_elev = compute_positions(
+                    n_t, x0, x1, y0, y1, axis, offset,
+                    grid_span_m=grid_span,
+                    length_m=float(it.get("length", grid_span) or grid_span),
+                    use_real_length=use_real_length,
+                    reversed_=is_rev,
+                    stagger_m=stagger_m,
+                    geo_on=geo_on, e0=e0, n0=n0, az_deg=az_deg,
+                    elev_mode=elev_mode, z_start=z_start, z_end=z_end,
+                    elev_ref=elev_ref, elev_ref_kind=elev_ref_kind,
+                    markers=markers or None,
+                    reverse_anchor=reverse_anchor,
+                )
+                _dbg.log("DIALOG-APPLY", f"{custom_name}: SOVRASCRIVO coordinate canali "
+                         f"(asse={axis} inv={is_rev} georef_GIS={geo_on}) "
+                         f"prima: {_dbg.describe_track(getattr(channels[0], 'easting', []), getattr(channels[0], 'northing', [])) if channels else '-'} "
+                         f"| dopo: {_dbg.describe_track(final_e, final_n)}")
+                for ch in channels:
+                    if not hasattr(ch, "_geo_orig"):
+                        try:
+                            ch._geo_orig = (
+                                np.array(ch.easting, copy=True), np.array(ch.northing, copy=True),
+                                np.array(ch.distances, copy=True), np.array(ch.altitude, copy=True),
+                            )
+                        except Exception:
+                            pass
+                    ch.easting = final_e.copy()
+                    ch.northing = final_n.copy()
+                    ch.distances = final_dist.copy()
+                    if elev_mode != "none":
+                        ch.altitude = final_elev.copy()
+
+            configured_records.append({
+                "index": idx,
+                "path": getattr(prof, "path", ""),
+                "name": custom_name,
+                "axis": axis,
+                "offset": offset,
+                "reversed": is_rev,
+                "n_traces": n_t,
+                "length": float(it.get("length", 0.0) or 0.0),
+            })
+
+        result_payload = {
+            "grid_bounds": {"x0": x0, "x1": x1, "y0": y0, "y1": y1},
+            "georef": {
+                "enabled": geo_on,
+                "origin_e": e0,
+                "origin_n": n0,
+                "azimuth_deg": az_deg,
+            },
+            "navigation": {
+                "use_real_length": use_real_length,
+                "stagger_m": stagger_m,
+                "elev_mode": elev_mode,
+                "z_start": z_start,
+                "z_end": z_end,
+                "elev_file": elev_file,
+                "elev_ref_kind": elev_ref_kind,
+                "pos_mode": pos_mode,
+                "pos_param": pos_param,
+                "reverse_anchor": reverse_anchor,
+                "keep_gps": bool(
+                    getattr(self, "_chk_keep_gps", None) and self._chk_keep_gps.isChecked()
+                ),
+            },
+            "profiles": configured_records,
+        }
+
+        self.positioning_applied.emit(result_payload)
+        self.accept()

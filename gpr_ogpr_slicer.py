@@ -14,13 +14,45 @@ Flow summary:
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
+import threading
 from time import perf_counter
+from typing import Callable
 
 import numpy as np
+
+try:
+    from . import gpr_debug_log as _dbg
+except ImportError:
+    import gpr_debug_log as _dbg
+
+# Shared numeric core and raster I/O (Fase A extraction). These names keep
+# their historical spelling so the rest of this module is unchanged.
+from .raster_io import (  # noqa: F401
+    embed_tif_metadata as _embed_tif_metadata,
+    write_qml_singleband as _write_qml_singleband,
+    write_tif_singleband as _write_tif_singleband,
+)
+from .slicing import (  # noqa: F401
+    _bin_with_idw,
+    _bin_with_idw_anisotropic,
+    _bin_with_idw_anisotropic_ball,
+    _bin_with_idw_ball,
+    _blanking_mask_from_distance,
+    _ckdtree_query_knn,
+    _depth_adaptive_radius,
+    _depth_to_sample_range,
+    _envelope,
+    _estimate_idw_knn_k,
+    _fill_nodata_grid,
+    _idw_chunk_size_from_k,
+    _idw_grid_guard,
+    _normalize_idw_mode,
+    _smooth_grid_gaussian,
+)
 
 SIDECAR_FILENAME = ".ogpr_slicer_params.json"
 _PREVIEW_CACHE: dict[str, object] = {
@@ -30,6 +62,7 @@ _PREVIEW_CACHE: dict[str, object] = {
     "z_max_depth": None,
     "topo_ref": None,
 }
+_PREVIEW_CACHE_LOCK: threading.Lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -87,41 +120,7 @@ def _profiles_cache_signature(profiles: list) -> tuple:
     return tuple(sig)
 
 
-def _envelope(data: np.ndarray) -> np.ndarray:
-    """Calculate Hilbert envelope along axis 0 (samples/depth).
-
-    Falls back to absolute value if SciPy is not available.
-    """
-    try:
-        from scipy.signal import hilbert  # type: ignore
-        analytic = hilbert(data.astype(np.float64), axis=0)
-        return np.abs(analytic).astype(np.float32)
-    except Exception:
-        return np.abs(data).astype(np.float32)
-
-
-def _depth_to_sample_range(
-    z_from: float,
-    z_to: float,
-    depth_max_m: float,
-    n_samples: int,
-) -> tuple[int, int]:
-    if n_samples <= 0:
-        return 0, 0
-    if depth_max_m <= 0:
-        return 0, n_samples
-
-    z0 = float(np.clip(min(z_from, z_to), 0.0, depth_max_m))
-    z1 = float(np.clip(max(z_from, z_to), 0.0, depth_max_m))
-    scale = float(n_samples) / max(float(depth_max_m), 1e-12)
-    s_lo = int(np.floor(z0 * scale))
-    s_hi = int(np.ceil(z1 * scale))
-    s_lo = int(np.clip(s_lo, 0, n_samples))
-    s_hi = int(np.clip(s_hi, 0, n_samples))
-    # Ensure at least one sample when a positive depth window collapses by rounding.
-    if z1 > z0 and s_hi <= s_lo:
-        s_hi = min(n_samples, s_lo + 1)
-    return s_lo, s_hi
+# _envelope and _depth_to_sample_range now live in slicing.py (imported above).
 
 
 def _normalize_channels(ampl_3d: np.ndarray) -> np.ndarray:
@@ -198,7 +197,9 @@ def _has_plausible_geo_xy(x: np.ndarray, y: np.ndarray) -> bool:
     if x.size == 0 or y.size == 0:
         return False
     finite = np.isfinite(x) & np.isfinite(y)
-    if float(finite.mean()) < 0.95:
+    # Tracce senza fix (NaN) vengono interpolate piu' avanti: basta che ce ne
+    # sia una parte utile, altrimenti tutto il rilievo finirebbe in coordinate locali.
+    if float(finite.mean()) < 0.3:
         return False
     xf = x[finite].astype(np.float64, copy=False)
     yf = y[finite].astype(np.float64, copy=False)
@@ -317,16 +318,23 @@ def _should_flip_profile(profile_idx: int, mode: str | None) -> bool:
 def _remove_amplitude_outliers(
     x: np.ndarray, y: np.ndarray, values: np.ndarray, n_sigma: float = 3.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Remove amplitude outliers using median + MAD (more robust than mean+std for GPR)."""
     if values.size == 0:
         return x, y, values
     finite = values[np.isfinite(values)]
     if finite.size == 0:
         return x, y, values
-    mean = float(finite.mean())
-    std = float(finite.std())
-    if std == 0.0:
+    # MAD-based sigma estimate: robust against the very outliers being filtered.
+    median = float(np.nanmedian(finite))
+    mad = float(np.nanmedian(np.abs(finite - median)))
+    # Scale MAD to be consistent with std for Gaussian distributions.
+    sigma_est = mad * 1.4826
+    if sigma_est < 1e-12:
+        # Fallback to classic std when all values are nearly identical.
+        sigma_est = float(finite.std())
+    if sigma_est < 1e-12:
         return x, y, values
-    mask = np.abs(values - mean) <= n_sigma * std
+    mask = np.isfinite(values) & (np.abs(values - median) <= float(n_sigma) * sigma_est)
     return x[mask], y[mask], values[mask]
 
 
@@ -389,7 +397,7 @@ def _stack_traces(
         return np.asarray(data, dtype=np.float32)
 
     if str(kernel or "boxcar").strip().lower() in {"tri", "triangle", "triangular"}:
-        # Triangular weights: 1..k..1
+        # Triangular weights: symmetric 1..peak..1 of exact length n
         half = max(1, n // 2)
         if n % 2 == 0:
             w = np.concatenate([np.arange(1, half + 1), np.arange(half, 0, -1)])
@@ -400,11 +408,16 @@ def _stack_traces(
         w = np.ones(n, dtype=np.float64)
     w /= max(float(w.sum()), 1e-12)
 
-    pad = len(w) // 2
-    padded = np.pad(arr, ((0, 0), (pad, pad)), mode="edge")
-    out = np.empty_like(arr)
-    for r in range(arr.shape[0]):
-        out[r, :] = np.convolve(padded[r, :], w, mode="valid")[: arr.shape[1]]
+    try:
+        from scipy.ndimage import convolve1d
+        out = convolve1d(arr, w, axis=1, mode="nearest")
+    except Exception:
+        pad_l = (len(w) - 1) // 2
+        pad_r = len(w) - 1 - pad_l
+        padded = np.pad(arr, ((0, 0), (pad_l, pad_r)), mode="edge")
+        out = np.empty_like(arr)
+        for r in range(arr.shape[0]):
+            out[r, :] = np.convolve(padded[r, :], w, mode="valid")
     return out.astype(np.float32)
 
 
@@ -425,10 +438,29 @@ def _estimate_interline_radius(
 
     if x.size < 4:
         return {"radius": 1.0, "anisotropy_ratio": 1.0, "acquisition_angle": 0.0}
+
+    # Query enough neighbours to cross a typical profile boundary.
+    # sqrt(n_pts) gives ~one full profile length worth of neighbours for
+    # a rectangular survey; cap at 64 to keep the KD-tree query fast.
+    k_query = min(max(8, int(np.sqrt(float(x.size)))), min(int(x.size), 64))
     tree = cKDTree(np.column_stack([x, y]))
-    dists, _ = tree.query(np.column_stack([x, y]), k=min(6, x.size))
+    dists, _ = tree.query(np.column_stack([x, y]), k=k_query)
+
+    # Along-line spacing: tight cluster at small distances (10th percentile
+    # of nearest-neighbour distances captures the modal trace spacing).
     along_line = float(np.percentile(dists[:, 1], 10))
-    cross_line = float(np.percentile(dists[:, 1], percentile))
+
+    # Cross-line spacing: find the first NN column where the distance jumps
+    # significantly above the along-track spacing, signalling a neighbour on
+    # an adjacent profile line.  Using a 2.5× threshold handles surveys where
+    # the inter-line gap is at least 3× the trace spacing (typical for GPR).
+    threshold = max(along_line * 2.5, 1e-9)
+    jumps = dists[:, 1:] > threshold          # shape (n_pts, k_query-1); skip col 0 (self)
+    has_jump = jumps.any(axis=1)
+    first_jump_in_slice = np.where(has_jump, np.argmax(jumps, axis=1), k_query - 2)
+    jump_dists = dists[np.arange(len(dists)), first_jump_in_slice + 1]
+    cross_line = float(np.percentile(jump_dists, 50))  # median of first-jump distances
+
     radius = cross_line * multiplier
     aniso = (cross_line / along_line) if along_line > 1e-9 else 1.0
     return {
@@ -438,490 +470,10 @@ def _estimate_interline_radius(
     }
 
 
-def _depth_adaptive_radius(
-    base_radius: float,
-    z_center: float,
-    z_max: float,
-    depth_factor: float = 0.6,
-) -> float:
-    radius = float(base_radius)
-    if not np.isfinite(radius) or radius <= 0.0:
-        return 1e-6
-    try:
-        df = float(depth_factor)
-    except Exception:
-        df = 0.0
-    if not np.isfinite(df) or df <= 0.0:
-        return radius
-    try:
-        zmax = float(z_max)
-    except Exception:
-        zmax = 0.0
-    if not np.isfinite(zmax) or zmax <= 0.0:
-        return radius
-    try:
-        zc = float(z_center)
-    except Exception:
-        zc = 0.0
-    if not np.isfinite(zc):
-        zc = 0.0
-    zc = min(max(zc, 0.0), zmax)
-    scale = 1.0 + df * (zc / max(zmax, 1e-9))
-    if not np.isfinite(scale) or scale <= 0.0:
-        scale = 1.0
-    return radius * scale
-
-
-def _fill_nodata_grid(grid: np.ndarray, max_distance: int = 5) -> np.ndarray:
-    from scipy.ndimage import distance_transform_edt
-    if grid is None or grid.ndim != 2:
-        return grid
-    try:
-        max_d = int(max_distance)
-    except Exception:
-        max_d = 0
-    if max_d <= 0:
-        return grid
-    nan_mask = np.isnan(grid)
-    if not nan_mask.any():
-        return grid
-    # Safety guard: EDT can allocate large temporary buffers on huge grids.
-    MAX_SAFE_CELLS = 5_000_000
-    if int(nan_mask.size) > MAX_SAFE_CELLS:
-        return grid
-    mask_u8 = nan_mask.astype(np.uint8, copy=False)
-    try:
-        dist, (row_idx, col_idx) = distance_transform_edt(
-            mask_u8, return_distances=True, return_indices=True,
-        )
-    except MemoryError:
-        return grid
-    except Exception:
-        return grid
-    filled = grid.copy()
-    fw = nan_mask & np.isfinite(dist) & (dist <= float(max_d))
-    filled[fw] = grid[row_idx[fw], col_idx[fw]]
-    return filled
-
-
-def _smooth_grid_gaussian(grid: np.ndarray, sigma: float = 1.0) -> np.ndarray:
-    from scipy.ndimage import gaussian_filter
-    if sigma <= 0:
-        return grid
-    nan_mask = np.isnan(grid)
-    filled = np.where(nan_mask, 0.0, grid.astype(np.float64))
-    weight = np.where(nan_mask, 0.0, 1.0)
-    smooth_num = gaussian_filter(filled, sigma=sigma)
-    smooth_den = gaussian_filter(weight, sigma=sigma)
-    result = np.full_like(grid, np.nan, dtype=np.float32)
-    valid = smooth_den > 1e-9
-    result[valid] = (smooth_num[valid] / smooth_den[valid]).astype(np.float32)
-    return result
-
-
-def _blanking_mask_from_distance(
-    e_pts: np.ndarray,
-    n_pts: np.ndarray,
-    x_min: float,
-    y_min: float,
-    n_x: int,
-    n_y: int,
-    resolution: float,
-    blanking_distance: float,
-) -> np.ndarray | None:
-    """Return mask for cells farther than blanking_distance from real samples."""
-    try:
-        dmax = float(blanking_distance)
-    except Exception:
-        dmax = 0.0
-    if (not np.isfinite(dmax)) or dmax <= 0.0:
-        return None
-    if len(e_pts) <= 0 or len(n_pts) <= 0:
-        return None
-    try:
-        from scipy.spatial import cKDTree
-    except Exception:
-        return None
-    try:
-        gx = float(x_min) + np.arange(int(n_x), dtype=np.float64) * float(resolution)
-        gy = float(y_min) + np.arange(int(n_y), dtype=np.float64) * float(resolution)
-        gxx, gyy = np.meshgrid(gx, gy)
-        qpts = np.column_stack([gxx.ravel(), gyy.ravel()])
-        tree = cKDTree(np.column_stack([e_pts.astype(np.float64), n_pts.astype(np.float64)]))
-        dist, _ = tree.query(qpts, k=1, workers=-1)
-        return np.asarray(dist, dtype=np.float64).reshape(int(n_y), int(n_x)) > dmax
-    except Exception:
-        return None
-
-
-def _estimate_idw_knn_k(
-    x_pts: np.ndarray,
-    y_pts: np.ndarray,
-    radius: float,
-    min_points: int,
-    max_k: int = 512,
-) -> int:
-    n_pts = int(len(x_pts))
-    if n_pts <= 0:
-        return 1
-    r = float(radius)
-    if not np.isfinite(r) or r <= 0.0:
-        r = 1e-6
-
-    try:
-        area = float(np.ptp(x_pts)) * float(np.ptp(y_pts))
-    except Exception:
-        area = 0.0
-    if not np.isfinite(area) or area <= 1e-12:
-        area = max(float(n_pts), 1.0)
-
-    density = float(n_pts) / area
-    expected = np.pi * (r ** 2) * density
-    try:
-        k = int(np.ceil(expected * 1.8)) + 8
-    except Exception:
-        k = 32
-    k = max(int(min_points), k, 8)
-    k = min(k, int(max_k), n_pts)
-    return max(1, int(k))
-
-
-def _idw_chunk_size_from_k(k: int, target_elements: int = 500_000) -> int:
-    kk = max(1, int(k))
-    cs = int(target_elements // kk)
-    return max(1_000, cs)
-
-
-def _ckdtree_query_knn(tree, qpts: np.ndarray, k: int, distance_upper_bound: float):
-    try:
-        return tree.query(
-            qpts,
-            k=int(k),
-            distance_upper_bound=float(distance_upper_bound),
-            workers=-1,
-        )
-    except TypeError:
-        return tree.query(
-            qpts,
-            k=int(k),
-            distance_upper_bound=float(distance_upper_bound),
-        )
-
-
-def _normalize_idw_mode(mode: str | None) -> str:
-    txt = str(mode or "fast").strip().lower()
-    if txt in {"quality", "accurate", "radius", "ball"}:
-        return "quality"
-    return "fast"
-
-
-def _idw_grid_guard(n_x: int, n_y: int, label: str, max_cells: int = 10_000_000) -> tuple[bool, int]:
-    """Return (ok, n_cells) for safe IDW grid allocation."""
-    try:
-        nx = int(n_x)
-        ny = int(n_y)
-    except Exception:
-        return False, 0
-    if nx <= 0 or ny <= 0:
-        return False, 0
-    n_cells = int(nx) * int(ny)
-    if n_cells > int(max_cells):
-        print(
-            f"[OGPR slicer][ERROR] {label} abortito: griglia {ny}x{nx}={n_cells:,} celle "
-            f"supera il limite di sicurezza ({int(max_cells):,}). "
-            "Aumenta la risoluzione o riduci il raggio IDW."
-        )
-        return False, n_cells
-    return True, n_cells
-
-
-def _bin_with_idw_ball(
-    x_pts, y_pts, i_pts, x_min, y_min, n_x, n_y, resolution, radius, power=2.0, min_points=1
-):
-    from scipy.spatial import cKDTree
-
-    ok_grid, _ = _idw_grid_guard(n_x, n_y, "IDW quality")
-    if not ok_grid:
-        return np.full((n_y, n_x), np.nan, dtype=np.float32)
-    gx = x_min + np.arange(n_x) * resolution
-    gy = y_min + np.arange(n_y) * resolution
-    gxx, gyy = np.meshgrid(gx, gy)
-    gpts = np.column_stack([gxx.ravel(), gyy.ravel()])
-    tree = cKDTree(np.column_stack([x_pts, y_pts]))
-    try:
-        results = tree.query_ball_point(gpts, r=radius, workers=-1)
-    except TypeError:
-        results = tree.query_ball_point(gpts, r=radius)
-    i64 = np.asarray(i_pts, dtype=np.float64)
-    x_arr = np.asarray(x_pts, dtype=np.float64)
-    y_arr = np.asarray(y_pts, dtype=np.float64)
-    pwr = float(power) if np.isfinite(power) and float(power) > 0 else 2.0
-    min_pts = max(1, int(min_points))
-
-    grid = np.full(n_x * n_y, np.nan, dtype=np.float32)
-    for k, idx_list in enumerate(results):
-        if len(idx_list) < min_pts:
-            continue
-        idx = np.asarray(idx_list, dtype=np.int64)
-        cx, cy = gpts[k]
-        d = np.sqrt((x_arr[idx] - cx) ** 2 + (y_arr[idx] - cy) ** 2)
-        w = 1.0 / (d ** pwr + 1e-9)
-        ws = w.sum()
-        if ws > 0:
-            grid[k] = float(np.dot(w, i64[idx]) / ws)
-    return grid.reshape(n_y, n_x)
-
-
-def _bin_with_idw_anisotropic_ball(
-    x_pts, y_pts, i_pts, x_min, y_min, n_x, n_y, resolution, radius, power=2.0, min_points=1,
-    anisotropy_ratio=1.0, anisotropy_angle=0.0, max_points_per_cell=4096,
-):
-    from scipy.spatial import cKDTree
-
-    ok_grid, _ = _idw_grid_guard(n_x, n_y, "IDW quality anisotropo")
-    if not ok_grid:
-        return np.full((n_y, n_x), np.nan, dtype=np.float32)
-    if anisotropy_ratio <= 0:
-        anisotropy_ratio = 1.0
-    ar = np.radians(anisotropy_angle)
-    ca, sa = np.cos(ar), np.sin(ar)
-
-    def _ad(px, py, cx, cy):
-        dx, dy = px - cx, py - cy
-        return np.sqrt((dx * ca + dy * sa) ** 2 + ((-dx * sa + dy * ca) / anisotropy_ratio) ** 2)
-
-    gx = x_min + np.arange(n_x) * resolution
-    gy = y_min + np.arange(n_y) * resolution
-    gxx, gyy = np.meshgrid(gx, gy)
-    gpts = np.column_stack([gxx.ravel(), gyy.ravel()])
-    tree = cKDTree(np.column_stack([x_pts, y_pts]))
-    try:
-        results = tree.query_ball_point(gpts, r=radius * max(1.0, anisotropy_ratio), workers=-1)
-    except TypeError:
-        results = tree.query_ball_point(gpts, r=radius * max(1.0, anisotropy_ratio))
-
-    i64 = np.asarray(i_pts, dtype=np.float64)
-    x_arr = np.asarray(x_pts, dtype=np.float64)
-    y_arr = np.asarray(y_pts, dtype=np.float64)
-    pwr = float(power) if np.isfinite(power) and float(power) > 0 else 2.0
-    min_pts = max(1, int(min_points))
-    cap_pts = int(max_points_per_cell or 0)
-
-    grid = np.full(n_x * n_y, np.nan, dtype=np.float32)
-    for k, idx_list in enumerate(results):
-        if not idx_list:
-            continue
-        idx = np.asarray(idx_list, dtype=np.int64)
-        cx, cy = gpts[k]
-        if cap_pts and idx.size > cap_pts:
-            d2 = (x_arr[idx] - cx) ** 2 + (y_arr[idx] - cy) ** 2
-            keep = np.argpartition(d2, cap_pts - 1)[:cap_pts]
-            idx = idx[keep]
-        d = _ad(x_arr[idx], y_arr[idx], cx, cy)
-        in_r = d <= radius
-        if int(np.count_nonzero(in_r)) < min_pts:
-            continue
-        d_in = d[in_r]
-        w = 1.0 / (d_in ** pwr + 1e-9)
-        ws = w.sum()
-        if ws > 0:
-            grid[k] = float(np.dot(w, i64[idx[in_r]]) / ws)
-    return grid.reshape(n_y, n_x)
-
-
-def _bin_with_idw(
-    x_pts, y_pts, i_pts, x_min, y_min, n_x, n_y, resolution, radius, power=2.0, min_points=1
-):
-    from scipy.spatial import cKDTree
-    ok_grid, n_cells = _idw_grid_guard(n_x, n_y, "IDW")
-    if not ok_grid:
-        return np.full((n_y, n_x), np.nan, dtype=np.float32)
-    gx = x_min + np.arange(n_x) * resolution
-    gy = y_min + np.arange(n_y) * resolution
-    gxx, gyy = np.meshgrid(gx, gy)
-    gpts = np.column_stack([gxx.ravel(), gyy.ravel()])
-    n_pts = int(np.asarray(x_pts).size)
-    if n_cells <= 0 or n_pts <= 0:
-        return np.full((n_y, n_x), np.nan, dtype=np.float32)
-
-    r = float(radius)
-    if not np.isfinite(r) or r <= 0.0:
-        r = 1e-6
-    pwr = float(power) if np.isfinite(power) and float(power) > 0.0 else 2.0
-    min_pts = max(1, int(min_points))
-
-    x_arr = np.asarray(x_pts, dtype=np.float64)
-    y_arr = np.asarray(y_pts, dtype=np.float64)
-    i64 = np.asarray(i_pts, dtype=np.float64)
-
-    tree = cKDTree(np.column_stack([x_arr, y_arr]))
-    k = _estimate_idw_knn_k(x_arr, y_arr, r, min_pts, max_k=32)
-    chunk_size = _idw_chunk_size_from_k(k)
-
-    grid = np.full(n_cells, np.nan, dtype=np.float32)
-    for start in range(0, n_cells, chunk_size):
-        end = min(n_cells, start + chunk_size)
-        q = gpts[start:end]
-        dists, idxs = _ckdtree_query_knn(tree, q, k=k, distance_upper_bound=r)
-        dists = np.asarray(dists, dtype=np.float64)
-        idxs = np.asarray(idxs, dtype=np.int64)
-        if dists.ndim == 1:
-            dists = dists[:, np.newaxis]
-            idxs = idxs[:, np.newaxis]
-
-        valid = np.isfinite(dists) & (idxs >= 0) & (idxs < n_pts)
-        if not np.any(valid):
-            continue
-
-        idx_clip = np.clip(idxs, 0, max(0, n_pts - 1))
-        vals = i64[idx_clip]
-        d_safe = np.where(valid, dists, 1.0)
-        w = np.where(valid, 1.0 / (np.power(d_safe, pwr) + 1e-9), 0.0)
-        ws = np.sum(w, axis=1)
-        cnt = np.sum(valid, axis=1)
-        ok = (cnt >= min_pts) & (ws > 1e-12)
-        if not np.any(ok):
-            continue
-        num = np.sum(w * vals, axis=1)
-        out = np.full(q.shape[0], np.nan, dtype=np.float32)
-        out[ok] = (num[ok] / ws[ok]).astype(np.float32)
-        grid[start:end] = out
-
-    return grid.reshape(n_y, n_x)
-
-
-def _bin_with_idw_anisotropic(
-    x_pts, y_pts, i_pts, x_min, y_min, n_x, n_y, resolution, radius, power=2.0, min_points=1,
-    anisotropy_ratio=1.0, anisotropy_angle=0.0, max_points_per_cell=4096,
-):
-    from scipy.spatial import cKDTree
-    ok_grid, n_cells = _idw_grid_guard(n_x, n_y, "IDW anisotropo")
-    if not ok_grid:
-        return np.full((n_y, n_x), np.nan, dtype=np.float32)
-    if anisotropy_ratio <= 0:
-        anisotropy_ratio = 1.0
-    ar = np.radians(anisotropy_angle)
-    ca, sa = np.cos(ar), np.sin(ar)
-
-    def _ad(px, py, cx, cy):
-        dx, dy = px - cx, py - cy
-        return np.sqrt((dx * ca + dy * sa) ** 2 + ((-dx * sa + dy * ca) / anisotropy_ratio) ** 2)
-
-    gx = x_min + np.arange(n_x) * resolution
-    gy = y_min + np.arange(n_y) * resolution
-    gxx, gyy = np.meshgrid(gx, gy)
-    gpts = np.column_stack([gxx.ravel(), gyy.ravel()])
-    n_pts = int(np.asarray(x_pts).size)
-    if n_cells <= 0 or n_pts <= 0:
-        return np.full((n_y, n_x), np.nan, dtype=np.float32)
-
-    r = float(radius)
-    if not np.isfinite(r) or r <= 0.0:
-        r = 1e-6
-    r_search = r * max(1.0, float(anisotropy_ratio))
-    pwr = float(power) if np.isfinite(power) and float(power) > 0.0 else 2.0
-    min_pts = max(1, int(min_points))
-    max_k = int(max_points_per_cell) if max_points_per_cell else 32
-    max_k = max(min_pts, min(32, max(8, max_k)))
-
-    x_arr = np.asarray(x_pts, dtype=np.float64)
-    y_arr = np.asarray(y_pts, dtype=np.float64)
-    i64 = np.asarray(i_pts, dtype=np.float64)
-
-    tree = cKDTree(np.column_stack([x_arr, y_arr]))
-    k = _estimate_idw_knn_k(x_arr, y_arr, r_search, min_pts, max_k=max_k)
-    chunk_size = _idw_chunk_size_from_k(k)
-
-    grid = np.full(n_cells, np.nan, dtype=np.float32)
-    for start in range(0, n_cells, chunk_size):
-        end = min(n_cells, start + chunk_size)
-        q = gpts[start:end]
-        dists, idxs = _ckdtree_query_knn(tree, q, k=k, distance_upper_bound=r_search)
-        dists = np.asarray(dists, dtype=np.float64)
-        idxs = np.asarray(idxs, dtype=np.int64)
-        if dists.ndim == 1:
-            dists = dists[:, np.newaxis]
-            idxs = idxs[:, np.newaxis]
-
-        valid0 = np.isfinite(dists) & (idxs >= 0) & (idxs < n_pts)
-        if not np.any(valid0):
-            continue
-
-        idx_clip = np.clip(idxs, 0, max(0, n_pts - 1))
-        px = x_arr[idx_clip]
-        py = y_arr[idx_clip]
-        cx = q[:, 0][:, np.newaxis]
-        cy = q[:, 1][:, np.newaxis]
-
-        d_aniso = _ad(px, py, cx, cy)
-        valid = valid0 & np.isfinite(d_aniso) & (d_aniso <= r)
-        if not np.any(valid):
-            continue
-
-        vals = i64[idx_clip]
-        d_safe = np.where(valid, d_aniso, 1.0)
-        w = np.where(valid, 1.0 / (np.power(d_safe, pwr) + 1e-9), 0.0)
-        ws = np.sum(w, axis=1)
-        cnt = np.sum(valid, axis=1)
-        ok = (cnt >= min_pts) & (ws > 1e-12)
-        if not np.any(ok):
-            continue
-        num = np.sum(w * vals, axis=1)
-        out = np.full(q.shape[0], np.nan, dtype=np.float32)
-        out[ok] = (num[ok] / ws[ok]).astype(np.float32)
-        grid[start:end] = out
-
-    return grid.reshape(n_y, n_x)
-
-
-# QML sidecar (single-band, percentile stretch)
-_QML_SINGLEBAND = """\
-<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
-<qgis version="3.0" styleCategories="AllStyleCategories">
-  <pipe>
-    <provider><resampling enabled="false" maxOversampling="2"
-      zoomedInResamplingMethod="nearestNeighbour"
-      zoomedOutResamplingMethod="nearestNeighbour"/></provider>
-    <rasterrenderer type="singlebandgray" opacity="1" alphaBand="-1"
-                    grayBand="1" gradient="BlackToWhite">
-      <rasterTransparency/>
-      <minMaxOrigin>
-        <limits>CumulativeCut</limits>
-        <extent>WholeRaster</extent>
-        <statAccuracy>Estimated</statAccuracy>
-        <cumulativeCutLower>0.02</cumulativeCutLower>
-        <cumulativeCutUpper>0.98</cumulativeCutUpper>
-      </minMaxOrigin>
-      <contrastEnhancement>
-        <minValue>{vmin}</minValue>
-        <maxValue>{vmax}</maxValue>
-        <algorithm>StretchToMinimumMaximum</algorithm>
-      </contrastEnhancement>
-    </rasterrenderer>
-    <brightnesscontrast brightness="0" contrast="0" gamma="1"/>
-    <huesaturation saturation="0" grayscaleMode="0" colorizeOn="0"/>
-    <rasterresampler maxOversampling="2"/>
-  </pipe>
-  <blendMode>0</blendMode>
-</qgis>
-"""
-
-
-def _write_qml_singleband(tif_path: str, grid: np.ndarray) -> None:
-    """Write .qml sidecar using 2-98 percentile stretch of the grid."""
-    finite = grid[np.isfinite(grid)]
-    if finite.size == 0:
-        vmin, vmax = 0.0, 1.0
-    else:
-        vmin = float(np.percentile(finite, 2))
-        vmax = float(np.percentile(finite, 98))
-        if vmax <= vmin:
-            vmax = vmin + 1e-6
-    qml = _QML_SINGLEBAND.format(vmin=vmin, vmax=vmax)
-    qml_path = os.path.splitext(tif_path)[0] + ".qml"
-    with open(qml_path, "w", encoding="utf-8") as f:
-        f.write(qml)
-
+# _depth_adaptive_radius, _fill_nodata_grid, _smooth_grid_gaussian,
+# _blanking_mask_from_distance, the IDW helpers and _bin_with_idw* now live
+# in slicing.py; _write_qml_singleband / _QML_SINGLEBAND live in raster_io.py
+# (all imported at module top).
 
 # ---------------------------------------------------------------------------
 # Shared helpers: processing pipeline, grid param building and interpolation
@@ -961,6 +513,7 @@ def _process_profiles(
     Optionally parallelizes per-profile preprocessing with a thread pool.
     """
     from .gpr_processing import apply_pipeline, apply_pre_bg_pipeline, background_removal
+    from .gpr_profile_gain import profile_gain_key, resolve_profile_params
 
     mode = str(extraction_mode or "las_like").strip().lower()
     hilbert_on = bool(use_hilbert)
@@ -989,6 +542,8 @@ def _process_profiles(
                 continue
         valid_geo_flags.append(ok_geo)
     use_synthetic_coords = not any(valid_geo_flags)
+    _dbg.log("SLICER", f"profili={len(profiles)} con geo plausibile={sum(1 for v in valid_geo_flags if v)} "
+             f"-> {'COORDINATE SINTETICHE locali' if use_synthetic_coords else 'coordinate reali dei profili'}")
     proc_diag = {
         "profiles_total": int(len(profiles)),
         "profiles_geo_valid": int(sum(1 for v in valid_geo_flags if bool(v))),
@@ -998,25 +553,57 @@ def _process_profiles(
         "profile_workers_used": 1,
     }
     if use_synthetic_coords:
+        _diag = []
+        for _prof in profiles[:5]:
+            try:
+                _c = _prof.channel(0)
+                _e = np.asarray(_c.easting, dtype=np.float64)
+                _n = np.asarray(_c.northing, dtype=np.float64)
+                _f = np.isfinite(_e) & np.isfinite(_n)
+                _diag.append(
+                    f"{os.path.basename(str(getattr(_prof, 'path', '')))}: n={_e.size} "
+                    f"finite={float(_f.mean()) if _e.size else 0.0:.2f} "
+                    f"span={float(np.ptp(_e[_f]) + np.ptp(_n[_f])) if _f.any() else 0.0:.3g}"
+                )
+            except Exception as _exc:
+                _diag.append(f"errore: {_exc}")
         print(
             "[OGPR slicer][WARN] nessun profilo con geolocalizzazione plausibile; "
-            "uso coordinate sintetiche locali."
+            "uso coordinate sintetiche locali. " + " | ".join(_diag)
         )
 
     bg_reference = None
     if use_proc and params.get("bg_removal", True) and params.get("bg_mode") == "grid_by_grid":
         _pre_traces = []
         for prof in profiles:
-            n_ch = prof.n_channels
-            ch_list = list(range(n_ch)) if channel < 0 else [min(channel, n_ch - 1)]
+            n_ch = getattr(prof, "n_channels", 0) or 0
+            ch_list = list(range(n_ch)) if channel < 0 else [min(channel, max(0, n_ch - 1))]
             for ci in ch_list:
-                ch = prof.channel(ci)
-                pre = apply_pre_bg_pipeline(ch.data.copy(), params, dt_ns=prof.dt_ns)
-                _pre_traces.append(pre)
+                try:
+                    ch = prof.channel(ci)
+                except Exception:
+                    continue
+                if ch is None or getattr(ch, "data", None) is None:
+                    continue
+                cdata = np.asarray(ch.data, dtype=np.float32)
+                if cdata.ndim != 2 or cdata.size == 0:
+                    continue
+                try:
+                    pre = apply_pre_bg_pipeline(cdata.copy(), params, dt_ns=getattr(prof, "dt_ns", 0.117))
+                    if pre is not None and pre.ndim == 2 and pre.shape[0] > 0 and pre.shape[1] > 0:
+                        _pre_traces.append(pre)
+                except Exception:
+                    continue
         if _pre_traces:
             min_ns = min(t.shape[0] for t in _pre_traces)
-            stacked = np.concatenate([t[:min_ns, :] for t in _pre_traces], axis=1)
-            bg_reference = stacked.mean(axis=1).astype(np.float64)
+            if min_ns > 0:
+                try:
+                    stacked = np.concatenate([t[:min_ns, :] for t in _pre_traces], axis=1)
+                    if stacked.size > 0 and stacked.shape[1] > 0:
+                        bg_reference = stacked.mean(axis=1).astype(np.float64)
+                except Exception as exc:
+                    print(f"[OGPR slicer][WARN] Impossibile calcolare bg_reference grid_by_grid: {exc}")
+                    bg_reference = None
 
     def _compute_proc_channels(job: tuple[int, object, list[int]]):
         p_idx, prof_local, ch_list_local = job
@@ -1031,7 +618,7 @@ def _process_profiles(
                     try:
                         proc = apply_pipeline(
                             raw.copy(),
-                            params,
+                            resolve_profile_params(params, profile_gain_key(path_local)),
                             dt_ns=prof_local.dt_ns,
                             bg_reference_trace=bg_reference,
                             normalize_output=False,
@@ -1281,8 +868,13 @@ def _build_grid_params(
     bounds_margin: float = 0.0,
 ) -> dict:
     radius_user_provided = radius is not None
-    all_e = np.concatenate([x for _, x, _, _, _ in _iter_processed_entries(processed)])
-    all_n = np.concatenate([y for _, _, y, _, _ in _iter_processed_entries(processed)])
+    # Single-pass iteration to collect coordinate arrays without intermediate tuple copies.
+    all_e_list, all_n_list = [], []
+    for _, x, y, _, _ in _iter_processed_entries(processed):
+        all_e_list.append(x)
+        all_n_list.append(y)
+    all_e = np.concatenate(all_e_list) if all_e_list else np.array([0.0, 1.0])
+    all_n = np.concatenate(all_n_list) if all_n_list else np.array([0.0, 1.0])
     finite = np.isfinite(all_e) & np.isfinite(all_n)
     if finite.any():
         all_e = all_e[finite]
@@ -1429,6 +1021,8 @@ def _interpolate_z_level(
     amplitude_hist_bins: int = 10,
     topographic_correction: bool = False,
     topo_reference_elevation: float | None = None,
+    tree=None,
+    grid_bg: str = "",
 ) -> tuple[np.ndarray | None, int, dict]:
     profile_rows = []
     topo_on = bool(topographic_correction) and topo_reference_elevation is not None and np.isfinite(float(topo_reference_elevation))
@@ -1541,6 +1135,9 @@ def _interpolate_z_level(
     if n_pts <= 0:
         return None, 0, diag
 
+    # Only reuse cached KD-tree if point count matches (e.g. when sigma filter did not drop points)
+    tree_to_use = tree if (tree is not None and hasattr(tree, "n") and tree.n == n_pts) else None
+
     mode_norm = _normalize_idw_mode(idw_mode)
     if use_anisotropic_idw:
         if mode_norm == "quality":
@@ -1551,6 +1148,7 @@ def _interpolate_z_level(
                 power=idw_power, min_points=min_points,
                 anisotropy_ratio=gp["eff_ratio"] or 1.0,
                 anisotropy_angle=gp["eff_angle"] or 0.0,
+                tree=tree_to_use,
             )
         else:
             grid = _bin_with_idw_anisotropic(
@@ -1560,6 +1158,7 @@ def _interpolate_z_level(
                 power=idw_power, min_points=min_points,
                 anisotropy_ratio=gp["eff_ratio"] or 1.0,
                 anisotropy_angle=gp["eff_angle"] or 0.0,
+                tree=tree_to_use,
             )
     else:
         if mode_norm == "quality":
@@ -1568,6 +1167,7 @@ def _interpolate_z_level(
                 gp["x_min"], gp["y_min"], gp["n_x"], gp["n_y"],
                 resolution, gp["radius"],
                 power=idw_power, min_points=min_points,
+                tree=tree_to_use,
             )
         else:
             grid = _bin_with_idw(
@@ -1575,6 +1175,7 @@ def _interpolate_z_level(
                 gp["x_min"], gp["y_min"], gp["n_x"], gp["n_y"],
                 resolution, gp["radius"],
                 power=idw_power, min_points=min_points,
+                tree=tree_to_use,
             )
     blank_mask = _blanking_mask_from_distance(
         e_all,
@@ -1613,6 +1214,9 @@ def _interpolate_z_level(
         if np.isfinite(fill_m) and fill_m > 0.0 and resolution > 0.0:
             fill_px = max(1, int(round(fill_m / float(resolution))))
             grid = _fill_nodata_grid(grid, max_distance=fill_px)
+    if grid_bg:
+        from .grid_filters import apply_grid_bg
+        grid = apply_grid_bg(grid, grid_bg).astype(np.float32, copy=False)
     if smooth_sigma > 0:
         grid = _smooth_grid_gaussian(grid, sigma=smooth_sigma)
     # Enforce blanking at the end so fill/smooth never reintroduce ghost values.
@@ -1653,6 +1257,7 @@ def compute_preview_slice(
     fill_nodata_max_distance: float = 0.0,
     blanking_distance: float = 0.0,
     smooth_sigma: float = 0.8,
+    grid_bg: str = "",
     depth_radius_factor: float = 0.6,
     balance_profiles: bool = True,
     per_slice_balance: bool = False,
@@ -1706,6 +1311,7 @@ def compute_preview_slice(
         float(fill_nodata_max_distance or 0.0),
         float(blanking_distance or 0.0),
         float(smooth_sigma or 0.0),
+        str(grid_bg or ""),
         float(depth_radius_factor or 0.0),
         bool(auto_radius),
         (None if anisotropy_ratio is None else float(anisotropy_ratio)),
@@ -1716,15 +1322,20 @@ def compute_preview_slice(
         _stable_json_key(params),
     )
 
-    cached = _PREVIEW_CACHE.get("key") == preview_key
-    if cached:
-        processed = _PREVIEW_CACHE.get("processed") or []
-        gp = dict(_PREVIEW_CACHE.get("gp") or {})
-        z_max_depth = float(_PREVIEW_CACHE.get("z_max_depth") or 0.0)
-        topo_ref = _PREVIEW_CACHE.get("topo_ref")
-        if not processed:
-            return None
-    else:
+    with _PREVIEW_CACHE_LOCK:
+        cached = _PREVIEW_CACHE.get("key") == preview_key
+        if cached:
+            processed = list(_PREVIEW_CACHE.get("processed") or [])
+            gp = dict(_PREVIEW_CACHE.get("gp") or {})
+            z_max_depth = float(_PREVIEW_CACHE.get("z_max_depth") or 0.0)
+            topo_ref = _PREVIEW_CACHE.get("topo_ref")
+        else:
+            processed = None  # sentinel: needs processing
+
+    if cached and not processed:
+        return None
+
+    if not cached:
         processed = _process_profiles(
             profiles,
             channel,
@@ -1747,11 +1358,12 @@ def compute_preview_slice(
             profile_workers=profile_workers,
         )
         if not processed:
-            _PREVIEW_CACHE["key"] = preview_key
-            _PREVIEW_CACHE["processed"] = []
-            _PREVIEW_CACHE["gp"] = {}
-            _PREVIEW_CACHE["z_max_depth"] = 0.0
-            _PREVIEW_CACHE["topo_ref"] = None
+            with _PREVIEW_CACHE_LOCK:
+                _PREVIEW_CACHE["key"] = preview_key
+                _PREVIEW_CACHE["processed"] = []
+                _PREVIEW_CACHE["gp"] = {}
+                _PREVIEW_CACHE["z_max_depth"] = 0.0
+                _PREVIEW_CACHE["topo_ref"] = None
             return None
         gp = _build_grid_params(
             processed, resolution, radius,
@@ -1770,11 +1382,12 @@ def compute_preview_slice(
                 mode=topo_reference_mode,
                 custom_elevation=topo_reference_elevation,
             )
-        _PREVIEW_CACHE["key"] = preview_key
-        _PREVIEW_CACHE["processed"] = processed
-        _PREVIEW_CACHE["gp"] = dict(gp)
-        _PREVIEW_CACHE["z_max_depth"] = float(z_max_depth)
-        _PREVIEW_CACHE["topo_ref"] = topo_ref
+        with _PREVIEW_CACHE_LOCK:
+            _PREVIEW_CACHE["key"] = preview_key
+            _PREVIEW_CACHE["processed"] = processed
+            _PREVIEW_CACHE["gp"] = dict(gp)
+            _PREVIEW_CACHE["z_max_depth"] = float(z_max_depth)
+            _PREVIEW_CACHE["topo_ref"] = topo_ref
 
     z_from = z_center - z_step / 2.0
     z_to = z_center + z_step / 2.0
@@ -1820,6 +1433,7 @@ def compute_preview_slice(
         fill_nodata, fill_nodata_max_distance,
         blanking_distance=blanking_distance,
         smooth_sigma=smooth_sigma,
+        grid_bg=str(grid_bg or ""),
         balance_profiles=balance_profiles,
         per_slice_balance=per_slice_balance_eff,
         amplitude_hist_bins=amplitude_hist_bins,
@@ -1912,9 +1526,157 @@ def compute_timeslice_preview(
         if grid.ndim != 2 or grid.size <= 0:
             return None, None
         n_y, n_x = int(grid.shape[0]), int(grid.shape[1])
-        x_max = x_min + float(n_x) * res
-        y_max = y_min + float(n_y) * res
-        extent = (float(x_min), float(x_max), float(y_min), float(y_max))
+        # Extent uses the outer pixel edges (matching _make_geotransform convention:
+        # x_min is pixel center, so left edge = x_min - res/2, right edge = x_min + (n_x-0.5)*res).
+        x_left  = x_min - 0.5 * res
+        x_right = x_min + (n_x - 0.5) * res
+        y_bottom = y_min - 0.5 * res
+        y_top    = y_min + (n_y - 0.5) * res
+        extent = (float(x_left), float(x_right), float(y_bottom), float(y_top))
+        return grid, extent
+    except Exception:
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# Fase C: entry point spec-native unico
+# ---------------------------------------------------------------------------
+
+
+def compute_slice(
+    profiles: list,
+    spec: "object",
+    *,
+    single_window: tuple[float, float] | None = None,
+    resolution_override: float | None = None,
+    channel: int = -1,
+    combine_method: str = "mean",
+    pipeline_params: dict | None = None,
+    use_processing: bool = False,
+    normalize_channels: bool = False,
+    **extra,
+) -> tuple[list[dict], dict]:
+    """Unica funzione di calcolo slice governata da :class:`slice_spec.SliceSpec`.
+
+    Sia la preview inline sia il run finale passano di qui: la finestra di
+    profondita', spessore/overlap, risoluzione, modo ampiezza, raggio di ricerca,
+    blanking e low-pass vengono dallo spec; ogni altro kwarg di
+    ``compute_ogpr_slice_grids`` puo' essere passato in ``extra``.
+
+    - ``single_window=(z0, z1)``  -> esattamente **una** slice su [z0, z1].
+    - ``resolution_override``      -> forza la risoluzione (celle piu' grosse per
+      la preview).
+
+    Ritorna ``(grids, meta)`` come ``compute_ogpr_slice_grids`` (``meta`` porta
+    gia' ``slice_spec`` con lo spec risolto).
+    """
+    from dataclasses import replace as _replace
+    from .slice_spec import SliceSpec
+
+    if not isinstance(spec, SliceSpec):
+        raise TypeError("spec deve essere una slice_spec.SliceSpec")
+    rspec = spec if spec.is_resolved() else spec.resolve(profiles)
+
+    if rspec.interp == "bin":
+        # Default engine: every channel at its own position, binned gridding.
+        # The legacy IDW kwargs in ``extra`` (idw_mode, fill_nodata, ...) do not
+        # apply to it and are ignored; progress/cancel/diagnostics are honoured.
+        from .slice_engine import compute_grids
+
+        return compute_grids(
+            profiles, rspec,
+            channel=channel,
+            single_window=single_window,
+            resolution_override=resolution_override,
+            progress_callback=extra.get("progress_callback"),
+            cancel_event=extra.get("cancel_event"),
+            emit_diagnostics=bool(extra.get("emit_diagnostics", True)),
+            points_cache=extra.get("points_cache"),
+        )
+
+    if single_window is not None:
+        try:
+            z0, z1 = sorted(float(v) for v in single_window)
+        except Exception:
+            raise ValueError("single_window deve essere una coppia (z0, z1)")
+        dz = float(max(1e-6, z1 - z0))
+        zc = 0.5 * (z0 + z1)
+        # In compute_ogpr_slice_grids i "z levels" sono i CENTRI e vanno da
+        # z_min a z_max con passo = thickness*(1-overlap). Per ottenere UNA sola
+        # slice su [z0, z1] si mette un unico centro zc con spessore dz e un
+        # z_max appena sopra zc (< zc + dz/2 -> nessun secondo livello).
+        rspec = _replace(
+            rspec,
+            z_min_m=float(zc),
+            z_max_m=float(zc + 0.4 * dz),
+            thickness_m=dz,
+            overlap=0.0,
+        )
+    if resolution_override is not None and float(resolution_override) > 0.0:
+        rspec = _replace(rspec, resolution_m=float(resolution_override))
+    rspec.validate()
+
+    return compute_ogpr_slice_grids(
+        profiles=profiles,
+        channel=channel,
+        combine_method=combine_method,
+        pipeline_params=pipeline_params,
+        use_processing=use_processing,
+        normalize_channels=normalize_channels,
+        spec=rspec,
+        **extra,
+    )
+
+
+def compute_slice_preview(
+    profiles: list,
+    spec: "object",
+    z_from: float,
+    z_to: float,
+    *,
+    resolution: float | None = None,
+    **extra,
+) -> tuple[np.ndarray | None, tuple[float, float, float, float] | None]:
+    """Preview spec-native di una singola finestra -> ``(grid float32, extent)``.
+
+    Rimpiazza ``compute_timeslice_preview`` per i chiamanti che hanno gia' una
+    :class:`slice_spec.SliceSpec`. ``extent`` usa i bordi esterni dei pixel,
+    coerente con ``raster_io.make_geotransform``.
+    """
+    try:
+        z0 = float(z_from)
+        z1 = float(z_to)
+    except Exception:
+        return None, None
+    if not (np.isfinite(z0) and np.isfinite(z1)):
+        return None, None
+    if z1 < z0:
+        z0, z1 = z1, z0
+
+    grids, meta = compute_slice(
+        profiles,
+        spec,
+        single_window=(z0, z1),
+        resolution_override=(float(resolution) if resolution else None),
+        **extra,
+    )
+    if not grids or not meta:
+        return None, None
+    try:
+        item = grids[0]
+        grid = np.asarray(item.get("grid"), dtype=np.float32)
+        if grid.ndim != 2 or grid.size <= 0:
+            return None, None
+        res = float(meta.get("resolution") or resolution or getattr(spec, "resolution_m", 0.1))
+        x_min = float(meta["x_min"])
+        y_min = float(meta["y_min"])
+        n_y, n_x = int(grid.shape[0]), int(grid.shape[1])
+        extent = (
+            x_min - 0.5 * res,
+            x_min + (n_x - 0.5) * res,
+            y_min - 0.5 * res,
+            y_min + (n_y - 0.5) * res,
+        )
         return grid, extent
     except Exception:
         return None, None
@@ -1952,6 +1714,7 @@ def compute_ogpr_slice_grids(
     overlap_fraction: float = 0.5,
     blanking_distance: float = 0.0,
     smooth_sigma: float = 0.8,
+    grid_bg: str = "",
     emit_diagnostics: bool = True,
     depth_radius_factor: float = 0.6,
     balance_profiles: bool = True,
@@ -1970,9 +1733,53 @@ def compute_ogpr_slice_grids(
     topo_reference_elevation: float | None = None,
     parallel_profiles: bool = False,
     profile_workers: int = 0,
+    progress_callback: Callable[[int, int], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    parallel_slices: bool = False,
+    slice_workers: int = 0,
+    spec: "object | None" = None,
 ) -> tuple[list[dict], dict]:
-    """Compute IDW grids for each slice and return (grids, meta)."""
+    """Compute IDW grids for each slice and return (grids, meta).
+
+    When ``spec`` is a :class:`slice_spec.SliceSpec`, the parameters it governs
+    (depth window, thickness/overlap, resolution, amplitude mode, search radius,
+    blanking, low-pass) are taken from it and override the matching keyword
+    arguments; every other kwarg keeps its own value. ``spec`` is resolved
+    against ``profiles`` first if it still has unresolved (``None``) fields.
+    """
     from .gpr_processing import DEFAULT_PIPELINE
+
+    resolved_spec = None
+    if spec is not None:
+        from .slice_spec import SliceSpec as _SliceSpec
+
+        if not isinstance(spec, _SliceSpec):
+            raise TypeError("spec must be a slice_spec.SliceSpec instance")
+        resolved_spec = spec if spec.is_resolved() else spec.resolve(profiles)
+        if resolved_spec.interp == "bin":
+            from .slice_engine import compute_grids
+
+            return compute_grids(
+                profiles, resolved_spec,
+                channel=channel,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+                emit_diagnostics=emit_diagnostics,
+            )
+        _sk = resolved_spec.to_compute_kwargs()
+        z_min = _sk.get("z_min", z_min)
+        z_max = _sk.get("z_max", z_max)
+        z_step = _sk.get("z_step", z_step)
+        overlap_fraction = _sk.get("overlap_fraction", overlap_fraction)
+        resolution = _sk.get("resolution", resolution)
+        extraction_mode = _sk.get("extraction_mode", extraction_mode)
+        use_hilbert = _sk.get("use_hilbert", use_hilbert)
+        blanking_distance = _sk.get("blanking_distance", blanking_distance)
+        smooth_sigma = _sk.get("smooth_sigma", smooth_sigma)
+        grid_bg = _sk.get("grid_bg", grid_bg)
+        auto_radius = _sk.get("auto_radius", auto_radius)
+        if "radius" in _sk:
+            radius = _sk["radius"]
 
     t_total_start = perf_counter()
     t_preprocess_s = 0.0
@@ -2203,21 +2010,43 @@ def compute_ogpr_slice_grids(
         profile_workers_used=int(proc_diag.get("profile_workers_used", 1)),
         bounds_margin_m=float(gp.get("bounds_margin_m", 0.0) or 0.0),
     )
+    if resolved_spec is not None:
+        meta["slice_spec"] = resolved_spec.to_dict()
 
-    t_loop_start = perf_counter()
-    for iz, z_lev in enumerate(z_levels):
+    # Build the common IDW grid parameter dict (x/y bounds, grid shape).
+    _gp_base = {
+        "x_min": x_min, "y_min": y_min, "x_max": x_max, "y_max": y_max,
+        "n_x": n_x, "n_y": n_y,
+        "eff_ratio": eff_ratio, "eff_angle": eff_angle,
+    }
+
+    # Pre-build KDTree once for all slices when survey coordinates are invariant across depth
+    shared_tree = None
+    if not bool(topographic_correction) and amplitude_sigma is None:
+        try:
+            from scipy.spatial import cKDTree
+            _all_pts = [(x, y) for _, x, y, _, _ in _iter_processed_entries(processed)]
+            if _all_pts:
+                _ex = np.concatenate([p[0] for p in _all_pts])
+                _ny = np.concatenate([p[1] for p in _all_pts])
+                _fin = np.isfinite(_ex) & np.isfinite(_ny)
+                if _fin.any():
+                    shared_tree = cKDTree(np.column_stack([_ex[_fin].astype(np.float64), _ny[_fin].astype(np.float64)]))
+        except Exception:
+            shared_tree = None
+
+    def _compute_one_slice(iz_zlev):
+        """Compute a single depth slice; used for both sequential and parallel execution."""
+        iz, z_lev = iz_zlev
         z_from = float(z_lev - z_step / 2.0)
-        z_to = float(z_lev + z_step / 2.0)
+        z_to   = float(z_lev + z_step / 2.0)
         radius_z = _depth_adaptive_radius(base_radius, float(z_lev), float(z_max), depth_radius_factor)
         effective_radius = radius_z * (max(1.0, ratio_for_radius) if use_anisotropic_idw else 1.0)
-        t_i0 = perf_counter()
+        gp_slice = dict(_gp_base)
+        gp_slice["radius"] = radius_z
         grid, n_pts, amp_diag = _interpolate_z_level(
             processed, z_from, z_to, combine_method,
-            {
-                "x_min": x_min, "y_min": y_min, "x_max": x_max, "y_max": y_max,
-                "n_x": n_x, "n_y": n_y, "radius": radius_z,
-                "eff_ratio": eff_ratio, "eff_angle": eff_angle,
-            },
+            gp_slice,
             resolution, amplitude_sigma, use_anisotropic_idw,
             idw_mode=idw_mode_norm,
             idw_power=idw_power, min_points=min_points,
@@ -2225,20 +2054,25 @@ def compute_ogpr_slice_grids(
             fill_nodata_max_distance=fill_nodata_max_distance,
             blanking_distance=blanking_distance,
             smooth_sigma=smooth_sigma,
+            grid_bg=str(grid_bg or ""),
             balance_profiles=balance_profiles,
             per_slice_balance=per_slice_balance_eff,
             amplitude_hist_bins=amplitude_hist_bins,
             topographic_correction=bool(topographic_correction),
             topo_reference_elevation=topo_ref,
+            tree=shared_tree,
         )
-        t_interp_s += max(0.0, perf_counter() - t_i0)
+        return iz, z_lev, z_from, z_to, grid, n_pts, amp_diag, radius_z, effective_radius
+
+    def _process_slice_result(iz, z_lev, z_from, z_to, grid, n_pts, amp_diag, radius_z, effective_radius):
+        """Append a slice result to `grids` and emit diagnostics."""
         if grid is None:
             if emit_diagnostics:
                 print(
                     f"[OGPR slicer] slice {iz:04d} z={z_lev:.4f}m skipped: "
                     f"no points in window [{z_from:.4f}, {z_to:.4f}]"
                 )
-            continue
+            return
         n_valid = int(np.count_nonzero(~np.isnan(grid)))
         n_total = int(grid.size)
         fill_pct = 100.0 * n_valid / max(n_total, 1)
@@ -2276,6 +2110,67 @@ def compute_ogpr_slice_grids(
             "effective_radius": float(effective_radius),
             "amplitude_diag": amp_diag,
         })
+
+    t_loop_start = perf_counter()
+    n_total_levels = int(len(z_levels))
+    _use_parallel_slices = bool(parallel_slices) and n_total_levels > 1
+    if _use_parallel_slices:
+        try:
+            _sw = int(slice_workers or 0)
+            _auto_sw = max(1, min(n_total_levels, max(1, int(os.cpu_count() or 2) - 1)))
+            _slice_w = _sw if _sw > 0 else _auto_sw
+            _slice_w = max(1, min(_slice_w, n_total_levels))
+        except Exception:
+            _slice_w = 1
+            _use_parallel_slices = False
+
+    if _use_parallel_slices:
+        jobs = list(enumerate(z_levels))
+        with ThreadPoolExecutor(max_workers=_slice_w, thread_name_prefix="ogpr-slice") as ex:
+            futures = {ex.submit(_compute_one_slice, job): job[0] for job in jobs}
+            done_count = 0
+            for fut in as_completed(futures):
+                if cancel_event is not None and cancel_event.is_set():
+                    # Cancel remaining futures gracefully.
+                    for f in futures:
+                        f.cancel()
+                    if emit_diagnostics:
+                        print("[OGPR slicer][INFO] elaborazione slice annullata dall'utente.")
+                    break
+                t_i0 = perf_counter()
+                try:
+                    iz, z_lev, z_from, z_to, grid, n_pts, amp_diag, radius_z, eff_r = fut.result()
+                except Exception as exc:
+                    if emit_diagnostics:
+                        print(f"[OGPR slicer][WARN] errore slice {futures[fut]}: {exc}")
+                    continue
+                finally:
+                    t_interp_s += max(0.0, perf_counter() - t_i0)
+                done_count += 1
+                _process_slice_result(iz, z_lev, z_from, z_to, grid, n_pts, amp_diag, radius_z, eff_r)
+                if progress_callback is not None:
+                    try:
+                        progress_callback(done_count, n_total_levels)
+                    except Exception:
+                        pass
+        # Parallel execution may produce out-of-order results; sort by depth level.
+        grids.sort(key=lambda g: g["z_lev"])
+    else:
+        for iz, z_lev in enumerate(z_levels):
+            if cancel_event is not None and cancel_event.is_set():
+                if emit_diagnostics:
+                    print("[OGPR slicer][INFO] elaborazione slice annullata dall'utente.")
+                break
+            t_i0 = perf_counter()
+            result = _compute_one_slice((iz, z_lev))
+            t_interp_s += max(0.0, perf_counter() - t_i0)
+            iz, z_lev, z_from, z_to, grid, n_pts, amp_diag, radius_z, eff_r = result
+            _process_slice_result(iz, z_lev, z_from, z_to, grid, n_pts, amp_diag, radius_z, eff_r)
+            if progress_callback is not None:
+                try:
+                    progress_callback(iz + 1, n_total_levels)
+                except Exception:
+                    pass
 
     t_slice_loop_s = max(0.0, perf_counter() - t_loop_start)
     t_total_s = max(0.0, perf_counter() - t_total_start)
@@ -2326,6 +2221,11 @@ def compute_ogpr_slice_grids(
             f"idw={t_interp_s:.3f}s idw_avg={interp_avg:.3f}s/slice "
             f"slices={n_slice_done}/{n_slice_total}"
         )
+
+    if resolved_spec is not None and resolved_spec.clip_polygons:
+        from .slice_clip import apply_clip_to_grids
+
+        apply_clip_to_grids(grids, meta, resolved_spec.clip_polygons)
 
     return grids, meta
 
@@ -2411,15 +2311,32 @@ def _validate_grid_georef_meta(meta: dict, grid: np.ndarray | None = None) -> No
             )
 
 
+def _embed_slice_provenance(tif_path: str, meta: dict, item: dict) -> None:
+    """Record inside the GeoTIFF how its values were made (depth window and the
+    full ``SliceSpec``, amplitude tools included). ``sliceset.json`` and the
+    ``.qml`` sit next to the file and get lost when it is copied elsewhere."""
+    items = {"GPR_Z_FROM": item.get("z_from"), "GPR_Z_TO": item.get("z_to")}
+    spec = (meta or {}).get("slice_spec")
+    if spec:
+        try:
+            items["GPR_SLICE_SPEC"] = json.dumps(spec, sort_keys=True, ensure_ascii=True, default=str)
+        except (TypeError, ValueError):
+            pass
+    _embed_tif_metadata(tif_path, items)
+
+
 def write_grids_to_tifs(
     grids: list[dict],
     meta: dict,
     output_dir: str,
     epsg: int | None = None,
+    style: dict | None = None,
 ) -> list[dict]:
-    """Write precomputed grids to disk as GeoTIFF + QML sidecar."""
-    from .gpr_las_slicer import _write_tif_singleband
+    """Write precomputed grids to disk as GeoTIFF + QML sidecar.
 
+    ``style`` = ``{"cmap": ..., "clip_lo": ..., "clip_hi": ...}`` colours the QML
+    like the viewer (see ``raster_io.write_qml_singleband``).
+    """
     _validate_grid_georef_meta(meta)
     os.makedirs(output_dir, exist_ok=True)
     results = []
@@ -2433,12 +2350,15 @@ def write_grids_to_tifs(
         iz = item["index"]
         grid = item["grid"]
         _validate_grid_georef_meta(meta, grid=np.asarray(grid))
-        z_label = f"{z_lev:.4f}".replace(".", "_").replace("-", "m")
-        tif_name = f"slice_{iz:04d}_z{z_label}.tif"
+        # La finestra di profondita' sta nel nome: resta leggibile anche dopo
+        # la copia nel progetto e come nome del layer nel canvas.
+        from .slice_manifest import slice_file_name as _slice_file_name
+        tif_name = _slice_file_name(iz, item["z_from"], item["z_to"])
         tif_path = os.path.join(output_dir, tif_name)
 
         _write_tif_singleband(grid, tif_path, x_min, y_min, y_max, res, epsg)
-        _write_qml_singleband(tif_path, grid)
+        _write_qml_singleband(tif_path, grid, style)
+        _embed_slice_provenance(tif_path, meta, item)
 
         results.append({
             "path": tif_path,
@@ -2478,8 +2398,16 @@ def slice_ogpr_to_tifs(
     flip_traces_mode: str = "none",
     parallel_profiles: bool = False,
     profile_workers: int = 0,
+    spec: "object | None" = None,
+    source_variant: str = "raw",
 ) -> list[dict]:
-    """Legacy entrypoint: compute grids and write to disk."""
+    """Legacy entrypoint: compute grids and write to disk.
+
+    Also writes a ``sliceset.json`` manifest next to the GeoTIFFs (Fase B): the
+    embedded :class:`slice_spec.SliceSpec` and per-slice depth/stats become the
+    source of truth for the display / 3D consumers, so depth is never
+    reconstructed from file names for generated sets.
+    """
     grids, meta = compute_ogpr_slice_grids(
         profiles=profiles,
         channel=channel,
@@ -2500,7 +2428,66 @@ def slice_ogpr_to_tifs(
         flip_traces_mode=flip_traces_mode,
         parallel_profiles=parallel_profiles,
         profile_workers=profile_workers,
+        spec=spec,
     )
     if not grids:
         return []
-    return write_grids_to_tifs(grids, meta, output_dir, epsg)
+    results = write_grids_to_tifs(grids, meta, output_dir, epsg)
+
+    try:
+        _write_run_sliceset(
+            output_dir, meta, grids, results,
+            spec=spec, epsg=epsg, source_variant=source_variant,
+            n_profiles=len(profiles or []),
+        )
+    except Exception as exc:  # manifest is best-effort; never break the run
+        print(f"[OGPR slicer][WARN] sliceset.json non scritto: {exc}")
+
+    return results
+
+
+def _write_run_sliceset(
+    output_dir, meta, grids, results, *, spec, epsg, source_variant, n_profiles,
+):
+    """Serialise ``sliceset.json`` for a finished ``slice_ogpr_to_tifs`` run."""
+    from .slice_spec import SliceSpec
+    from .slice_manifest import write_sliceset
+
+    if isinstance(meta.get("slice_spec"), dict):
+        # compute_ogpr_slice_grids already resolved the spec against the profiles.
+        out_spec = SliceSpec.from_dict(meta["slice_spec"])
+    elif isinstance(spec, SliceSpec) and spec.is_resolved():
+        out_spec = spec
+    else:
+        out_spec = SliceSpec.from_compute_meta(meta, crs_epsg=epsg)
+
+    if epsg and out_spec.crs_epsg is None:
+        from dataclasses import replace as _replace
+        out_spec = _replace(out_spec, crs_epsg=int(epsg))
+
+    grid_by_index = {int(g["index"]): g.get("grid") for g in grids}
+    slice_items = []
+    for r in results:
+        idx = int(r["index"])
+        slice_items.append({
+            "index": idx,
+            "z_from": r["z_from"],
+            "z_to": r["z_to"],
+            "z_center": r.get("z_center"),
+            "grid": os.path.basename(str(r["path"])),
+            "array": grid_by_index.get(idx),
+        })
+
+    extent = None
+    if all(k in meta for k in ("x_min", "y_min", "x_max", "y_max")):
+        extent = [meta["x_min"], meta["y_min"], meta["x_max"], meta["y_max"]]
+
+    source = {
+        "kind": "ogpr",
+        "variant_id": str(source_variant or "raw"),
+        "n_profiles": int(n_profiles),
+    }
+    return write_sliceset(
+        output_dir, out_spec, slice_items, source,
+        extent=extent, crs_epsg=epsg,
+    )

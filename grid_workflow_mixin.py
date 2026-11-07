@@ -1,3 +1,5 @@
+import math
+
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
     QFileDialog,
@@ -31,6 +33,14 @@ from .layer_property_utils import get_layer_property, set_layer_property
 
 
 class GridWorkflowMixin:
+    @staticmethod
+    def _parse_float_text(value):
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("Empty numeric value")
+        # Support both dot and european comma decimal separators.
+        return float(text.replace(",", "."))
+
     def _init_grid_state(self):
         """Initialise grid workflow state. Called by the plugin constructor."""
         self.grid_use_snap = True
@@ -55,10 +65,12 @@ class GridWorkflowMixin:
         self.base_angle_label = None
         self.length_label = None
         self.orientation_status_label = None
+        self.grid_crs_warning_label = None
         self.orientation_helper_dialog = None
         self.orientation_helper_status_label = None
         self.orientation_helper_edits = {}
         self._orientation_helper_syncing = False
+        self._grid_crs_signal_connected = False
         self.internal_grid_checkbox = None
         self.last_area_layer = None
         self.last_grid_layer = None
@@ -67,9 +79,20 @@ class GridWorkflowMixin:
         self._gpr_z_min = 0.0           # Z minimo del volume caricato
         self._gpr_z_step = 0.05         # passo Z (profondità per slice)
         self._gpr_n_slices = 0          # numero totale slice calcolate
+        try:
+            QgsProject.instance().crsChanged.connect(self._refresh_grid_crs_warning_label)
+            self._grid_crs_signal_connected = True
+        except Exception:
+            self._grid_crs_signal_connected = False
 
     def _cleanup_grid_state(self):
         """Teardown grid workflow transient UI state. Called by plugin unload()."""
+        if getattr(self, "_grid_crs_signal_connected", False):
+            try:
+                QgsProject.instance().crsChanged.disconnect(self._refresh_grid_crs_warning_label)
+            except Exception:
+                pass
+            self._grid_crs_signal_connected = False
         if self.orientation_helper_dialog is not None:
             try:
                 self.orientation_helper_dialog.hide()
@@ -83,6 +106,25 @@ class GridWorkflowMixin:
         self.orientation_helper_status_label = None
         self.orientation_helper_edits = {}
         self._orientation_helper_syncing = False
+        self.grid_crs_warning_label = None
+
+    def _refresh_grid_crs_warning_label(self):
+        label = getattr(self, "grid_crs_warning_label", None)
+        if label is None:
+            return
+        try:
+            project_crs = QgsProject.instance().crs()
+        except Exception:
+            project_crs = None
+        if project_crs is None or (not project_crs.isGeographic()):
+            label.setText("")
+            label.setVisible(False)
+            return
+        label.setText(
+            f"Warning: project CRS {project_crs.authid()} is geographic. "
+            "Grid distances are interpreted in degrees."
+        )
+        label.setVisible(True)
 
     def _orientation_main_fields_map(self):
         dlg = getattr(self, "dlg", None)
@@ -320,8 +362,8 @@ class GridWorkflowMixin:
 
             if internal_enabled:
                 # Read spacing values from UI only when internal grid is enabled.
-                distance_x = float(self.dlg.lineEditDistanceX.text().strip())
-                distance_y = float(self.dlg.lineEditDistanceY.text().strip())
+                distance_x = self._parse_float_text(self.dlg.lineEditDistanceX.text())
+                distance_y = self._parse_float_text(self.dlg.lineEditDistanceY.text())
                 # Create grid
                 grid_layer = create_grid_from_polygon(
                     polygon_layer,
@@ -417,6 +459,7 @@ class GridWorkflowMixin:
         if self.internal_grid_checkbox is not None:
             self.grid_internal_enabled = bool(self.internal_grid_checkbox.isChecked())
         self._apply_grid_snapping_config()
+        self._refresh_grid_crs_warning_label()
 
     def _on_internal_grid_toggled(self, checked):
         enabled = bool(checked)
@@ -492,7 +535,7 @@ class GridWorkflowMixin:
         if angle_rad is None:
             self.base_angle_label.setText("Base: --")
         else:
-            angle_deg = (angle_rad * 180.0 / 3.141592653589793) % 360.0
+            angle_deg = (angle_rad * 180.0 / math.pi) % 360.0
             self.base_angle_label.setText(f"Base: {angle_deg:.1f}deg")
 
         if self.length_label is not None:
@@ -722,6 +765,7 @@ class GridWorkflowMixin:
             QMessageBox.critical(self.dlg, "Export Error", f"Unable to export GeoPackage: {e}")
 
     def _confirm_planar_units_for_grid(self):
+        self._refresh_grid_crs_warning_label()
         project_crs = QgsProject.instance().crs()
         if not project_crs.isGeographic():
             return True
@@ -765,10 +809,10 @@ class GridWorkflowMixin:
 
     def _get_grid_dimensions_from_fields(self):
         try:
-            x0_val = float(self.dlg.lineEditX0Y0.text().strip())
-            x1_val = float(self.dlg.lineEditX1Y0.text().strip())
-            y0_val = float(self.dlg.lineEditY0.text().strip())
-            y1_val = float(self.dlg.lineEditX0Y1.text().strip())
+            x0_val = self._parse_float_text(self.dlg.lineEditX0Y0.text())
+            x1_val = self._parse_float_text(self.dlg.lineEditX1Y0.text())
+            y0_val = self._parse_float_text(self.dlg.lineEditY0.text())
+            y1_val = self._parse_float_text(self.dlg.lineEditX0Y1.text())
         except Exception:
             return None
         size_x = abs(x1_val - x0_val)
@@ -791,8 +835,8 @@ class GridWorkflowMixin:
 
             internal_enabled = bool(self.internal_grid_checkbox.isChecked()) if self.internal_grid_checkbox is not None else True
             if internal_enabled:
-                cell_x = float(self.dlg.lineEditDistanceX.text().strip())
-                cell_y = float(self.dlg.lineEditDistanceY.text().strip())
+                cell_x = self._parse_float_text(self.dlg.lineEditDistanceX.text())
+                cell_y = self._parse_float_text(self.dlg.lineEditDistanceY.text())
                 if cell_x <= 0 or cell_y <= 0:
                     QMessageBox.warning(self.dlg, "Invalid Cell Size", "Cell X and Cell Y must be positive.")
                     return

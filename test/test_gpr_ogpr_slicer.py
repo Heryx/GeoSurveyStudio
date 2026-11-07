@@ -208,5 +208,28 @@ class GprOgprSlicerTest(unittest.TestCase):
         _validate_grid_georef_meta(meta, grid=np.asarray(grids[0]["grid"]))
 
 
+@unittest.skipUnless(HAS_SCIPY, "scipy not available")
+class TestGridOrientationConvention(unittest.TestCase):
+    """La griglia interna e' ordinata dal sud al nord (riga 0 = y minima).
+
+    Il viewer si basa su questa convenzione per disegnare l'anteprima con
+    origin="lower" (i GeoTIFF vengono invece scritti nord-in-alto)."""
+
+    def test_row0_is_south(self):
+        n_s, n_t = 64, 60
+        profiles = []
+        for p, (yv, amp) in enumerate([(4548956.0, 1000.0), (4548960.0, 1.0)]):
+            x = 443570.0 + np.arange(n_t) * 0.05
+            data = np.random.default_rng(p).normal(0, 1, (n_s, n_t)) * amp
+            profiles.append(_FakeProfile(f"p{p}.ogpr", [data], x, np.full(n_t, yv), np.full(n_t, 120.0)))
+        grids, _meta = compute_ogpr_slice_grids(
+            profiles, channel=0, resolution=0.2, z_step=0.5, z_min=0.0, z_max=1.0,
+            extraction_mode="las_like", use_hilbert=True, use_processing=False,
+            balance_profiles=False,
+        )
+        g = np.asarray(grids[0]["grid"])
+        self.assertGreater(np.nanmean(np.abs(g[:3])), np.nanmean(np.abs(g[-3:])))
+
+
 if __name__ == "__main__":
     unittest.main()
