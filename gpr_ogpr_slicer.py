@@ -513,6 +513,7 @@ def _process_profiles(
     Optionally parallelizes per-profile preprocessing with a thread pool.
     """
     from .gpr_processing import apply_pipeline, apply_pre_bg_pipeline, background_removal
+    from .gpr_profile_gain import profile_gain_key, resolve_profile_params
 
     mode = str(extraction_mode or "las_like").strip().lower()
     hilbert_on = bool(use_hilbert)
@@ -617,7 +618,7 @@ def _process_profiles(
                     try:
                         proc = apply_pipeline(
                             raw.copy(),
-                            params,
+                            resolve_profile_params(params, profile_gain_key(path_local)),
                             dt_ns=prof_local.dt_ns,
                             bg_reference_trace=bg_reference,
                             normalize_output=False,
@@ -2220,6 +2221,11 @@ def compute_ogpr_slice_grids(
             f"idw={t_interp_s:.3f}s idw_avg={interp_avg:.3f}s/slice "
             f"slices={n_slice_done}/{n_slice_total}"
         )
+
+    if resolved_spec is not None and resolved_spec.clip_polygons:
+        from .slice_clip import apply_clip_to_grids
+
+        apply_clip_to_grids(grids, meta, resolved_spec.clip_polygons)
 
     return grids, meta
 

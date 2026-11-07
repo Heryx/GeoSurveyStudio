@@ -22,6 +22,7 @@ from qgis.PyQt.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPushButton,
     QWidget,
 )
 
@@ -74,6 +75,8 @@ class SliceSpecPanel(QWidget):
     """Form widget whose state is a :class:`slice_spec.SliceSpec`."""
 
     spec_changed = pyqtSignal()
+    clip_draw_toggled = pyqtSignal(bool)   # "Disegna…" acceso / spento
+    clip_undo_requested = pyqtSignal()     # "Annulla": ultimo vertice o ultimo poligono
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -176,6 +179,36 @@ class SliceSpecPanel(QWidget):
         self.sp_blanking = self._dspin(0.0, 0.0, 100.0, 0.05, " m")
         self.sp_blanking.setToolTip("0 = nessun blanking; celle oltre questa distanza dai dati -> NoData")
         form.addRow("Raggio blanking:", self.sp_blanking)
+
+        # --- grid boundary: manually drawn clip polygons ---------------------
+        self._clip_polygons: list = []
+        self.lbl_clip = QLabel("nessuno")
+        self.btn_clip_draw = QPushButton("Disegna…")
+        self.btn_clip_draw.setCheckable(True)
+        self.btn_clip_draw.setToolTip(
+            "Disegna sulla time-slice il perimetro da tenere: tutto cio' che sta\n"
+            "fuori diventa NoData (toglie i 'tendoni' dove i profili di andata e\n"
+            "ritorno non finiscono alla stessa distanza).\n"
+            "Clic sinistro = aggiunge un vertice; doppio clic o clic destro =\n"
+            "chiude il poligono; Esc = annulla quello in corso. Piu' poligoni si\n"
+            "sommano. Mentre disegni vedi la slice intera, senza ritaglio."
+        )
+        self.btn_clip_undo = QPushButton("Annulla")
+        self.btn_clip_undo.setToolTip("Toglie l'ultimo vertice (se stai disegnando) o l'ultimo poligono")
+        self.btn_clip_clear = QPushButton("Rimuovi")
+        self.btn_clip_clear.setToolTip("Toglie il limite: la griglia torna intera")
+        _clw = QWidget()
+        _cll = QHBoxLayout(_clw)
+        _cll.setContentsMargins(0, 0, 0, 0)
+        _cll.setSpacing(4)
+        _cll.addWidget(self.lbl_clip, 1)
+        for _w in (self.btn_clip_draw, self.btn_clip_undo, self.btn_clip_clear):
+            _cll.addWidget(_w, 0)
+        form.addRow("Limite griglia:", _clw)
+        self.btn_clip_draw.toggled.connect(self.clip_draw_toggled.emit)
+        self.btn_clip_undo.clicked.connect(lambda *_: self.clip_undo_requested.emit())
+        self.btn_clip_clear.clicked.connect(lambda *_: self.set_clip_polygons([]))
+        self._refresh_clip_widgets()
 
         # --- amplitude tools: the value conditioning, in the order it is applied ---
         self.grp_tools = QGroupBox("Rifinitura ampiezze")
@@ -360,6 +393,40 @@ class SliceSpecPanel(QWidget):
             self.spec_changed.emit()
 
     # ------------------------------------------------------------------
+    # grid boundary (clip polygons)
+    # ------------------------------------------------------------------
+    def clip_polygons(self) -> list:
+        return [[list(p) for p in ring] for ring in self._clip_polygons]
+
+    def set_clip_polygons(self, rings, *, emit: bool = True) -> None:
+        from .slice_clip import normalize_rings
+
+        self._clip_polygons = normalize_rings(rings)
+        self._refresh_clip_widgets()
+        if emit and not self._building:
+            self.spec_changed.emit()
+
+    def add_clip_polygon(self, ring) -> None:
+        self.set_clip_polygons(self._clip_polygons + [list(ring)])
+
+    def pop_clip_polygon(self) -> None:
+        if self._clip_polygons:
+            self.set_clip_polygons(self._clip_polygons[:-1])
+
+    def set_clip_drawing(self, on: bool) -> None:
+        """Allinea il pulsante "Disegna…" senza riemettere il segnale."""
+        block = self.btn_clip_draw.blockSignals(True)
+        try:
+            self.btn_clip_draw.setChecked(bool(on))
+        finally:
+            self.btn_clip_draw.blockSignals(block)
+
+    def _refresh_clip_widgets(self) -> None:
+        n = len(self._clip_polygons)
+        self.lbl_clip.setText("nessuno" if n == 0 else ("1 poligono" if n == 1 else f"{n} poligoni"))
+        self.btn_clip_clear.setEnabled(n > 0)
+
+    # ------------------------------------------------------------------
     # spec <-> widgets
     # ------------------------------------------------------------------
     def get_spec(self) -> SliceSpec:
@@ -394,6 +461,7 @@ class SliceSpecPanel(QWidget):
             amp_scale=str(self.cb_scale.currentData() or "linear"),
             despeckle=int(self.cb_despeckle.currentData() or 0),
             highpass_m=float(self.sp_highpass.value()),
+            clip_polygons=self.clip_polygons(),
             crs_epsg=crs_epsg,
         )
         spec.validate()
@@ -434,6 +502,7 @@ class SliceSpecPanel(QWidget):
             self._set_combo(self.cb_scale, spec.amp_scale)
             self._set_combo(self.cb_despeckle, int(spec.despeckle))
             self.sp_highpass.setValue(float(spec.highpass_m))
+            self.set_clip_polygons(spec.clip_polygons, emit=False)
             self.le_crs_epsg.setText("" if spec.crs_epsg is None else str(int(spec.crs_epsg)))
             self._sync_enabled()
         finally:

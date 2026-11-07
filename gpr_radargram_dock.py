@@ -428,7 +428,7 @@ class RadargramDock(QDockWidget):
                  feature_sink=None, feature_query=None, parent=None, zones_provider=None,
                  project_root_provider=None, feature_update=None, feature_delete=None,
                  band_filter=None):
-        super().__init__("Radargrammi processati", parent or (iface.mainWindow() if iface else None))
+        super().__init__("Radargram Editing", parent or (iface.mainWindow() if iface else None))
         self.setObjectName("GeoSurveyRadargramDock")
         self.setAllowedAreas(Qt.AllDockWidgetAreas)
         self.setFeatures(
@@ -1255,9 +1255,9 @@ class RadargramDock(QDockWidget):
         ci = int(np.clip(int(self._ci if ci is None else ci), 0, n_ch - 1))
         if pi == self._pi and ci == self._ci and self._cur is not None:
             return
-        same_profile = pi == self._pi
+        first = self._im is None
         self._pi, self._ci = pi, ci
-        self._load_current(reset_view=not same_profile, keep_y=True)
+        self._load_current(reset_view=first, keep_y=True)      # navigando tra profili lo zoom resta
 
     def _on_profile_combo(self, i: int) -> None:
         if not self._updating and i >= 0:
@@ -1402,6 +1402,10 @@ class RadargramDock(QDockWidget):
             extent=[0.0, length, depth_max, 0.0], interpolation="bilinear",
             interpolation_stage="data", resample=True,
         )
+        if x_view is not None:                      # zoom mantenuto anche su un profilo piu' corto: si ritaglia
+            lo, hi = sorted(float(v) for v in x_view)
+            lo, hi = max(lo, 0.0), min(hi, length)
+            x_view = (lo, hi) if hi - lo > 1e-6 * length else None
         ax.set_xlim(*(x_view if x_view is not None else (0.0, length)))
         if y_keep is not None:
             lo, hi = sorted(float(v) for v in y_keep)
@@ -1768,7 +1772,7 @@ class RadargramDock(QDockWidget):
         bar = getattr(self.iface, "messageBar", None)
         if callable(bar):
             try:
-                bar().pushWarning("Radargrammi processati", text)
+                bar().pushWarning("Radargram Editing", text)
             except Exception:
                 pass
 

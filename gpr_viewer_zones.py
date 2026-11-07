@@ -17,6 +17,8 @@ from .gpr_viewer_common import (
 )
 
 _NEW_ZONE_ITEM = "＋ Nuova area..."
+_RENAME_ZONE_ITEM = "✎ Rinomina area attiva..."
+_RENAME_SENTINEL = "\x00rename"
 
 
 class ZonesMixin:
@@ -84,6 +86,7 @@ class ZonesMixin:
             for name in names:
                 combo.addItem(name, name)
             combo.addItem(_NEW_ZONE_ITEM, None)
+            combo.addItem(_RENAME_ZONE_ITEM, _RENAME_SENTINEL)
             combo.setCurrentIndex(max(0, combo.findData(current)))
         finally:
             combo.blockSignals(False)
@@ -91,11 +94,42 @@ class ZonesMixin:
     def _on_zone_activated(self, row: int) -> None:
         combo = self._cb_zone
         name = combo.itemData(int(row))
-        if name is None:
+        if name == _RENAME_SENTINEL:
+            self._refresh_zone_combo()
+            self._rename_zone()
+        elif name is None:
             self._refresh_zone_combo()
             self._new_zone()
         else:
             self._switch_zone(str(name))
+
+    def _rename_zone(self) -> str:
+        """Chiede un nuovo nome per l'area attiva e lo applica."""
+        root = self._gpr_project_root()
+        if not root:
+            QMessageBox.information(self, "Rinomina area", "Crea o apri prima un progetto GPR.")
+            return ""
+        if self._busy_for_zone_change():
+            return ""
+        old = self._zone_context(root)[0]
+        name, ok = QInputDialog.getText(
+            self, "Rinomina area", f"Nuovo nome per l'area '{old}':", text=old
+        )
+        name = str(name or "").strip()
+        if not ok or not name or name == old:
+            return ""
+        self._save_current_zone_state()
+        final = project_zones.rename_zone(root, old, name)
+        if not final:
+            QMessageBox.warning(
+                self, "Rinomina area",
+                f"Impossibile rinominare: esiste gia' un'area chiamata '{name}'.",
+            )
+            return ""
+        self._invalidate_zone_context()
+        self._refresh_zone_combo()
+        self._safe_set_text(self._lbl_status, f"Area '{old}' rinominata in '{final}'.")
+        return final
 
     # ------------------------------------------------------------------
     # Cambio / creazione area

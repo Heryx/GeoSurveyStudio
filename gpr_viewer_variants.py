@@ -10,6 +10,7 @@ import time
 
 from qgis.PyQt.QtCore import QEventLoop
 
+from .gpr_profile_gain import profile_gain_key, resolve_profile_params
 from .gpr_variant_runner import run_channels
 from .gpr_velocity_store import write_velocity_override
 from .gpr_viewer_common import (
@@ -111,6 +112,7 @@ class _VariantProgressDialog(QDialog):
         self.setWindowModality(Qt.ApplicationModal)
         self.setMinimumWidth(480)
         self._finished = False
+        self._cancel_note = "\nI profili gia' scritti restano su disco."
         lay = QVBoxLayout(self)
         self._lbl = QLabel("Avvio del calcolo in parallelo...")
         self._lbl.setWordWrap(True)
@@ -130,7 +132,7 @@ class _VariantProgressDialog(QDialog):
         if self._finished or not self._btn.isEnabled():
             return
         self._btn.setEnabled(False)
-        self._lbl.setText("Annullamento in corso...\nI profili gia' scritti restano su disco.")
+        self._lbl.setText("Annullamento in corso..." + self._cancel_note)
         self.cancel_requested.emit()
 
     def set_progress(self, done: int, text: str) -> None:
@@ -497,9 +499,9 @@ class VariantsMixin:
             raw = np.asarray(prof.channel(ci).data, dtype=np.float32)
             if trimmed:
                 raw = raw[:, tidx]
-            p_ch = params
+            # TVG: ogni profilo con la propria curva.
+            p_ch = resolve_profile_params(params, profile_gain_key(prof))
             if topo:
-                p_ch = dict(params)
                 elev = self._profile_channel_elevation(prof, ci)
                 try:
                     if trimmed and elev is not None and len(elev) > int(np.max(tidx)):
@@ -512,7 +514,8 @@ class VariantsMixin:
         def on_profile_done(pi, proc_by_ch):
             idx_by_ch = [tidx if trimmed else None for tidx, trimmed in plan[pi]]
             files_by_idx[pi] = save_processed_profile_npz(
-                variant_dir, profiles[pi], proc_by_ch, params, chain,
+                variant_dir, profiles[pi], proc_by_ch,
+                resolve_profile_params(params, profile_gain_key(profiles[pi])), chain,
                 view_geom=view_geom,
                 trace_indices_by_channel=(idx_by_ch if any(t for _i, t in plan[pi]) else None),
             )
@@ -973,9 +976,12 @@ class VariantsMixin:
         act_slice = menu.addAction("Genera time-slice")
         act_open = menu.addAction("Apri cartella")
         menu.addSeparator()
+        act_ren = menu.addAction("Rinomina variante…")
         act_del = menu.addAction("Elimina variante…")
         chosen = menu.exec_(tree.viewport().mapToGlobal(pos))
-        if chosen == act_view:
+        if chosen == act_ren:
+            self._rename_selected_variant()
+        elif chosen == act_view:
             self._view_selected_variant()
         elif chosen == act_new:
             self._new_variant_from_selected()
@@ -1039,6 +1045,53 @@ class VariantsMixin:
             self._lbl_status,
             f"Pipeline della variante '{name}' caricata. La prossima variante "
             f"salvata sara' registrata come sua figlia.",
+        )
+
+    def _rename_selected_variant(self):
+        d = self._selected_variant_dir()
+        old = os.path.basename(os.path.normpath(d)) if d else ""
+        if not d or not os.path.isdir(d):
+            return
+        if getattr(self, "_variant_job", None) is not None:
+            QMessageBox.information(
+                self, "Rinomina variante",
+                "Un salvataggio di variante e' in corso: attendi la fine.",
+            )
+            return
+        new, ok = QInputDialog.getText(
+            self, "Rinomina variante", f"Nuovo nome per la variante '{old}':", text=old
+        )
+        new = str(new or "").strip()
+        if not ok or not new or new == old:
+            return
+        processed = os.path.dirname(os.path.normpath(d))
+        from . import variant_cascade
+        err = variant_cascade.rename_variant(processed, old, new)
+        if err:
+            QMessageBox.warning(self, "Rinomina variante", err)
+            return
+        new_dir = os.path.join(processed, new)
+        active = str(getattr(self, "_active_variant_dir", "") or "")
+        if active and os.path.normcase(os.path.normpath(active)) == os.path.normcase(os.path.normpath(d)):
+            self._active_variant_dir = new_dir
+        if getattr(self, "_variant_parent_ctx", None) == old:
+            self._variant_parent_ctx = new
+        try:
+            self._flush_recipe_autosave()
+        except Exception:
+            pass
+        self._refresh_variants_list()
+        plugin = getattr(self, "plugin", None)
+        dock = getattr(plugin, "_radargram_dock", None) if plugin is not None else None
+        if dock is not None:
+            try:
+                dock.refresh_variants()
+            except Exception:
+                pass
+        self._safe_set_text(
+            self._lbl_status,
+            f"Variante '{old}' rinominata in '{new}' (le time-slice gia' generate "
+            f"restano nella loro cartella).",
         )
 
     def _delete_selected_variant(self):

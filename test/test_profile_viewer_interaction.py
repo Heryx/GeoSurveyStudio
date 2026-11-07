@@ -4,6 +4,7 @@
 La parte "viewer" richiede Qt (offscreen) e QGIS; si salta se non disponibili.
 """
 
+import dataclasses
 import importlib
 import os
 import pathlib
@@ -208,6 +209,10 @@ class _ViewerTestBase(unittest.TestCase):
         self.v._load_current_profile()
         self._pump(200)
         self.cv = self.v._canvas_mpl
+        self.cv.draw()
+        # Il layout puo' ancora assestarsi (splitter): un ultimo giro, poi si ridisegna,
+        # cosi' nessun draw in sospeso sporca i test che contano i ridisegni.
+        self._pump(100)
         self.cv.draw()
 
     def tearDown(self):
@@ -912,25 +917,124 @@ class RangeGainCurveLimitTest(_ViewerTestBase):
         pts = np.array([[0.0, 0.3], [0.4, 300.0], [1.0, 40.0]])
         dlg = self._dialog(points=pts)
         self.assertEqual(dlg.points()[:, 1].tolist(), [0.3, 300.0, 40.0])   # niente clip a 100
-        self.assertGreaterEqual(dlg.gain_max(), 600.0)                       # asse auto, sopra i punti
-        self.assertTrue(dlg._chk_log.isChecked())                            # decadi -> scala log
-        # il picking funziona anche con l'asse log: ogni punto e' il piu' vicino a se stesso
+        self.assertGreaterEqual(dlg.gain_max(), 20 * np.log10(300.0))       # asse (dB) sopra i punti
+        # il picking: ogni punto e' il piu' vicino a se stesso
         dlg._canvas.draw()
         for i, (depth, gain) in enumerate(dlg.points()):
-            idx, dist = dlg._nearest_idx(gain, depth)
+            idx, dist = dlg._nearest_idx(dlg._to_db(gain), depth)
             self.assertEqual(idx, i)
             self.assertLess(dist, 1e-6)
 
-    def test_editor_stays_linear_for_small_gains(self):
+    def test_editor_small_gains_keep_a_compact_axis(self):
         dlg = self._dialog(points=np.array([[0.0, 1.0], [1.0, 6.0]]))
-        self.assertFalse(dlg._chk_log.isChecked())
-        self.assertEqual(dlg.gain_max(), 20.0)
+        self.assertGreaterEqual(dlg.gain_max(), 20 * np.log10(6.0))
+        self.assertLessEqual(dlg.gain_max(), 30.0)
 
     def test_editor_manual_axis_does_not_clip_points(self):
         dlg = self._dialog(points=np.array([[0.0, 1.0], [1.0, 500.0]]), gain_max=50.0)
         self.assertFalse(dlg._chk_auto_axis.isChecked())
         self.assertEqual(float(dlg.points()[-1, 1]), 500.0)
-        self.assertGreaterEqual(dlg.gain_max(), 500.0)   # l'asse non nasconde il punto
+        self.assertGreaterEqual(dlg.gain_max(), 20 * np.log10(500.0))   # l'asse non nasconde il punto
+
+    def test_editor_steps_move_points_in_db(self):
+        dlg = self._dialog(points=np.array([[0.0, 1.0], [0.5, 10.0], [1.0, 100.0]]))
+        dlg._selected_idx = 1
+        dlg._spin_step.setValue(6.0)
+        dlg._move_selected(+6.0)
+        self.assertAlmostEqual(float(dlg.points()[1, 1]), 10.0 * 10 ** (6 / 20), places=4)
+        dlg._btn_all_shift.setChecked(True)
+        dlg._move_selected(-20.0)
+        np.testing.assert_allclose(dlg.points()[[0, 2], 1], [0.1, 10.0], rtol=1e-6)
+
+    def test_editor_amplitudes_replace_the_ascan_and_curve_sits_left(self):
+        v = self.v
+        v._chk_range_gain.setChecked(True)
+        self._pump(50)
+        v._open_range_gain_curve_editor()
+        self._pump(100)
+        lines = v._ax_wiggle.lines            # zero, prima, dopo
+        self.assertEqual(len(lines), 3)
+        self.assertFalse(v._gain_curve_host.isHidden())
+        self.assertIs(v._gain_panel.curve_canvas().parent(), v._gain_curve_host)
+        # alzando tutta la curva cambia solo la traccia "dopo"
+        before0 = np.asarray(lines[1].get_xdata()).copy()
+        v._gain_panel._btn_all_shift.setChecked(True)
+        v._gain_panel._move_selected(+20.0)
+        self._pump(50)
+        lines = v._ax_wiggle.lines
+        np.testing.assert_allclose(lines[1].get_xdata(), before0)
+        v._gain_panel.finished_with.emit("cancel")
+        self._pump(50)
+        self.assertTrue(v._gain_curve_host.isHidden())
+        self.assertIsNotNone(v._wiggle_fil_line)      # l'A-scan normale e' tornato
+
+    def test_editor_panel_sits_under_the_radargram_and_applies(self):
+        v = self.v
+        v._chk_range_gain.setChecked(True)
+        self._pump(50)
+        v._open_range_gain_curve_editor()
+        self._pump(100)
+        self.assertIsNotNone(v._gain_panel)
+        self.assertFalse(v._gain_panel_host.isHidden())
+        v._gain_panel._points = v._gain_panel._sanitize([[0.0, 1.0], [1.0, 40.0]])
+        v._gain_panel._emit_changed()
+        v._gain_panel.finished_with.emit("one")
+        self._pump(50)
+        self.assertIsNone(v._gain_panel)
+        self.assertTrue(v._gain_panel_host.isHidden())
+        self.assertAlmostEqual(v._spin_gain_deep.value(), 40.0)
+
+    def test_editor_panel_cancel_restores_the_curve(self):
+        v = self.v
+        v._chk_range_gain.setChecked(True)
+        before = v._range_gain_breakpoints.copy()
+        v._open_range_gain_curve_editor()
+        v._gain_panel._points = v._gain_panel._sanitize([[0.0, 1.0], [1.0, 99.0]])
+        v._gain_panel._emit_changed()
+        v._gain_panel.finished_with.emit("cancel")
+        self._pump(50)
+        np.testing.assert_allclose(v._range_gain_breakpoints, before)
+        self.assertEqual(v._current_processing_params().get("pre_agc_interp"), "log")
+
+    def test_auto_for_all_profiles_runs_in_a_job_and_fills_every_profile(self):
+        import os
+        v = self.v
+        v._profiles = [v._profiles[0], dataclasses.replace(v._profiles[0], path="second.ogpr")]
+        v._prof_idx = 0
+        v._chk_dewow.setChecked(True)
+        v._chk_range_gain.setChecked(True)
+        os.environ["RASTERLINKER_GPR_WORKERS"] = "1"       # seriale: niente processi nei test
+        self.addCleanup(lambda: os.environ.pop("RASTERLINKER_GPR_WORKERS", None))
+        mine = v._auto_gain_all_profiles(
+            {"start": 0.1, "strength": 1.0, "max_db": 60.0, "n_points": 8})
+        self.assertIsNotNone(mine)
+        self.assertEqual(set(v._range_gain_by_profile), {"synthetic", "second"})
+        self.assertEqual(v._range_gain_interp, "log")
+        self.assertIsNone(getattr(v, "_variant_job", None))
+
+    def test_pre_gain_matrix_uses_only_the_steps_before_the_gain(self):
+        v = self.v
+        v._chk_dewow.setChecked(True)
+        v._chk_range_gain.setChecked(True)
+        v._chk_agc.setChecked(True)
+        self._pump(50)
+        raw = np.asarray(v._profiles[0].channel(0).data, dtype=np.float32)
+        pre = v._pre_gain_matrix(v._profiles[0], 0)
+        self.assertEqual(pre.shape[0], raw.shape[0])
+        self.assertFalse(np.allclose(pre[:, :raw.shape[1]], raw[:, :pre.shape[1]]))   # dewow applicato
+
+    def test_editor_auto_builds_a_flat_start_and_a_rising_curve(self):
+        n = 400
+        env = np.concatenate([np.full(40, 20.0), 0.0 - 60.0 * np.linspace(0, 1, n - 40)])
+        dlg = self._dialog(points=np.array([[0.0, 1.0], [1.0, 6.0]]), envelope_db=env)
+        dlg._chk_start_auto.setChecked(False)
+        dlg._spin_start.setValue(12.0)
+        dlg._on_auto_clicked()
+        p = dlg.points()
+        self.assertEqual(dlg.interp(), "log")
+        self.assertTrue(np.all(p[p[:, 0] <= 0.12, 1] == 1.0))   # nessun guadagno sull'onda diretta
+        self.assertTrue(np.all(np.diff(p[:, 1]) >= -1e-9))
+        self.assertGreater(p[-1, 1], 30.0)
 
 
 @unittest.skipUnless(HAS_MPL and HAS_VIEWER, "matplotlib/viewer non disponibili")

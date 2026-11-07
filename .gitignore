@@ -10,3 +10,7 @@ resources.py
 
 # Claude Code session data / worktrees
 .claude/
+
+# QGIS runtime leftovers
+ext.json
+symbology-style.db

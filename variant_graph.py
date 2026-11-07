@@ -337,7 +337,7 @@ _PARAM_STEP_HINTS = {
     "bg_removal": ("bg_mode", "bg_method", "bg_window", "bg_sample_start", "bg_sample_end"),
     "bandpass": ("bp_low_mhz", "bp_high_mhz", "bp_taper_frac"),
     "migration": ("mig_velocity_m_s", "mig_dx_m"),
-    "pre_agc_gain": ("pre_agc_surface_gain", "pre_agc_deep_gain", "pre_agc_breakpoints"),
+    "pre_agc_gain": ("pre_agc_surface_gain", "pre_agc_deep_gain", "pre_agc_breakpoints", "pre_agc_interp"),
     "agc": ("agc_win", "agc_sample_start", "agc_max_gain"),
     "notch": ("notch_freq_mhz", "notch_bw_mhz"),
     "whiten": ("whiten_low_mhz", "whiten_high_mhz", "whiten_gain"),

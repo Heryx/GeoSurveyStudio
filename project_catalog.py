@@ -1203,6 +1203,227 @@ def normalize_copy_into_project(project_root, subfolder, source_path, name_prefi
     return destination_path, os.path.basename(destination_path)
 
 
+TIMESLICES_DIR = "timeslices_2d"
+
+
+def group_folder_name(group_name):
+    """Nome di cartella (un solo livello) per un gruppo: il nome del gruppo con
+    solo i caratteri non ammessi dal filesystem sostituiti."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(group_name or "").strip())
+    name = name.strip(" .")
+    return name or "group"
+
+
+def group_timeslice_subfolder(group_name):
+    """Sottocartella relativa al progetto che ospita le time-slice di un gruppo."""
+    return os.path.join(TIMESLICES_DIR, group_folder_name(group_name))
+
+
+_DEPTH_TOKEN_RE = re.compile(r"^z?\d+([.\-,]\d+)*m?$", re.IGNORECASE)
+_SLICE_MARKER_TOKENS = {"slice", "slices", "ts", "timeslice", "z", "depth", "prof"}
+
+
+def timeslice_group_prefix(file_name):
+    """Parte iniziale del nome di una time-slice, senza i riferimenti di
+    profondita' (``slice_0003_0.30-0.40m``, ``z0_5000``, ...).
+    ``Area_Nord_slice_0003_0.30-0.40m.tif`` -> ``Area_Nord``. '' se non resta nulla."""
+    stem = os.path.splitext(os.path.basename(str(file_name or "")))[0]
+    kept = []
+    for tok in re.split(r"[_\s]+", stem):
+        if not tok:
+            continue
+        low = tok.lower()
+        if low in _SLICE_MARKER_TOKENS or _DEPTH_TOKEN_RE.match(low):
+            break
+        kept.append(tok)
+    return "_".join(kept).strip("_- ")
+
+
+def detect_timeslice_prefix_groups(project_root, catalog=None, min_files=2):
+    """Raggruppa le time-slice del catalogo che stanno direttamente in
+    ``timeslices_2d`` (senza sottocartella) per prefisso del nome.
+
+    Ritorna ``[{"prefix", "records", "group"}]`` ordinato per prefisso; ``group``
+    e' il gruppo gia' esistente con quel nome (o None). Un prefisso con meno di
+    ``min_files`` file non e' un gruppo."""
+    data = catalog if catalog is not None else load_catalog(project_root)
+    root = os.path.normcase(os.path.abspath(os.path.join(project_root, TIMESLICES_DIR)))
+    clusters = {}
+    by_id = {}
+    for rec in data.get("timeslices", []):
+        pth = str(rec.get("project_path") or "").strip()
+        if pth and os.path.normcase(os.path.dirname(os.path.abspath(pth))) == root:
+            by_id[rec.get("id")] = rec
+    # 1) gruppi gia' esistenti: i loro membri sciolti in timeslices_2d vanno
+    #    nella cartella del gruppo, qualunque sia il nome dei file
+    used = set()
+    exact_groups = {}
+    for g in data.get("raster_groups", []):
+        if g.get("system") or g.get("id") == "grp_imported":
+            continue
+        gname = str(g.get("name") or "").strip()
+        recs = [by_id[t] for t in g.get("timeslice_ids", []) if t in by_id and t not in used]
+        if not gname or not recs:
+            continue
+        used.update(r.get("id") for r in recs)
+        exact_groups[gname.lower()] = g
+        clusters[gname.lower()] = (gname, recs)
+    # 2) le altre: per inizio del nome
+    for tid, rec in by_id.items():
+        if tid in used:
+            continue
+        pth = str(rec.get("project_path") or "")
+        prefix = timeslice_group_prefix(rec.get("normalized_name") or os.path.basename(pth))
+        if not prefix:
+            continue
+        clusters.setdefault(prefix.lower(), (prefix, []))[1].append(rec)
+    groups_by_name = {
+        str(g.get("name") or "").strip().lower(): g for g in data.get("raster_groups", [])
+    }
+    out = []
+    for key in sorted(clusters):
+        prefix, recs = clusters[key]
+        if key not in exact_groups and len(recs) < int(min_files):
+            continue
+        out.append({"prefix": prefix, "records": recs, "group": groups_by_name.get(key)})
+    return out
+
+
+def rescan_group_folders(project_root):
+    """Rilega al catalogo le time-slice che stanno nelle cartelle di gruppo
+    ``timeslices_2d/<Gruppo>`` ma non sono (piu') registrate.
+
+    Per ogni sottocartella con raster non presenti nel catalogo: registra i file
+    (CRS/estensione/profondita' letti dal raster) e li assegna al gruppo con lo
+    stesso nome della cartella (creato se manca; un gruppo il cui nome non
+    coincide con la cartella e' cercato anche per ``group_folder_name``).
+    Ritorna ``{"registered": n, "assigned": n, "groups": n}``."""
+    result = {"registered": 0, "assigned": 0, "groups": 0}
+    base = os.path.join(project_root, TIMESLICES_DIR)
+    if not os.path.isdir(base):
+        return result
+    from qgis.core import QgsRasterLayer
+
+    catalog = load_catalog(project_root)
+    known = {
+        os.path.normcase(os.path.abspath(r.get("project_path") or ""))
+        for r in catalog.get("timeslices", []) if r.get("project_path")
+    }
+    stamp = utc_now_iso()
+    seq = 0
+    for sub in sorted(os.listdir(base)):
+        folder = os.path.join(base, sub)
+        if not os.path.isdir(folder):
+            continue
+        new_records = []
+        for fname in sorted(os.listdir(folder)):
+            if os.path.splitext(fname)[1].lower() not in (".tif", ".tiff"):
+                continue
+            path = os.path.join(folder, fname)
+            if os.path.normcase(os.path.abspath(path)) in known:
+                continue
+            lyr = QgsRasterLayer(path, fname)
+            if not lyr.isValid():
+                continue
+            seq += 1
+            ext, crs = lyr.extent(), lyr.crs()
+            rec = {
+                "id": f"timeslice_{stamp}_{sub}_{seq:04d}_{fname}",
+                "name": os.path.splitext(fname)[0],
+                "normalized_name": fname,
+                "source_path": path,
+                "project_path": path,
+                "imported_at": stamp,
+                "is_valid_raster": True,
+                "crs": crs.authid() if crs.isValid() else None,
+                "width": lyr.width(), "height": lyr.height(),
+                "band_count": lyr.bandCount(),
+                "extent": {"xmin": ext.xMinimum(), "xmax": ext.xMaximum(),
+                           "ymin": ext.yMinimum(), "ymax": ext.yMaximum()},
+                "rescanned_from_folder": True,
+            }
+            try:
+                from .slice_manifest import depth_window_for_file
+                window = depth_window_for_file(path)
+                if window:
+                    rec["depth_from"], rec["depth_to"] = window
+                    rec["unit"] = "m"
+                else:
+                    depth = parse_depth_from_filename(fname) or {}
+                    for k in ("depth_from", "depth_to", "unit"):
+                        if depth.get(k) is not None:
+                            rec[k] = depth[k]
+            except Exception:
+                pass
+            new_records.append(rec)
+        if not new_records:
+            continue
+        register_timeslices_batch(project_root, new_records)
+        result["registered"] += len(new_records)
+        catalog = load_catalog(project_root)
+        group = next(
+            (g for g in catalog.get("raster_groups", [])
+             if group_folder_name(g.get("name")).lower() == sub.lower()),
+            None,
+        )
+        if group is None:
+            group, _created = create_raster_group(project_root, sub)
+        assign_timeslices_to_group(project_root, group.get("id"), [r["id"] for r in new_records])
+        try:
+            remove_timeslices_from_group(project_root, "grp_imported", [r["id"] for r in new_records])
+        except Exception:
+            pass
+        result["assigned"] += len(new_records)
+        result["groups"] += 1
+        known.update(os.path.normcase(os.path.abspath(r["project_path"])) for r in new_records)
+    return result
+
+
+def _move_raster_with_sidecars(old_path, new_path):
+    """Sposta un raster e i suoi file accanto (world file, .qml, .aux.xml, ...)."""
+    old_stem, _ = os.path.splitext(old_path)
+    new_stem, _ = os.path.splitext(new_path)
+    os.replace(old_path, new_path)
+    for sfx in _RASTER_SIDECAR_SUFFIXES + (".qml", ".grd"):
+        if sfx in (".aux.xml", ".ovr"):
+            src, dst = old_path + sfx, new_path + sfx
+        else:
+            src, dst = old_stem + sfx, new_stem + sfx
+        try:
+            if os.path.isfile(src) and not os.path.exists(dst):
+                os.replace(src, dst)
+        except Exception:
+            pass
+
+
+def move_timeslices_into_group_folder(project_root, group_name, timeslice_ids):
+    """Sposta in ``timeslices_2d/<gruppo>/`` le time-slice indicate e aggiorna
+    il catalogo (project_path). Ritorna ``{"moved": [(old, new)], "failed": [str]}``."""
+    data = load_catalog(project_root)
+    dest_dir = os.path.join(project_root, group_timeslice_subfolder(group_name))
+    wanted = {t for t in timeslice_ids if t}
+    moved, failed = [], []
+    for rec in data.get("timeslices", []):
+        if rec.get("id") not in wanted:
+            continue
+        old = str(rec.get("project_path") or "").strip()
+        if not old or not os.path.isfile(old):
+            failed.append(f"{os.path.basename(old) or rec.get('id')}: file mancante")
+            continue
+        try:
+            new = _unique_destination_path(dest_dir, os.path.basename(old))
+            _move_raster_with_sidecars(old, new)
+        except Exception as exc:
+            failed.append(f"{os.path.basename(old)}: {exc}")
+            continue
+        rec["project_path"] = new
+        rec["normalized_name"] = os.path.basename(new)
+        moved.append((old, new))
+    if moved:
+        save_catalog(project_root, data)
+    return {"moved": moved, "failed": failed}
+
+
 def find_matching_surfer_grid(reference_raster_path, extra_search_dirs=None):
     """
     Find a Surfer grid file with the same basename (stem) as the reference raster.

@@ -17,6 +17,7 @@ from .gpr_volume_mixin import GprVolumeMixin
 from .gpr_ogpr_volume_mixin import GprOgprVolumeMixin
 from .grid_workflow_mixin import GridWorkflowMixin
 from .ui_layout_mixin import UiLayoutMixin
+from .slice_amplitude_mixin import SliceAmplitudeMixin
 from .app_runtime_mixin import AppRuntimeMixin
 from .update_checker_mixin import UpdateCheckerMixin
 
@@ -71,6 +72,7 @@ class GeoSurveyStudioPlugin(
     GprOgprVolumeMixin,
     GridWorkflowMixin,
     UiLayoutMixin,
+    SliceAmplitudeMixin,
     TraceInfoMixin,
     TraceCaptureMixin,
     TraceBuild3DMixin,
@@ -203,25 +205,28 @@ class GeoSurveyStudioPlugin(
                 callback=self.open_gpr_profile_viewer,
                 parent=self.iface.mainWindow(),
             )
-            radar_icon = self._qgis_theme_icon("mIconRasterLayer.svg", "mIconRaster.svg")
-            if radar_icon is not None and not radar_icon.isNull():
-                self.gpr_viewer_action.setIcon(radar_icon)
+            viewer_icon_path = os.path.join(self.plugin_dir, "icon_profile_viewer.png")
+            if os.path.exists(viewer_icon_path):
+                self.gpr_viewer_action.setIcon(QIcon(viewer_icon_path))
+            else:
+                radar_icon = self._qgis_theme_icon("mIconRasterLayer.svg", "mIconRaster.svg")
+                if radar_icon is not None and not radar_icon.isNull():
+                    self.gpr_viewer_action.setIcon(radar_icon)
 
         # --- Radargrammi processati (pannello agganciabile) ---
         if _HAS_RADARGRAM_DOCK:
             self.radargram_dock_action = self.add_action(
                 icon_path,
-                text=self.tr(u'Radargrammi processati'),
+                text=self.tr(u'Radargram Editing'),
                 callback=self.open_radargram_dock,
                 parent=self.iface.mainWindow(),
             )
             self.radargram_dock_action.setToolTip(
-                "Pannello agganciabile con i radargrammi processati: profilo, canale e "
-                "profondità, senza il Profile Viewer."
+                "Radargram Editing: analisi e annotazione dei radargrammi processati."
             )
-            wave_icon = self._qgis_theme_icon("mActionAddRasterLayer.svg", "mIconRasterLayer.svg")
-            if wave_icon is not None and not wave_icon.isNull():
-                self.radargram_dock_action.setIcon(wave_icon)
+            editing_icon_path = os.path.join(self.plugin_dir, "icon_radargram_editing.png")
+            if os.path.exists(editing_icon_path):
+                self.radargram_dock_action.setIcon(QIcon(editing_icon_path))
 
         # --- Vista 3D profili GPR + ERT (finestra agganciabile) ---
         if _HAS_FENCE_DOCK:
@@ -232,12 +237,15 @@ class GeoSurveyStudioPlugin(
                 parent=self.iface.mainWindow(),
             )
             self.fence_dock_action.setToolTip(
-                "Vista 3D dei profili GPR e delle sezioni ERT come tende verticali lungo le loro linee "
-                "reali: i profili che si incrociano si vedono incrociati."
+                "Vista 3D di profili GPR, sezioni ERT e time-slice."
             )
-            cube_icon = self._qgis_theme_icon("3d.svg", "mActionNew3DMap.svg")
-            if cube_icon is not None and not cube_icon.isNull():
-                self.fence_dock_action.setIcon(cube_icon)
+            cube_icon_path = os.path.join(self.plugin_dir, "icon_profile_3d.png")
+            if os.path.exists(cube_icon_path):
+                self.fence_dock_action.setIcon(QIcon(cube_icon_path))
+            else:
+                cube_icon = self._qgis_theme_icon("3d.svg", "mActionNew3DMap.svg")
+                if cube_icon is not None and not cube_icon.isNull():
+                    self.fence_dock_action.setIcon(cube_icon)
 
         self.check_updates_action = self.add_action(
             icon_path,
@@ -546,7 +554,7 @@ class GeoSurveyStudioPlugin(
         """
         if not _HAS_RADARGRAM_DOCK:
             QMessageBox.warning(
-                self.iface.mainWindow(), "Radargrammi processati",
+                self.iface.mainWindow(), "Radargram Editing",
                 "Pannello non disponibile (componenti QGIS/matplotlib mancanti).")
             return None
         from qgis.PyQt.QtCore import Qt

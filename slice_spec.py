@@ -82,6 +82,11 @@ class SliceSpec:
     amp_scale: str = "linear"             # "linear" | "sqrt" | "db" (positive modes only)
     despeckle: int = 0                    # 0 | 3 | 5 (median filter on the finished slice)
     highpass_m: float = 0.0               # Gaussian sigma (m) of the local background to subtract (0 = off)
+    # --- grid boundary --------------------------------------------------
+    # Poligoni di ritaglio in coordinate mondo ([[ [x, y], ... ], ...]): le celle
+    # fuori da tutti i poligoni diventano NoData (toglie i "tendoni" dove i profili
+    # di andata/ritorno non finiscono alla stessa distanza). Vuoto = nessun limite.
+    clip_polygons: list = field(default_factory=list)
     # --- crs ------------------------------------------------------------
     crs_epsg: int | None = None
 
@@ -89,6 +94,14 @@ class SliceSpec:
     # validation
     # ------------------------------------------------------------------
     def validate(self) -> None:
+        # (autonomo: questo modulo viene caricato anche fuori dal pacchetto nei test)
+        for ring in self.clip_polygons or []:
+            try:
+                n_ok = sum(1 for p in ring if len(p) == 2 and all(abs(float(v)) < float("inf") for v in p))
+            except (TypeError, ValueError):
+                n_ok = 0
+            if n_ok < 3 or n_ok != len(ring):
+                raise SliceSpecError("clip_polygons: ogni poligono ha bisogno di almeno 3 vertici finiti")
         if self.amplitude_mode not in AMPLITUDE_MODES:
             raise SliceSpecError(
                 f"amplitude_mode {self.amplitude_mode!r} not in {AMPLITUDE_MODES}"
@@ -149,6 +162,10 @@ class SliceSpec:
             or self.amp_scale != "linear" or int(self.despeckle) > 0
             or float(self.highpass_m) > 0.0
         )
+
+    @property
+    def has_clip(self) -> bool:
+        return bool(self.clip_polygons)
 
     @property
     def grid_bg_spec(self) -> str:

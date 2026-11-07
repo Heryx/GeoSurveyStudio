@@ -414,6 +414,10 @@ class AppRuntimeMixin:
             QgsMessageLog.logMessage(
                 f"_bind_project_and_repair: {exc}", "GeoSurvey Studio", Qgis.Warning)
         self._repair_broken_group_layers_from_catalog()
+        try:
+            self._amp_reconcile_project_layers()
+        except Exception as exc:
+            QgsMessageLog.logMessage(f"Ampiezze: ripristino fallito: {exc}", "GeoSurvey Studio", Qgis.Warning)
 
     def _repair_broken_group_layers_from_catalog(self):
         """Repair raster layers with broken sources inside plugin layer-tree groups.

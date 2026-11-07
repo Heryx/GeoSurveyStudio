@@ -805,6 +805,10 @@ class TimesliceViewMixin:
             # Never render the preview finer than the final output; the
             # "Qualita' preview" combo only makes it coarser.
             res = max(float(res), float(preview_spec.resolution_m))
+            if self._clip_is_drawing() and preview_spec.clip_polygons:
+                # mentre si disegna il limite si vede la slice intera
+                from dataclasses import replace as _dc_replace
+                preview_spec = _dc_replace(preview_spec, clip_polygons=[])
 
         kwargs = {
             "channel": int(self._ch_idx),
@@ -1045,6 +1049,7 @@ class TimesliceViewMixin:
             self._slice_vline = None
             self._slice_hline = None
             self._update_slice_crosshair_overlay(draw=False)
+            self._draw_clip_artists()
             self._safe_draw_idle(self._canvas_slice)
             return
 
@@ -1217,10 +1222,14 @@ class TimesliceViewMixin:
                 self._slice_current_cmap = str(cmap)
 
         changed = self._update_slice_crosshair_overlay(draw=False)
+        if needs_full_redraw:
+            self._draw_clip_artists()
         if changed or needs_full_redraw:
             self._safe_draw_idle(self._canvas_slice)
 
     def _on_slice_press(self, event):
+        if self._clip_handle_press(event):
+            return  # strumento "Limite griglia" attivo: niente pan / puntatore
         if event is None or event.inaxes != self._ax_slice:
             return
         if int(getattr(event, "button", 0) or 0) != 1:
@@ -1254,6 +1263,8 @@ class TimesliceViewMixin:
             self._on_slice_click(float(event.xdata), float(event.ydata))
 
     def _on_slice_mouse_move(self, event):
+        if self._clip_handle_move(event):
+            return
         if event is None or event.inaxes != self._ax_slice:
             return
         if event.xdata is None or event.ydata is None:

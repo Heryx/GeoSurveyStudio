@@ -1066,6 +1066,8 @@ class Gpr3dViewerDialog(QDialog):
 
         try:
             from .gpr_processing import apply_pipeline, normalize_display
+            from .gpr_profile_gain import profile_gain_key, resolve_profile_params
+            params = resolve_profile_params(params, profile_gain_key(prof))
         except Exception:
             apply_pipeline = None
             normalize_display = None

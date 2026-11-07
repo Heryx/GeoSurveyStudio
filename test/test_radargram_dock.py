@@ -242,6 +242,15 @@ class DockTest(_DockBase):
 
     # -- profilo, canale ---------------------------------------------------------
 
+    def test_navigating_between_profiles_keeps_the_zoom(self):
+        d = self.dock
+        d.select_profile(0)
+        d._ax.set_xlim(1.0, 3.0)
+        d._ax.set_ylim(0.2, 0.05)
+        d.select_profile(1)
+        self.assertEqual(tuple(round(v, 6) for v in d._ax.get_xlim()), (1.0, 3.0))
+        self.assertEqual(tuple(round(v, 6) for v in d._ax.get_ylim()), (0.2, 0.05))
+
     def test_profile_and_channel_selection_load_once(self):
         d = self.dock
         loads = []
@@ -3007,8 +3016,8 @@ class FenceDockTest(_DockBase):
         self.iface.addDockWidget(Qt.RightDockWidgetArea, fence)
         fence.show()
         if not scrub:
-            for sc in fence._scrub.values():
-                sc.set_active(False)
+            for kind in fence._scrub:
+                fence.set_checked(kind, [])           # modo "Spuntati" e nessuna spunta: parte da zero
         self._pump(30)
         return fence
 
@@ -3061,7 +3070,7 @@ class FenceDockTest(_DockBase):
         self.fence._spin_depth.setValue(0.1)
         self.fence._chk_labels.setChecked(False)
         self._build(gpr=["Swath2"], ert=["T"])
-        self.assertNotIn("labels", self.fence._shown)
+        self.assertNotIn("legend", self.fence._shown)
         self.assertIn("ert::T", self.fence._shown)
 
     def test_ert_alone_and_gpr_alone(self):
@@ -3097,7 +3106,7 @@ class FenceDockTest(_DockBase):
         self._build(gpr=["Swath2"])
         self.fence.set_sources(["v3"])
         self.assertEqual([x["name"] for x in self.fence.checked_sources()], ["v3"])
-        self.assertEqual(self.fence.checked("gpr"), [])               # altra variante: le spunte ripartono
+        self.assertEqual(len(self.fence.checked("gpr")), 2)           # altra variante: i suoi profili partono spuntati
         self.assertEqual(self.fence._tree.topLevelItem(0).childCount(), 1)
         self.assertEqual(self.fence._tree.topLevelItem(0).child(0).childCount(), 2)
 
@@ -3375,11 +3384,477 @@ class FenceDockTest(_DockBase):
         self._slice_group()
         self.fence.cleanup()
         self.fence = self._make_fence(scrub=True, **kw)
+        for sc in self.fence._scrub.values():
+            sc.set_mode("one")                                      # i test dei cursori partono dal modo "Uno alla volta"
         return self.fence
 
     def _settle(self):
         self.fence._timer.stop()
         self.fence._rebuild()
+
+    def test_default_modes_open_one_radargram_not_the_whole_group(self):
+        self._slice_group()
+        self.fence.cleanup()
+        f = self.fence = self._make_fence(scrub=True)
+        self.assertEqual({k: sc.mode() for k, sc in f._scrub.items()}, {"gpr": "one", "ert": "all", "slice": "one"})
+        self._settle()
+        shown = sorted(f._shown)
+        self.assertEqual([k for k in shown if k.startswith("gpr::")], ["gpr::Swath2"])    # un solo radargramma
+        self.assertEqual([k for k in shown if k.startswith("slice::")], ["slice::a.tif"])
+        f._scrub["gpr"].set_mode("all")
+        self._settle()
+        self.assertEqual(len([k for k in f._shown if k.startswith("gpr::")]), 2)          # "Tutti" a richiesta
+        self.assertEqual(len(f.checked("gpr")), 2)                # l'elenco rispecchia la scena
+
+    def test_play_steps_through_the_items_and_wraps(self):
+        f = self._scrubbing()
+        sc = f._scrub["slice"]
+        self.assertEqual(sc.index(), 0)
+        sc.btn_play.setChecked(True)
+        self.assertTrue(sc.is_playing())
+        sc._play_tick()
+        self.assertEqual(sc.index(), 1)
+        sc._play_tick()                                           # oltre l'ultimo: ricomincia dal primo
+        self.assertEqual(sc.index(), 0)
+        sc.set_mode("all")                                        # anche in "Tutti" il cursore e la riproduzione ci sono
+        self.assertTrue(sc.is_playing())
+        self.assertFalse(sc.slider.isHidden())
+        sc.btn_play.setChecked(False)
+
+    def test_play_does_not_start_with_a_single_item(self):
+        f = self._scrubbing()
+        sc = f._scrub["ert"]                                      # una sola sezione ERT
+        sc.btn_play.setChecked(True)
+        self.assertFalse(sc.is_playing())
+
+    def test_names_are_a_legend_outside_the_model_not_labels_in_it(self):
+        f = self._scrubbing()
+        f._scrub["gpr"].set_mode("all")
+        self._settle()
+        self.assertIn("legend", f._shown)
+        self.assertNotIn("labels", f._shown)                      # niente etichette dentro la scena
+        text = f._legend_text([{"label": "Swath2"}, {"label": "Swath10"}], [{"name": "T"}],
+                              [{"z_from": 0.0, "z_to": 0.2}, {"z_from": 0.2, "z_to": 0.4}])
+        self.assertIn("Swath10", text)
+        self.assertIn("0.20–0.40 m", text)
+        many = f._legend_text([{"label": f"P{i}"} for i in range(30)], [], [{"z_from": i * 0.1, "z_to": i * 0.1 + 0.1} for i in range(20)])
+        self.assertIn("e altri 22", many)                         # le liste lunghe si riassumono
+        self.assertIn("da 0.00 a 2.00 m", many)
+
+    def test_double_click_in_the_list_isolates_the_item(self):
+        f = self._scrubbing()
+        f.apply_preset("Panoramica")
+        self._settle()
+        item = f._tree.topLevelItem(0).child(0).child(0)          # Swath2
+        f._on_tree_double_click(item, 0)
+        self.assertEqual(f._focus, "gpr::Swath2")
+        f._on_tree_double_click(item, 0)                          # secondo doppio clic: toglie l'isolamento
+        self.assertIsNone(f._focus)
+
+    def test_double_click_on_an_item_not_in_the_scene_says_so(self):
+        f = self._scrubbing()
+        f._set_ticks("gpr", False)
+        self._settle()
+        f._on_tree_double_click(f._tree.topLevelItem(0).child(0).child(0), 0)
+        self.assertIsNone(f._focus)
+        self.assertIn("non è nella scena", f._txt_cross.toPlainText())
+
+    def test_view_widget_double_click_event_reaches_the_picker(self):
+        from qgis.PyQt.QtCore import QEvent, QPoint, QPointF
+        from qgis.PyQt.QtGui import QMouseEvent
+        f = self._scrubbing()
+        calls = []
+        f._on_double_click = lambda pos: calls.append(pos)
+        ev = QMouseEvent(QEvent.MouseButtonDblClick, QPointF(10, 20), Qt.LeftButton, Qt.LeftButton, Qt.NoModifier)
+        f.eventFilter(f._view_widget, ev)
+        self.assertEqual(len(calls), 1)
+        self.assertAlmostEqual(calls[0][0], 10 * f._view_widget.devicePixelRatioF())
+
+    def test_export_image_writes_png_and_jpg(self):
+        f = self._scrubbing()
+        f.apply_preset("Panoramica")
+        self._settle()
+        folder = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        png = f.export_image(os.path.join(folder, "scena.png"))
+        jpg = f.export_image(os.path.join(folder, "scena.jpg"))
+        noext = f.export_image(os.path.join(folder, "scena2"))
+        self.assertTrue(png.endswith(".png") and os.path.getsize(png) > 500)
+        self.assertTrue(jpg.endswith(".jpg") and os.path.getsize(jpg) > 500)
+        self.assertTrue(noext.endswith(".png") and os.path.exists(noext))
+        with open(jpg, "rb") as fh:
+            self.assertEqual(fh.read(2), b"\xff\xd8")             # JPEG vero, non un PNG rinominato
+
+    def _kml_scene(self):
+        f = self._scrubbing()
+        f.apply_preset("Panoramica")
+        f._set_ticks("slice", True)
+        f._scrub["slice"].set_mode("all")
+        self._settle()
+        return f
+
+    def test_export_kml_writes_lines_and_a_georeferenced_overlay(self):
+        f = self._kml_scene()
+        folder = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        path = os.path.join(folder, "scena.kml")
+        n = f.export_kml(path)
+        self.assertEqual(n["ert"], 1)
+        self.assertGreaterEqual(n["gpr"], 1)
+        self.assertGreaterEqual(n["slice"], 2)
+        import xml.etree.ElementTree as ET
+        root = ET.parse(path).getroot()
+        ns = {"k": "http://www.opengis.net/kml/2.2", "gx": "http://www.google.com/kml/ext/2.2"}
+        self.assertTrue(root.findall(".//k:Placemark/k:name", ns))
+        quads = root.findall(".//gx:LatLonQuad/k:coordinates", ns)
+        self.assertEqual(len(quads), n["slice"])
+        lon, lat = [float(v) for v in quads[0].text.split()[0].split(",")[:2]]
+        self.assertTrue(-180 <= lon <= 180 and -90 <= lat <= 90)    # coordinate in gradi, non metri UTM
+        images = [e.text for e in root.findall(".//k:Icon/k:href", ns)]
+        for rel in images:
+            self.assertTrue(os.path.exists(os.path.join(folder, rel)))
+
+    def test_export_kmz_packs_the_overlay_images(self):
+        import zipfile
+        f = self._kml_scene()
+        folder = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        path = os.path.join(folder, "scena.kmz")
+        n = f.export_kml(path)
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+        self.assertIn("doc.kml", names)
+        self.assertEqual(len([x for x in names if x.endswith(".png")]), n["slice"])
+
+    def test_export_kml_refuses_an_empty_scene(self):
+        f = self._scrubbing()
+        for kind in f._scrub:
+            f._set_ticks(kind, False)
+        self._settle()
+        folder = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        with self.assertRaises(ValueError):
+            f.export_kml(os.path.join(folder, "x.kmz"))
+
+
+    def test_builtin_preset_sets_modes_and_parameters_together(self):
+        f = self._scrubbing()
+        self.assertTrue(f.apply_preset("Panoramica"))
+        self.assertEqual({k: sc.mode() for k, sc in f._scrub.items()}, {"gpr": "all", "ert": "all", "slice": "one"})
+        self.assertEqual(f._leaves("slice"), [])                  # Panoramica nasconde le time-slice (spunte tolte)
+        self._settle()
+        self.assertEqual(len([k for k in f._shown if k.startswith("gpr::")]), 2)
+        self.assertEqual([k for k in f._shown if k.startswith("slice::")], [])
+        f.apply_preset("Solo time-slice")
+        self._settle()
+        self.assertEqual([k for k in f._shown if k.startswith(("gpr::", "ert::"))], [])
+        self.assertTrue([k for k in f._shown if k.startswith("slice::")])
+        self.assertFalse(f.apply_preset("non esiste"))
+
+    def test_user_preset_roundtrip_and_delete(self):
+        from qgis.PyQt.QtCore import QSettings
+        self.addCleanup(lambda: QSettings().remove(_FD._PRESET_KEY))
+        QSettings().remove(_FD._PRESET_KEY)
+        f = self._scrubbing()
+        f._spin_depth.setValue(0.3)
+        f._spin_ve.setValue(4.0)
+        f._set_ticks("gpr", False)
+        self.assertTrue(f.save_preset("Mia"))
+        self.assertFalse(f.save_preset("Panoramica"))                 # i nomi predefiniti non si sovrascrivono
+        self.assertFalse(f.save_preset("  "))
+        f.apply_preset("Panoramica")
+        f._spin_ve.setValue(1.0)
+        self.assertEqual(f.user_presets(), ["Mia"])
+        f.apply_preset("Mia")
+        self.assertEqual(f._leaves("gpr"), [])                      # la scena salvata nascondeva i profili GPR
+        self.assertAlmostEqual(f._spin_depth.value(), 0.3)
+        self.assertAlmostEqual(f._spin_ve.value(), 4.0)
+        labels = [a.text() for a in f._preset_menu.actions() if a.text()]
+        f._fill_preset_menu()
+        labels = [a.text() for a in f._preset_menu.actions() if a.text()]
+        self.assertIn("Mia", labels)
+        self.assertIn("Salva la scena attuale…", labels)
+        f.delete_preset("Mia")
+        self.assertEqual(f.user_presets(), [])
+
+    def test_focus_isolates_one_item_and_dims_the_others(self):
+        f = self._scrubbing()
+        f.apply_preset("Panoramica")
+        self._settle()
+        pl = f._plotter
+        f.focus_actor("gpr::Swath2")
+        self.assertAlmostEqual(pl.renderer.actors["gpr::Swath2"].prop.opacity, 1.0)
+        self.assertLess(pl.renderer.actors["gpr::Swath10"].prop.opacity, 0.2)
+        self.assertLess(pl.renderer.actors["ert::T"].prop.opacity, 0.2)
+        self.assertIn("focus", f._shown)
+        self._settle()                                            # una ricostruzione mantiene l'isolamento
+        self.assertEqual(f._focus, "gpr::Swath2")
+        self.assertLess(pl.renderer.actors["gpr::Swath10"].prop.opacity, 0.2)
+        f.focus_actor(None)
+        self.assertAlmostEqual(pl.renderer.actors["gpr::Swath10"].prop.opacity, 1.0)
+        self.assertNotIn("focus", f._shown)
+
+    def test_focus_is_dropped_when_the_item_leaves_the_scene(self):
+        f = self._scrubbing()
+        f.apply_preset("Panoramica")
+        self._settle()
+        f.focus_actor("gpr::Swath2")
+        f._set_ticks("gpr", False)
+        self._settle()
+        self.assertIsNone(f._focus)
+        self.assertNotIn("focus", f._shown)
+        f.focus_actor("gpr::inesistente")
+        self.assertIsNone(f._focus)
+
+    def test_picked_actor_is_mapped_to_its_name(self):
+        f = self._scrubbing()
+        f.apply_preset("Panoramica")
+        self._settle()
+        actor = f._plotter.renderer.actors["ert::T"]
+        self.assertEqual(f._name_of_actor(actor), "ert::T")
+        self.assertIsNone(f._name_of_actor(object()))
+
+    def test_slice_group_flag_survives_a_refresh(self):
+        f = self._scrubbing()
+        f._tree.topLevelItem(2).child(0).setCheckState(0, Qt.Checked)
+        f.refresh_lists()
+        self.assertEqual(f._tree.topLevelItem(2).child(0).checkState(0), Qt.Checked)
+
+    def test_only_two_modes_are_offered(self):
+        sc = self.fence._scrub["gpr"]
+        self.assertEqual([sc.cb_mode.itemText(i) for i in range(sc.cb_mode.count())], ["Tutti", "Uno alla volta"])
+
+    def test_everything_starts_ticked_and_ticks_are_remembered(self):
+        f = self._scrubbing()
+        self.assertEqual(len(f._leaves("gpr")), 2)
+        self.assertEqual(len(f._leaves("slice")), 2)
+        f._tree.topLevelItem(0).child(0).child(0).setCheckState(0, Qt.Unchecked)       # Swath2 fuori
+        f.refresh_lists()
+        self.assertEqual([it.text(0) for it in f._leaves("gpr")], ["Swath10"])         # la scelta resta
+        f.set_sources(["v3"])
+        f.set_sources(["Lavoro"])                                                      # sorgente tolta e rimessa
+        self.assertEqual([it.text(0) for it in f._leaves("gpr")], ["Swath10"])
+
+    def test_cursor_scrolls_only_over_ticked_items(self):
+        f = self._two_sources()
+        sc = f._scrub["gpr"]
+        self.assertEqual(sc.count(), 22)                                               # 2 + 20 profili spuntati
+        molti = next(f._tree.topLevelItem(0).child(i) for i in range(2) if f._tree.topLevelItem(0).child(i).childCount() == 20)
+        molti.setCheckState(0, Qt.Unchecked)                                           # flag del gruppo
+        self.assertEqual(sc.count(), 2)
+        self.assertIn("(1/2)", sc.lbl.text())
+        sc.slider.setValue(1)
+        self._settle()
+        self.assertEqual([k for k in f._shown if k.startswith("gpr::")], ["gpr::Swath10"])
+
+    def test_group_flag_chooses_which_slices_the_cursor_runs_over(self):
+        self._slice_group()
+        self._slice_group(group="altro", variant="v3",
+                          slices=(("p.tif", 0.0, 0.1), ("q.tif", 0.1, 0.2), ("r.tif", 0.2, 0.3)))
+        self.fence.cleanup()
+        f = self.fence = self._make_fence(scrub=True)
+        sc = f._scrub["slice"]
+        self.assertEqual(sc.count(), 5)
+        groups = {f._tree.topLevelItem(2).child(i).text(0).split("  (")[0]: f._tree.topLevelItem(2).child(i)
+                  for i in range(2)}
+        groups["gpr_slices"].setCheckState(0, Qt.Unchecked)
+        self.assertEqual(sc.count(), 3)
+        self._settle()
+        self.assertEqual([k for k in f._shown if k.startswith("slice::")], ["slice::p.tif"])
+        groups["gpr_slices"].setCheckState(0, Qt.Checked)
+        groups["altro"].setCheckState(0, Qt.Unchecked)
+        self.assertEqual(sc.count(), 2)
+
+    def test_unticking_one_item_in_all_mode_hides_only_it(self):
+        f = self._scrubbing()
+        f._scrub["gpr"].set_mode("all")
+        self._settle()
+        f._tree.topLevelItem(0).child(0).child(0).setCheckState(0, Qt.Unchecked)       # tutti tranne Swath2
+        self._settle()
+        self.assertEqual([k for k in f._shown if k.startswith("gpr::")], ["gpr::Swath10"])
+
+    def test_category_header_hides_and_shows_the_whole_category(self):
+        f = self._scrubbing()
+        header = f._tree.topLevelItem(2)                                               # Time-slice
+        self.assertTrue(header.flags() & Qt.ItemIsUserCheckable)
+        header.setCheckState(0, Qt.Unchecked)
+        self.assertEqual(f._leaves("slice"), [])
+        self.assertIn("nessuna spuntata", f._scrub["slice"].lbl.text())
+        self._settle()
+        self.assertEqual([k for k in f._shown if k.startswith("slice::")], [])
+        header.setCheckState(0, Qt.Checked)
+        self.assertEqual(len(f._leaves("slice")), 2)
+
+    def test_group_flag_ticks_and_unticks_all_its_slices(self):
+        f = self._scrubbing()
+        f._scrub["slice"].set_mode("all")
+        group = f._tree.topLevelItem(2).child(0)
+        self.assertTrue(group.flags() & Qt.ItemIsUserCheckable)
+        self.assertEqual(group.checkState(0), Qt.Checked)
+        group.setCheckState(0, Qt.Unchecked)
+        self.assertEqual(f.checked("slice"), [])
+        group.setCheckState(0, Qt.Checked)
+        self._settle()
+        self.assertEqual(sorted(k for k in f._shown if k.startswith("slice::")), ["slice::a.tif", "slice::b.tif"])
+        group.child(0).setCheckState(0, Qt.Unchecked)                                  # una sola tolta: gruppo parziale
+        self.assertEqual(group.checkState(0), Qt.PartiallyChecked)
+
+    def test_scene_is_not_empty_when_no_zone_is_active(self):
+        other = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(other, ignore_errors=True))
+        _write_variant(other, "Solo", ["Alfa"])
+        zones = [{"name": "Zona1", "base": self.root, "active": False},
+                 {"name": "Zona2", "base": other, "active": False}]
+        fence = self._make_fence(scrub=True, zones_provider=lambda: zones)
+        try:
+            self.assertEqual([x["name"] for x in fence.checked_sources()], ["Lavoro"])     # la prima area con dati
+            self.assertGreater(len(fence._leaves("gpr")), 0)
+        finally:
+            fence.cleanup()
+
+    def test_fullscreen_detaches_and_maximizes_then_restores(self):
+        f = self.fence
+        f.setFloating(False)
+        f._act_full.setChecked(True)
+        self.assertTrue(f.isFloating())
+        self.assertTrue(f.windowState() & Qt.WindowMaximized)
+        f._act_full.setChecked(False)
+        self.assertFalse(f.windowState() & Qt.WindowMaximized)
+        self.assertFalse(f.isFloating())                           # era agganciata: ci torna
+        f.toggle_fullscreen()
+        self.assertTrue(f._act_full.isChecked())
+        f.toggle_fullscreen()
+        self.assertFalse(f._act_full.isChecked())
+
+    def test_view_keeps_the_room_and_the_cursors_stay_compact(self):
+        f = self.fence
+        f.setFloating(True)
+        f.resize(1500, 800)
+        self._pump(60)
+        view_h = f._view_widget.height()
+        self.assertGreater(view_h, 400)                            # la vista 3D prende lo spazio
+        for sc in f._scrub.values():
+            self.assertLess(sc.height(), 120)                      # i cursori non si allargano
+
+    def test_slider_stays_in_all_mode_and_builds_the_sequence(self):
+        f = self._scrubbing()
+        sc = f._scrub["slice"]
+        sc.set_mode("all")
+        self.assertFalse(sc.slider.isHidden())                    # lo slider non sparisce
+        self.assertEqual(sc.index(), sc.slider.maximum())         # in fondo = tutte insieme
+        self._settle()
+        self.assertEqual(sorted(k for k in f._shown if k.startswith("slice::")), ["slice::a.tif", "slice::b.tif"])
+        self.assertIn("tutte", sc.lbl.text())
+        sc.slider.setValue(0)                                     # indietro: spariscono le ultime
+        self._settle()
+        self.assertEqual([k for k in f._shown if k.startswith("slice::")], ["slice::a.tif"])
+        self.assertIn("dal primo", sc.lbl.text())
+        sc.slider.setValue(1)
+        self._settle()
+        self.assertEqual(len([k for k in f._shown if k.startswith("slice::")]), 2)
+        sc.set_mode("one")
+        sc.set_mode("all")                                        # tornando a "Tutti" si rivedono tutte
+        self.assertEqual(sc.index(), sc.slider.maximum())
+
+    def test_all_mode_follows_the_end_when_ticks_change(self):
+        f = self._scrubbing()
+        sc = f._scrub["gpr"]
+        sc.set_mode("all")
+        f._tree.topLevelItem(0).child(0).child(0).setCheckState(0, Qt.Unchecked)
+        self.assertEqual(sc.index(), sc.slider.maximum())         # un'esclusa non lascia il cursore a meta'
+        f._tree.topLevelItem(0).child(0).child(0).setCheckState(0, Qt.Checked)
+        self.assertEqual(sc.index(), sc.slider.maximum())
+        self.assertEqual(sc.count(), 2)
+
+    def test_toolbar_has_visible_export_fullscreen_and_close_buttons(self):
+        from qgis.PyQt.QtWidgets import QToolButton
+        f = self.fence
+        acts = {b.defaultAction() for b in f.findChildren(QToolButton) if b.defaultAction() is not None}
+        for a in (f._act_img, f._act_kml, f._act_full, f._act_close):
+            self.assertIn(a, acts)                                # ognuna ha il suo pulsante nella barra
+            self.assertFalse(a.icon().isNull())
+        self.assertIn("PNG", f._act_img.text())
+        self.assertIn("KML", f._act_kml.text())
+        shown = []
+        f._ask_export_image = lambda: shown.append("img")
+        f._act_img.trigger()
+        self.assertEqual(shown, ["img"])
+
+    def test_close_button_closes_the_dock_and_leaves_fullscreen(self):
+        f = self.fence
+        f._act_full.setChecked(True)
+        f._act_close.trigger()
+        self.assertFalse(f._act_full.isChecked())
+        self.assertIsNone(f._plotter)                             # chiusa: la vista 3D e' rilasciata
+
+    def test_rebuild_keeps_unchanged_actors_and_only_builds_the_new_ones(self):
+        f = self._scrubbing()
+        f._scrub["gpr"].set_mode("all")
+        f._scrub["gpr"].slider.setValue(0)                        # tutti dal primo fino al cursore: solo Swath2
+        self._settle()
+        pl = f._plotter
+        first = pl.renderer.actors["gpr::Swath2"]
+        f._scrub["gpr"].slider.setValue(1)                        # si aggiunge Swath10
+        self._settle()
+        self.assertIs(pl.renderer.actors["gpr::Swath2"], first)   # lo stesso attore: non e' stato rifatto
+        self.assertIn("gpr::Swath10", f._shown)
+        f._spin_gain.setValue(3.0)                                # cambia un parametro: si rifanno
+        self._settle()
+        self.assertIsNot(pl.renderer.actors["gpr::Swath2"], first)
+
+    def test_rebuild_removes_what_is_no_longer_wanted(self):
+        f = self._scrubbing()
+        f._scrub["gpr"].set_mode("all")
+        self._settle()
+        self.assertIn("gpr::Swath10", f._shown)
+        f._tree.topLevelItem(0).child(0).child(1).setCheckState(0, Qt.Unchecked)
+        self._settle()
+        self.assertNotIn("gpr::Swath10", f._shown)
+        self.assertNotIn("gpr::Swath10", f._plotter.renderer.actors)
+        self.assertNotIn("gpr::Swath10", f._sig)
+
+    def test_kept_slice_can_still_be_exported_to_kml(self):
+        f = self._kml_scene()
+        self._settle()                                            # seconda ricostruzione: le slice restano in scena
+        folder = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        n = f.export_kml(os.path.join(folder, "s.kmz"))
+        self.assertGreaterEqual(n["slice"], 2)
+
+    def test_reopening_does_not_rescan_every_time(self):
+        f = self.fence
+        calls = []
+        orig = f.refresh_variants
+        f.refresh_variants = lambda *a: calls.append(1) or orig(*a)
+        f.hide()
+        f.show()
+        self.assertEqual(calls, [])                               # appena letto: niente nuova scansione
+        f._last_refresh -= 10_000
+        f.hide()
+        f.show()
+        self.assertEqual(calls, [1])                              # dopo un po' si rilegge
+
+    def test_many_slices_use_lighter_planes(self):
+        f = self._scrubbing()
+        sizes = []
+        orig = f._slice_item
+        f._slice_item = lambda path, max_px=None: (sizes.append(max_px), orig(path, max_px))[1]
+        f._scrub["slice"].set_mode("one")
+        self._settle()
+        self.assertEqual(sizes[-1], _FD.MAX_PLANE_PX)             # una slice: piena risoluzione
+        sizes.clear()
+        monkey = _FD._MANY_SLICES
+        _FD._MANY_SLICES = 1
+        self.addCleanup(lambda: setattr(_FD, "_MANY_SLICES", monkey))
+        f._scrub["slice"].set_mode("all")
+        self._settle()
+        self.assertTrue(sizes and all(s == _FD._MANY_SLICES_PX for s in sizes))
+
+    def test_scene_parameters_live_in_the_view_menu(self):
+        f = self.fence
+        self.assertFalse(f._tabs.widget(1).isAncestorOf(f._spin_depth))
+        self.assertFalse(f._tabs.widget(1).isAncestorOf(f._spin_ve))
+        self.assertTrue(f._spin_depth.parent() is not None)
 
     def test_scrubbers_are_active_by_default_and_show_one_item_each(self):
         f = self._scrubbing()
@@ -3428,17 +3903,6 @@ class FenceDockTest(_DockBase):
         self.assertEqual(sorted(k for k in f._shown if "::" in k and not k.startswith("x::")),
                          ["ert::T", "gpr::Swath10", "slice::b.tif"])
 
-    def test_ticking_the_tree_turns_that_slider_off_only(self):
-        f = self._scrubbing()
-        gpr = f._tree.topLevelItem(0).child(0)
-        gpr.child(1).setCheckState(0, Qt.Checked)                  # a mano: voglio proprio questo
-        self.assertFalse(f._scrub["gpr"].is_active())
-        self.assertTrue(f._scrub["ert"].is_active())
-        self.assertTrue(f._scrub["slice"].is_active())
-        self._settle()
-        self.assertIn("gpr::Swath10", f._shown)
-        self.assertNotIn("gpr::Swath2", f._shown)
-
     def test_switching_the_slider_off_returns_to_the_ticked_items(self):
         f = self._scrubbing()
         f.set_checked("gpr", ["Swath10"])                          # spegne anche il cursore
@@ -3473,7 +3937,7 @@ class FenceDockTest(_DockBase):
         g = _G.ErtGeoref.from_endpoints((500002.0, -20.0), (500002.0, 20.0), 40.0, "EPSG:32632")
         _S.save_ert(self.root, "T9", csv, g)
         self.fence.refresh_variants()
-        self.assertTrue(self.fence._scrub["ert"].is_active())
+        self.assertEqual(self.fence._scrub["ert"].mode(), "all")
         self._settle()
         self.assertIn("ert::T9", self.fence._shown)
 
@@ -3573,69 +4037,6 @@ class FenceDockTest(_DockBase):
         self.assertEqual(len(curtains), 2)
         self.assertTrue(all("Swath2" in k and "(" in k for k in curtains))     # distinti dalla sorgente
 
-    def test_scope_selector_appears_only_with_several_groups(self):
-        self.assertTrue(self.fence._scrub["gpr"].cb_scope.isHidden())
-        f = self._two_sources()
-        self.assertFalse(f._scrub["gpr"].cb_scope.isHidden())
-        self.assertEqual(f._scrub["gpr"].cb_scope.count(), 2)
-        self.assertTrue(f._scrub["ert"].cb_scope.isHidden())                   # l'ERT e' un solo gruppo
-
-    def test_gpr_slider_stays_inside_the_chosen_group(self):
-        f = self._two_sources()
-        sc = f._scrub["gpr"]
-        sizes = {}
-        for i in range(sc.cb_scope.count()):
-            sc.cb_scope.setCurrentIndex(i)
-            sizes[sc.cb_scope.currentText().split("  (")[0]] = sc.count()
-        self.assertEqual(sizes, {"Lavoro": 2, "Molti": 20})                   # niente piu' 22 elementi in fila
-        sc.cb_scope.setCurrentIndex(sc.cb_scope.findText("Lavoro", Qt.MatchStartsWith))
-        sc.slider.setValue(sc.slider.maximum())                                # in fondo al gruppo...
-        f._timer.stop()
-        f._rebuild()
-        shown = [k for k in f._shown if k.startswith("gpr::")]
-        self.assertEqual(len(shown), 1)
-        self.assertIn("Swath10", shown[0])                                     # ...resta nello stesso gruppo
-        sc.btn_next.click()
-        self.assertEqual(sc.index(), sc.count() - 1)
-
-    def test_changing_group_restarts_from_its_first_profile_and_names_it(self):
-        f = self._two_sources()
-        sc = f._scrub["gpr"]
-        sc.cb_scope.setCurrentIndex(sc.cb_scope.findText("Molti", Qt.MatchStartsWith))
-        sc.slider.setValue(5)
-        sc.cb_scope.setCurrentIndex(sc.cb_scope.findText("Lavoro", Qt.MatchStartsWith))
-        self.assertEqual(sc.index(), 0)
-        self.assertIn("Lavoro", sc.lbl.text())
-        self.assertIn("(1/2)", sc.lbl.text())
-        f._timer.stop()
-        f._rebuild()
-        self.assertEqual([k for k in f._shown if k.startswith("gpr::")], ["gpr::Swath2"])
-
-    def test_chosen_group_is_kept_when_lists_are_refreshed(self):
-        f = self._two_sources()
-        sc = f._scrub["gpr"]
-        sc.cb_scope.setCurrentIndex(sc.cb_scope.findText("Molti", Qt.MatchStartsWith))
-        f.refresh_variants()
-        self.assertTrue(sc.cb_scope.currentText().startswith("Molti"))
-
-    def test_slice_slider_scrolls_inside_one_group_at_a_time(self):
-        self._slice_group()                                                    # gpr_slices: 2 slice
-        self._slice_group(group="altro", variant="v3",
-                          slices=(("p.tif", 0.0, 0.1), ("q.tif", 0.1, 0.2), ("r.tif", 0.2, 0.3)))
-        self.fence.cleanup()
-        self.fence = self._make_fence(scrub=True)
-        sc = self.fence._scrub["slice"]
-        self.assertFalse(sc.cb_scope.isHidden())
-        counts = {}
-        for i in range(sc.cb_scope.count()):
-            sc.cb_scope.setCurrentIndex(i)
-            counts[sc.cb_scope.currentText().split("  (")[0]] = sc.count()
-        self.assertEqual(counts, {"altro": 3, "gpr_slices": 2})
-        sc.cb_scope.setCurrentIndex(sc.cb_scope.findText("altro", Qt.MatchStartsWith))
-        self.fence._timer.stop()
-        self.fence._rebuild()
-        self.assertEqual([k for k in self.fence._shown if k.startswith("slice::")], ["slice::p.tif"])
-
     def test_removing_a_source_drops_its_group_and_its_store(self):
         f = self._two_sources()
         self.assertEqual(len(f._stores), 2)
@@ -3650,7 +4051,9 @@ class FenceDockTest(_DockBase):
                 it.setCheckState(0, Qt.Checked)
         self.assertEqual(sorted(x["name"] for x in self.fence.checked_sources()), ["Lavoro", "v3"])
         self.assertEqual(self.fence._tree.topLevelItem(0).childCount(), 2)
-        self.assertEqual([t for t, _ in self.fence.checked("gpr")], ["Swath10"])      # solo quello del gruppo Lavoro
+        lavoro = self.fence._tree.topLevelItem(0).child(0)
+        self.assertEqual([lavoro.child(i).text(0) for i in range(lavoro.childCount())
+                          if lavoro.child(i).checkState(0) == Qt.Checked], ["Swath10"])   # la scelta di Lavoro resta
 
     def test_unchecking_every_source_is_respected_after_a_refresh(self):
         self.fence.set_sources([])

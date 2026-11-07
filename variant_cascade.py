@@ -43,6 +43,55 @@ def _is_within_root(path: str, root: str) -> bool:
     return p == r or p.startswith(r + os.sep)
 
 
+def rename_variant(processed_root: str, old: str, new: str) -> str:
+    """Rinomina la variante ``old`` in ``new``: cartella ``processed/<old>/``,
+    ``name`` in variant.json e nodo (e riferimenti ``parent`` dei figli) nel
+    grafo di provenienza. Le time-slice gia' generate non si toccano (layer e
+    catalogo puntano ai loro percorsi). Ritorna '' se ok, altrimenti il
+    messaggio d'errore."""
+    old, new = str(old or "").strip(), str(new or "").strip()
+    if not old or not new:
+        return "Nome vuoto."
+    if new == old:
+        return ""
+    if new.lower() == "raw" or any(c in new for c in '\\/:*?"<>|') or new in (".", ".."):
+        return "Nome non valido (caratteri vietati o riservato)."
+    src = os.path.join(processed_root, old)
+    dst = os.path.join(processed_root, new)
+    if not os.path.isdir(src):
+        return f"Cartella della variante '{old}' non trovata."
+    if os.path.exists(dst) and os.path.normcase(dst) != os.path.normcase(src):
+        return f"Esiste gia' una variante chiamata '{new}'."
+    try:
+        os.rename(src, dst)
+    except OSError as exc:
+        return f"Impossibile rinominare la cartella (file in uso?): {exc}"
+
+    try:
+        import json
+        mpath = os.path.join(dst, "variant.json")
+        if os.path.isfile(mpath):
+            with open(mpath, "r", encoding="utf-8") as fh:
+                man = json.load(fh)
+            if isinstance(man, dict):
+                man["name"] = new
+                with open(mpath, "w", encoding="utf-8") as fh:
+                    json.dump(man, fh, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    try:
+        entries = variant_provenance.load(processed_root)
+        if old in entries:
+            entries = {(new if n == old else n): m for n, m in entries.items()}
+            for m in entries.values():
+                if m.get("parent") == old:
+                    m["parent"] = new
+            variant_provenance.save(processed_root, entries)
+    except Exception:
+        pass
+    return ""
+
+
 def list_descendants(entries: dict, name: str) -> list:
     """Discendenti (figli, nipoti, ...) di ``name`` nel grafo ``entries``
     (formato di ``variant_provenance.load()``). A differenza di

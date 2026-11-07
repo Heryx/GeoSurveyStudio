@@ -472,6 +472,12 @@ def compute_grids(
     reach = float(rspec.search_radius_m or (res * 5.0))
     sigma_cells = 1.0
 
+    clip_mask = None
+    if rspec.clip_polygons:
+        from .slice_clip import polygons_mask
+
+        clip_mask = polygons_mask(rspec.clip_polygons, x_min, y_min, n_x, n_y, res)
+
     grids: list[dict] = []
     t_grid = 0.0
     total = len(windows)
@@ -494,6 +500,11 @@ def compute_grids(
         )
         keep = np.isfinite(grid)
         grid = finish_grid(grid, rspec, res)
+        if clip_mask is not None:
+            # il ritaglio e' l'ultimo passo: filtri e background hanno visto i
+            # dati interi, cosi' il bordo tagliato non altera i valori dentro
+            grid = np.where(clip_mask, grid, np.nan).astype(np.float32, copy=False)
+            keep &= clip_mask
         t_grid += perf_counter() - t0
 
         n_valid = int(np.count_nonzero(keep))
@@ -535,7 +546,7 @@ def compute_grids(
         stack_n=1, stack_kernel="boxcar", flip_traces_mode="none",
         topographic_correction=False, topo_reference_mode="median", topo_reference_elevation=None,
         parallel_profiles=False, profile_workers_used=1, bounds_margin_m=float(margin),
-        slice_spec=rspec.to_dict(), engine="bin",
+        slice_spec=rspec.to_dict(), engine="bin", clip_applied=clip_mask is not None,
         **diag,
     )
     if grids:

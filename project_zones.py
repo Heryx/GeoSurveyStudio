@@ -190,6 +190,26 @@ def add_zone(root: str, name: str, make_active: bool = True) -> str:
     return final
 
 
+def rename_zone(root: str, old: str, new: str) -> str:
+    """Rinomina l'area ``old`` in ``new`` (solo l'etichetta: la cartella su
+    disco resta la stessa, cosi' nessun file viene spostato). Ritorna il nome
+    effettivo, o '' se non possibile (area inesistente, nome vuoto o gia' usato
+    da un'altra area)."""
+    new = str(new or "").strip()
+    state = read_state(root)
+    if old not in state["zones"] or not new:
+        return ""
+    if new == old:
+        return old
+    if any(n.casefold() == new.casefold() for n in state["zones"] if n != old):
+        return ""
+    # stesso ordine di prima: si ricostruisce il dict sostituendo la chiave
+    state["zones"] = {(new if n == old else n): p for n, p in state["zones"].items()}
+    if state["active_zone"] == old:
+        state["active_zone"] = new
+    return new if write_state(root, state) else ""
+
+
 def set_active_zone(root: str, zone: str) -> bool:
     state = read_state(root)
     if zone not in state["zones"]:

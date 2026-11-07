@@ -2008,6 +2008,7 @@ DEFAULT_PIPELINE = {
     "pre_agc_surface_gain": 1.0,
     "pre_agc_deep_gain":    1.0,
     "pre_agc_breakpoints":  None,         # [[x(0..1), gain], ...]
+    "pre_agc_interp":       "linear",     # tra i punti: "linear" (guadagno) o "log" (dB, esponenziale)
     "agc":                  True,
     "agc_win":              128,
     "agc_sample_start":     0,            # 0 = dall'inizio; >0 = lascia invariati i primi N campioni
@@ -2230,7 +2231,8 @@ def _step_fingerprint(
     elif step == "pre_agc_gain":
         return (
             "pre_agc_gain", bool(p.get("pre_agc_gain")), float(p.get("pre_agc_surface_gain", 1.0)),
-            float(p.get("pre_agc_deep_gain", 1.0)), str(p.get("pre_agc_breakpoints")), input_shape
+            float(p.get("pre_agc_deep_gain", 1.0)), str(p.get("pre_agc_breakpoints")),
+            str(p.get("pre_agc_interp", "linear")), input_shape
         )
     elif step == "agc":
         return (
@@ -2371,7 +2373,12 @@ def _build_pre_agc_gain(n_samples: int, p: dict) -> np.ndarray:
     g1 = max(float(p.get("pre_agc_deep_gain", 1.0) or 1.0), 0.0)
     t = np.linspace(0.0, 1.0, n, dtype=np.float64)
     pts = _sanitize_gain_breakpoints(p.get("pre_agc_breakpoints"))
-    if pts.shape[0] >= 2:
+    if pts.shape[0] >= 2 and str(p.get("pre_agc_interp", "linear")) == "log":
+        # Interpolazione in dB: tra due punti il guadagno cresce/cala in modo
+        # esponenziale, senza i "gradini" che l'interpolazione lineare crea
+        # quando i valori coprono piu' decadi.
+        g = np.exp(np.interp(t, pts[:, 0], np.log(np.maximum(pts[:, 1], 1e-6))))
+    elif pts.shape[0] >= 2:
         g = np.interp(t, pts[:, 0], pts[:, 1])
     else:
         g = g0 + (g1 - g0) * t

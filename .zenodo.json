@@ -1,0 +1,14 @@
+{
+  "title": "GeoSurvey Studio",
+  "upload_type": "software",
+  "version": "1.2.0",
+  "license": "GPL-2.0-or-later",
+  "description": "QGIS plugin for the management, processing and 3D visualisation of GPR (ground-penetrating radar) profiles, time-slices and ERT sections, with oriented survey grids generated from drawn areas.",
+  "creators": [
+    {"name": "Guarino, Giuseppe"}
+  ],
+  "keywords": ["GPR", "ground-penetrating radar", "QGIS", "archaeological geophysics", "time-slice"],
+  "related_identifiers": [
+    {"relation": "isSupplementTo", "identifier": "https://github.com/Heryx/GeoSurveyStudio", "scheme": "url"}
+  ]
+}

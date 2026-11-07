@@ -61,6 +61,8 @@ from .gpr_viewer_common import (
     _PipelineWorker,
     _PreviewSliceWorker,
     _RangeGainCurveDialog,
+    RangeGainPanel,
+    AgcPanel,
     _dbg,
     _gpr_palettes,
     _log_gpr,
@@ -82,6 +84,7 @@ from .gpr_viewer_common import (
 from .gpr_viewer_navigator import NavigatorMixin
 from .gpr_viewer_radargram import RadargramViewMixin
 from .gpr_viewer_timeslice import TimesliceViewMixin
+from .gpr_viewer_sliceclip import SliceClipMixin
 from .gpr_viewer_variants import VariantsMixin
 from .gpr_viewer_project import ProjectPersistenceMixin
 from .gpr_viewer_zones import ZonesMixin
@@ -89,12 +92,20 @@ from .gpr_viewer_presets import PresetsMixin
 from .gpr_velocity_store import write_velocity_override
 from .gpr_hyperbola_math import velocity_from_two_points
 from .gpr_material_presets import MATERIAL_PRESETS, material_preset
+from .gpr_profile_gain import (
+    AGC_BY_PROFILE_KEY,
+    AGC_KEYS,
+    BY_PROFILE_KEY,
+    profile_gain_key,
+    resolve_profile_params,
+)
 
 
 class GprProfileViewer(
     NavigatorMixin,
     RadargramViewMixin,
     TimesliceViewMixin,
+    SliceClipMixin,
     VariantsMixin,
     ProjectPersistenceMixin,
     ZonesMixin,
@@ -133,6 +144,19 @@ class GprProfileViewer(
         self._suppress_3d_depth_sync = False
         self._updating_range_gain_controls = False
         self._range_gain_breakpoints = np.asarray([(0.0, 1.0), (1.0, 6.0)], dtype=np.float64)
+        # TVG per profilo: _range_gain_breakpoints e' la curva del profilo
+        # mostrato; _range_gain_default quella dei profili senza curva propria.
+        self._range_gain_default = self._range_gain_breakpoints.copy()
+        self._range_gain_by_profile: dict[str, list] = {}
+        self._range_gain_interp = "log"       # "log" = in dB, "linear" = curve salvate prima
+        self._range_gain_auto_settings: dict = {}
+        # AGC per profilo (stessa logica del TVG)
+        self._agc_default = {"agc_win": 128, "agc_max_gain": 0.0,
+                             "agc_sample_start": 0, "agc_lateral": 0}
+        self._agc_by_profile: dict[str, dict] = {}
+        self._agc_auto_settings: dict = {}
+        self._updating_agc_controls = False
+        self._gain_panel_kind = None
         self._hyper_apex_x: Optional[float] = None
         self._hyper_apex_depth: Optional[float] = None
         self._syncing_hyperbola_vel = False
@@ -753,7 +777,17 @@ class GprProfileViewer(
             left_lay = QVBoxLayout(left_host)
             left_lay.setContentsMargins(0, 0, 0, 0)
             left_lay.setSpacing(4)
-            left_lay.addWidget(self._canvas_mpl, stretch=1)
+            canvas_row = QHBoxLayout()
+            canvas_row.setContentsMargins(0, 0, 0, 0)
+            canvas_row.setSpacing(0)
+            # A sinistra del radargramma, solo mentre si edita il guadagno (TVG).
+            self._gain_curve_host = QWidget()
+            _gc_lay = QVBoxLayout(self._gain_curve_host)
+            _gc_lay.setContentsMargins(0, 0, 0, 0)
+            self._gain_curve_host.setVisible(False)
+            canvas_row.addWidget(self._gain_curve_host, 0)
+            canvas_row.addWidget(self._canvas_mpl, 1)
+            left_lay.addLayout(canvas_row, stretch=1)
 
             pan_row = QWidget()
             pan_row_l = QHBoxLayout(pan_row)
@@ -776,11 +810,23 @@ class GprProfileViewer(
             pan_row_l.addWidget(self._lbl_xpan, 0)
             left_lay.addWidget(pan_row, stretch=0)
 
+            # Editor del guadagno (TVG): compare qui sotto al posto di una finestra.
+            self._gain_panel = None
+            self._gain_panel_host = QWidget()
+            _gp_lay = QVBoxLayout(self._gain_panel_host)
+            _gp_lay.setContentsMargins(0, 0, 0, 0)
+            self._gain_panel_host.setVisible(False)
+
             splitter = QSplitter(Qt.Vertical)
             splitter.addWidget(slice_host)
             splitter.addWidget(left_host)
             splitter.setStretchFactor(0, 2)
             splitter.setStretchFactor(1, 1)
+            # Editor del guadagno: terza parte dello splitter, sotto il radargramma.
+            splitter.addWidget(self._gain_panel_host)
+            splitter.setStretchFactor(2, 0)
+            self._main_splitter = splitter
+            self._main_splitter_sizes = None
             center.addWidget(splitter, stretch=4)
             self._im    = None
             self._vline = None
@@ -1482,6 +1528,8 @@ class GprProfileViewer(
             agc_s0_row.addWidget(self._spin_agc_sample_start)
             agc_s0_row.addWidget(self._btn_pick_agc_s0)
             fl.addRow("Da campione:", agc_s0_row)
+            fl.addRow("", self._btn_agc_edit)
+            fl.addRow("", self._btn_agc_all)
             return host
 
         if sid == "envelope":
@@ -1494,6 +1542,7 @@ class GprProfileViewer(
             fl.addRow("Gain min:", self._spin_gain_surface)
             fl.addRow("Gain max:", self._spin_gain_deep)
             fl.addRow("Breakpoints:", self._btn_range_gain_curve)
+            fl.addRow("", self._btn_range_gain_all)
             return host
 
         if sid == "manual_gain":
@@ -2110,7 +2159,24 @@ class GprProfileViewer(
                                                 self._btn_pick_agc_s0)
         )
 
+        self._btn_agc_edit = QPushButton("Edit AGC...")
+        self._btn_agc_edit.setEnabled(False)
+        self._btn_agc_edit.setToolTip(
+            "Apre l'editor sotto il radargramma: guadagno effettivo, ampiezze prima/dopo,\n"
+            "calcolo automatico per profilo o per tutti i profili."
+        )
+        self._btn_agc_edit.clicked.connect(self._open_agc_editor)
+        self._btn_agc_all = QPushButton("Copia su tutti i profili")
+        self._btn_agc_all.setEnabled(False)
+        self._btn_agc_all.setToolTip(
+            "L'AGC e' per profilo: le modifiche valgono solo per il profilo mostrato.\n"
+            "Questo pulsante copia i suoi valori su tutti gli altri profili."
+        )
+        self._btn_agc_all.clicked.connect(self._apply_current_agc_to_all)
+
         def _toggle_agc(agc_checked):
+            self._btn_agc_edit.setEnabled(agc_checked and getattr(self, "_gain_panel", None) is None)
+            self._btn_agc_all.setEnabled(agc_checked)
             self._spin_agc.setEnabled(agc_checked)
             self._spin_agc_max_gain.setEnabled(agc_checked)
             self._spin_agc_lateral.setEnabled(agc_checked)
@@ -2121,6 +2187,9 @@ class GprProfileViewer(
                 self._set_pick_mode(None, None)
 
         self._chk_agc.toggled.connect(_toggle_agc)
+        for _sp in (self._spin_agc, self._spin_agc_max_gain,
+                    self._spin_agc_sample_start, self._spin_agc_lateral):
+            _sp.valueChanged.connect(self._on_agc_control_edited)
         self._spin_agc_max_gain.valueChanged.connect(
             lambda _v: self._apply_processing_async() if self._chk_agc.isChecked() and self._raw_data is not None else None
         )
@@ -2281,11 +2350,19 @@ class GprProfileViewer(
         self._btn_range_gain_curve = QPushButton("Edit curve...")
         self._btn_range_gain_curve.setEnabled(False)
         self._btn_range_gain_curve.clicked.connect(self._open_range_gain_curve_editor)
+        self._btn_range_gain_all = QPushButton("Copia su tutti i profili")
+        self._btn_range_gain_all.setEnabled(False)
+        self._btn_range_gain_all.setToolTip(
+            "Il guadagno e' per profilo: le modifiche valgono solo per il profilo mostrato.\n"
+            "Questo pulsante copia la sua curva su tutti gli altri profili."
+        )
+        self._btn_range_gain_all.clicked.connect(self._apply_current_range_gain_to_all)
 
         def _toggle_range_gain(checked):
             self._spin_gain_surface.setEnabled(checked)
             self._spin_gain_deep.setEnabled(checked)
             self._btn_range_gain_curve.setEnabled(checked)
+            self._btn_range_gain_all.setEnabled(checked)
             self._apply_range_gain_change()
 
         self._chk_range_gain.toggled.connect(_toggle_range_gain)
@@ -2985,6 +3062,7 @@ class GprProfileViewer(
                 lambda: self._request_preview_update(immediate=False)
             )
             fl_slice.insertRow(2, "Parametri slice:", self._slice_spec_panel)
+            self._wire_slice_clip_panel()
             for _w in (
                 self._spin_slice_thickness, self._chk_slice_thickness_locked,
                 self._cb_slice_idw_mode, self._spin_slice_search_radius,
@@ -3716,6 +3794,8 @@ class GprProfileViewer(
             return
         prof = self._profiles[self._prof_idx]
         self._refresh_preset_controls(prof)
+        self._load_range_gain_for_current_profile()
+        self._load_agc_for_current_profile()
         # Reset zoom when changing profile to avoid carrying tiny previous windows.
         self._view_xlim = None
         self._view_ylim = None
@@ -3920,8 +4000,12 @@ class GprProfileViewer(
         # riceve le proprie quote in _save_processed_variant).
         if phase1.get("kirchhoff") and phase1.get("kirchhoff_topo"):
             phase1["kirchhoff_elev_m"] = self._current_channel_elevation()
+        gain_by_profile = self._gain_map_for_params()
+        agc_by_profile = self._agc_map_for_params()
         return {
             **phase1,
+            **({BY_PROFILE_KEY: gain_by_profile} if gain_by_profile else {}),
+            **({AGC_BY_PROFILE_KEY: agc_by_profile} if agc_by_profile else {}),
             "dewow": bool(self._chk_dewow.isChecked()),
             "dewow_win": int(self._spin_dewow.value()),
             "timezero": bool(self._chk_timezero.isChecked()),
@@ -3947,6 +4031,7 @@ class GprProfileViewer(
             "pre_agc_surface_gain": float(self._spin_gain_surface.value()),
             "pre_agc_deep_gain": float(self._spin_gain_deep.value()),
             "pre_agc_breakpoints": [[float(x), float(y)] for x, y in rg_points.tolist()],
+            "pre_agc_interp": str(self._range_gain_interp),
             "bandpass": bool(self._chk_bp.isChecked()),
             "envelope": bool(getattr(self, "_chk_envelope", None) and self._chk_envelope.isChecked()),
             "bp_low_mhz": float(bp_lo),
@@ -4385,6 +4470,7 @@ class GprProfileViewer(
         _safe_set_spin("_spin_bg_sample_start",  params.get("bg_sample_start", 0))
         _safe_set_spin("_spin_agc",              params.get("agc_win", 128))
         _safe_set_spin("_spin_agc_sample_start", params.get("agc_sample_start", 0))
+        self._set_agc_for_all_profiles(self._agc_from_controls())
         _safe_set_spin("_spin_bp_lo",            params.get("bp_low_mhz", 100.0))
         _safe_set_spin("_spin_bp_hi",            params.get("bp_high_mhz", 1200.0))
 
@@ -4393,8 +4479,9 @@ class GprProfileViewer(
         if bkpts is not None:
             bkpts_arr = np.asarray(bkpts, dtype=np.float64).reshape(-1, 2)
             if bkpts_arr.shape[0] >= 2:
-                self._range_gain_breakpoints = bkpts_arr
-                self._sync_range_gain_spins_from_breakpoints()
+                # L'auto-tune stima una curva dai dati di tutti i profili: vale
+                # per tutti (le curve proprie dei singoli profili si azzerano).
+                self._set_range_gain_for_all_profiles(bkpts_arr)
 
         # Setta i checkbox emettendo i segnali — così i toggle abilitano/disabilitano
         # gli spinner dipendenti e sincronizzano la filter chain.
@@ -4444,6 +4531,67 @@ class GprProfileViewer(
             out = [out[0]] + inner + [out[-1]]
         return np.asarray(out, dtype=np.float64)
 
+    # --- TVG per profilo --------------------------------------------------
+    def _current_gain_key(self) -> str:
+        if self._profiles and 0 <= self._prof_idx < len(self._profiles):
+            return profile_gain_key(self._profiles[self._prof_idx])
+        return ""
+
+    @staticmethod
+    def _curve_to_list(points) -> list:
+        arr = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        return [[float(x), float(y)] for x, y in arr.tolist()]
+
+    def _store_current_range_gain(self) -> None:
+        """La curva mostrata diventa quella del profilo corrente (solo suo)."""
+        key = self._current_gain_key()
+        if key:
+            self._range_gain_by_profile[key] = self._curve_to_list(
+                self._sanitize_range_gain_breakpoints(self._range_gain_breakpoints)
+            )
+
+    def _load_range_gain_for_current_profile(self) -> None:
+        """Al cambio profilo: controlli e curva mostrano quelli del nuovo profilo."""
+        key = self._current_gain_key()
+        pts = self._range_gain_by_profile.get(key)
+        if pts is None:
+            pts = self._range_gain_default
+        self._range_gain_breakpoints = self._sanitize_range_gain_breakpoints(pts)
+        self._sync_range_gain_spins_from_breakpoints()
+
+    def _gain_map_for_params(self) -> dict:
+        """{profilo: curva} per tutti i profili, se almeno uno ha curva propria."""
+        if not self._range_gain_by_profile or not self._profiles:
+            return {}
+        out = {}
+        for prof in self._profiles:
+            key = profile_gain_key(prof)
+            pts = self._range_gain_by_profile.get(key)
+            out[key] = self._curve_to_list(
+                self._sanitize_range_gain_breakpoints(
+                    self._range_gain_default if pts is None else pts
+                )
+            )
+        cur = self._current_gain_key()
+        if cur:
+            out[cur] = self._curve_to_list(
+                self._sanitize_range_gain_breakpoints(self._range_gain_breakpoints)
+            )
+        return out
+
+    def _set_range_gain_for_all_profiles(self, points) -> None:
+        """Stessa curva per tutti i profili (nessuna curva propria)."""
+        self._range_gain_default = self._sanitize_range_gain_breakpoints(points)
+        self._range_gain_by_profile = {}
+        self._range_gain_breakpoints = self._range_gain_default.copy()
+        self._sync_range_gain_spins_from_breakpoints()
+
+    def _apply_current_range_gain_to_all(self) -> None:
+        self._set_range_gain_for_all_profiles(self._range_gain_breakpoints)
+        self._safe_set_text(self._lbl_status, "Curva TVG copiata su tutti i profili.")
+        if self._chk_range_gain.isChecked():
+            self._apply_range_gain_change()
+
     def _sync_range_gain_spins_from_breakpoints(self):
         if self._range_gain_breakpoints is None or self._range_gain_breakpoints.shape[0] < 2:
             return
@@ -4488,6 +4636,7 @@ class GprProfileViewer(
             finally:
                 self._updating_range_gain_controls = False
         self._sync_range_gain_breakpoints_from_spins()
+        self._store_current_range_gain()
         self._apply_range_gain_change()
 
     def _on_range_gain_deep_changed(self, _value: float):
@@ -4500,37 +4649,442 @@ class GprProfileViewer(
             finally:
                 self._updating_range_gain_controls = False
         self._sync_range_gain_breakpoints_from_spins()
+        self._store_current_range_gain()
         self._apply_range_gain_change()
 
     def _on_range_gain_curve_live_changed(self, points, gain_max=None):
         # `gain_max` e' solo la scala dell'asse dell'editor: non tocca i controlli.
         self._range_gain_breakpoints = self._sanitize_range_gain_breakpoints(points)
         self._sync_range_gain_spins_from_breakpoints()
+        self._store_current_range_gain()
         if self._chk_range_gain.isChecked():
             self._apply_range_gain_change()
 
-    def _open_range_gain_curve_editor(self):
-        if not HAS_MPL:
-            QMessageBox.information(self, "Range Gain", "Editor curva non disponibile (matplotlib mancante).")
-            return
-        original = np.asarray(self._range_gain_breakpoints, dtype=np.float64).copy()
-        dlg = _RangeGainCurveDialog(
-            points=original,
-            max_points=16,
-            on_curve_changed=self._on_range_gain_curve_live_changed,
-            parent=self,
+    # --- dato che arriva a un passo (TVG o AGC) -------------------------------
+    def _pre_step_setup(self, step: str):
+        """Parametri per ottenere il dato che arriva al passo `step`: i passi attivi
+        che lo precedono nella catena, senza `step` e quelli che lo seguono.
+        Le mappe per-profilo restano: si risolvono profilo per profilo."""
+        params = self._current_processing_params()
+        order = [str(x) for x in (params.get("chain_order") or [])]
+        pos = order.index(step) if step in order else len(order)
+        p_pre = dict(params)
+        for sid in order[pos:]:
+            p_pre[self._CHAIN_ENABLE_KEY.get(sid, sid)] = False
+        p_pre[self._CHAIN_ENABLE_KEY.get(step, step)] = False
+        return p_pre, order, pos
+
+    def _pre_step_raw(self, prof, ch: int):
+        ch = int(min(max(ch, 0), int(getattr(prof, "n_channels", 1)) - 1))
+        raw = np.asarray(prof.channel(ch).data, dtype=np.float32)
+        return raw, self._trace_indices_for(raw.shape[1]), ch
+
+    def _pre_step_matrix(self, prof, ch: int, step: str, stage_cache=None):
+        """Dato del canale `ch` cosi' come arriva al passo `step`."""
+        from .gpr_processing import apply_pipeline
+        p_pre, order, pos = self._pre_step_setup(step)
+        p_pre = resolve_profile_params(p_pre, profile_gain_key(prof))
+        raw, tidx, ch = self._pre_step_raw(prof, ch)
+        raw = raw[:, tidx]
+        if not any(bool(p_pre.get(self._CHAIN_ENABLE_KEY.get(s, s), False)) for s in order[:pos]):
+            return raw
+        return apply_pipeline(
+            raw, p_pre, dt_ns=float(getattr(prof, "dt_ns", 0.117) or 0.117),
+            bg_reference_trace=self._grid_bg_reference(p_pre, ch),
+            normalize_output=False, chain_order=order, stage_cache=stage_cache,
         )
-        if dlg.exec_() == QDialog.Accepted:
-            self._range_gain_breakpoints = self._sanitize_range_gain_breakpoints(dlg.points())
+
+    def _pre_gain_matrix(self, prof, ch: int, stage_cache=None):
+        return self._pre_step_matrix(prof, ch, "pre_agc_gain", stage_cache)
+
+    def _analyze_profiles(self, step: str, analyzer, title: str):
+        """Applica `analyzer(dato_prima_del_passo)` a ogni profilo (canale mostrato).
+
+        Il dato e' calcolato in processi paralleli (come il salvataggio delle
+        varianti), con avanzamento e Annulla. Ritorna {chiave profilo: risultato}
+        oppure None se annullato."""
+        from qgis.PyQt.QtCore import QEventLoop, QThread
+        from .gpr_viewer_variants import _VariantProgressDialog, _VariantSaveWorker
+
+        profiles = list(self._profiles)
+        n = len(profiles)
+        ch = int(self._ch_idx)
+        p_pre, order, _pos = self._pre_step_setup(step)
+        # Tutto cio' che legge i controlli Qt si prepara qui, nel thread della GUI.
+        trims = [self._pre_step_raw(prof, ch)[1] for prof in profiles]
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            bg_ref = self._grid_bg_reference(p_pre, ch)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        results: dict = {}
+
+        def make_payload(pi, _ci):
+            prof = profiles[pi]
+            raw = self._pre_step_raw(prof, ch)[0][:, trims[pi]]
+            return (raw, resolve_profile_params(p_pre, profile_gain_key(prof)),
+                    float(getattr(prof, "dt_ns", 0.117) or 0.117), bg_ref, order)
+
+        def on_done(pi, arrays):
+            results[profile_gain_key(profiles[pi])] = analyzer(arrays[0])
+
+        dlg = _VariantProgressDialog(self, n)
+        dlg.setWindowTitle(title)
+        dlg._cancel_note = ""
+        worker = _VariantSaveWorker([1] * n, make_payload, on_done)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        loop = QEventLoop(self)
+        state = {"result": None}
+        thread.started.connect(worker.run)
+        worker.progress.connect(
+            lambda done, total, _s: dlg.set_progress(done, f"Profili analizzati: {done}/{total}"))
+        worker.finished.connect(lambda res: (state.__setitem__("result", res), loop.quit()))
+        dlg.cancel_requested.connect(lambda: worker.cancel())
+        try:
+            thread.start()
+            dlg.show()
+            loop.exec_()
+        finally:
+            thread.quit()
+            thread.wait(10000)
+            dlg.finish()
+            dlg.deleteLater()
+            worker.deleteLater()
+            thread.deleteLater()
+        res = state["result"] or {}
+        if res.get("cancelled") or not results:
+            self._safe_set_text(self._lbl_status, f"{title}: annullato.")
+            return None
+        return results
+
+    def _auto_gain_all_profiles(self, settings: dict):
+        """Curva TVG automatica per ogni profilo. Ritorna quella del profilo mostrato."""
+        from .gpr_profile_gain import auto_gain_points, envelope_db
+        self._range_gain_auto_settings = dict(settings)
+        curves = self._analyze_profiles(
+            "pre_agc_gain", lambda arr: auto_gain_points(envelope_db(arr), **settings),
+            "Guadagno automatico")
+        if curves is None:
+            return None
+        for key, pts in curves.items():
+            self._range_gain_by_profile[key] = self._curve_to_list(pts)
+        self._range_gain_interp = "log"
+        mine = self._range_gain_by_profile.get(self._current_gain_key())
+        if mine:
+            self._range_gain_breakpoints = self._sanitize_range_gain_breakpoints(mine)
             self._sync_range_gain_spins_from_breakpoints()
+        failed = len(self._profiles) - len(curves)
+        self._safe_set_text(
+            self._lbl_status,
+            f"Guadagno automatico calcolato per {len(curves)}/{len(self._profiles)} profili"
+            + (f" ({failed} falliti: mantengono la curva precedente)." if failed else "."))
+        return mine
+
+    # --- AGC per profilo ---------------------------------------------------------
+    def _agc_from_controls(self) -> dict:
+        return {
+            "agc_win": int(self._spin_agc.value()),
+            "agc_max_gain": float(self._spin_agc_max_gain.value()),
+            "agc_sample_start": int(self._spin_agc_sample_start.value()),
+            "agc_lateral": int(self._spin_agc_lateral.value()),
+        }
+
+    def _set_agc_controls(self, d: dict) -> None:
+        """Valori nei controlli AGC, senza segnali (non riprocessa da solo)."""
+        self._updating_agc_controls = True
+        try:
+            for spin, key, cast in (
+                (self._spin_agc, "agc_win", int),
+                (self._spin_agc_max_gain, "agc_max_gain", float),
+                (self._spin_agc_sample_start, "agc_sample_start", int),
+                (self._spin_agc_lateral, "agc_lateral", int),
+            ):
+                if key in d:
+                    blocked = spin.blockSignals(True)
+                    try:
+                        spin.setValue(cast(d[key]))
+                    finally:
+                        spin.blockSignals(blocked)
+        finally:
+            self._updating_agc_controls = False
+
+    def _store_current_agc(self) -> None:
+        """I valori mostrati diventano quelli del profilo corrente (solo suoi)."""
+        key = self._current_gain_key()
+        if key and not self._updating_agc_controls:
+            self._range_gain_agc_store(key)
+
+    def _range_gain_agc_store(self, key: str) -> None:
+        self._agc_by_profile[key] = self._agc_from_controls()
+
+    def _load_agc_for_current_profile(self) -> None:
+        if not hasattr(self, "_spin_agc"):
+            return
+        self._set_agc_controls(self._agc_by_profile.get(self._current_gain_key(), self._agc_default))
+
+    def _on_agc_control_edited(self, *_a) -> None:
+        self._store_current_agc()
+
+    def _agc_map_for_params(self) -> dict:
+        """{profilo: parametri AGC} per tutti i profili, se almeno uno ha valori propri."""
+        if not self._agc_by_profile or not self._profiles:
+            return {}
+        out = {profile_gain_key(p): dict(self._agc_by_profile.get(profile_gain_key(p),
+                                                                   self._agc_default))
+               for p in self._profiles}
+        cur = self._current_gain_key()
+        if cur:
+            out[cur] = self._agc_from_controls()
+        return out
+
+    def _set_agc_for_all_profiles(self, d: dict) -> None:
+        self._agc_default = {**self._agc_default, **{k: d[k] for k in AGC_KEYS if k in d}}
+        self._agc_by_profile = {}
+        self._set_agc_controls(self._agc_default)
+
+    def _apply_current_agc_to_all(self) -> None:
+        self._set_agc_for_all_profiles(self._agc_from_controls())
+        self._safe_set_text(self._lbl_status, "Impostazioni AGC copiate su tutti i profili.")
+
+    def _auto_agc_all_profiles(self, settings: dict):
+        """Parametri AGC automatici per ogni profilo. Ritorna quelli del profilo mostrato."""
+        from .gpr_profile_gain import auto_agc_params
+        self._agc_auto_settings = dict(settings)
+        res = self._analyze_profiles(
+            "agc", lambda arr: auto_agc_params(arr, **settings), "AGC automatico")
+        if res is None:
+            return None
+        lat = int(self._spin_agc_lateral.value())
+        for key, d in res.items():
+            self._agc_by_profile[key] = {**d, "agc_lateral": lat}
+        mine = self._agc_by_profile.get(self._current_gain_key())
+        if mine:
+            self._set_agc_controls(mine)
+        self._safe_set_text(
+            self._lbl_status,
+            f"AGC automatico calcolato per {len(res)}/{len(self._profiles)} profili.")
+        return mine
+
+    # --- ampiezze prima/dopo al posto dell'A-scan ---------------------------
+    def _draw_gain_amplitudes(self, draw: bool = True):
+        panel = self._gain_panel
+        axw = self._ax_wiggle
+        data = panel.trace_data() if panel is not None else None
+        if data is None or not self._profiles:
+            return
+        metrics = self._cursor_metrics()
+        if metrics is None:
+            k = data.shape[1] // 2
+            depth_max = self._depth_max_display(self._profiles[self._prof_idx])
+        else:
+            k = int(metrics["idx_trace"])
+            depth_max = float(metrics["depth_max_m"])
+        pair = panel.amplitude_pair(int(np.clip(k, 0, data.shape[1] - 1)))
+        if pair is None:
+            return
+        before, after = pair
+        depth = np.linspace(0.0, depth_max, before.size)
+        lim = float(np.max(np.abs(before))) or 1.0
+        if panel.same_scale():
+            b, a, xlim = before, after, lim * 1.05
+        else:
+            b = before / lim
+            a = after / (float(np.percentile(np.abs(after), 98.0)) or 1.0)
+            xlim = 1.05
+        axw.clear()
+        axw.set_facecolor("#1a1a1a")
+        axw.axvline(0.0, color="#555555", lw=0.5)
+        axw.plot(np.clip(b, -xlim, xlim), depth, color="#e0a040", lw=0.9, label="prima")
+        axw.plot(np.clip(a, -xlim, xlim), depth, color="#5ab0ff", lw=0.9, label="dopo")
+        axw.set_xlim(-xlim, xlim)
+        axw.set_xticks([])
+        axw.tick_params(axis="y", left=False, labelleft=False)
+        axw.set_title("prima / dopo", fontsize=8, color="#cccccc")
+        axw.legend(loc="lower right", fontsize=7, facecolor="#1a1a1a", labelcolor="#dddddd")
+        for spine in axw.spines.values():
+            spine.set_edgecolor("#333333")
+            spine.set_linewidth(0.5)
+        self._wiggle_reset_artists()
+        if draw:
+            self._safe_draw_idle(self._canvas_mpl)
+
+    # --- pannello editor (TVG o AGC) --------------------------------------------
+    def _open_range_gain_curve_editor(self):
+        self._open_gain_editor("tvg")
+
+    def _open_agc_editor(self):
+        self._open_gain_editor("agc")
+
+    def _open_gain_editor(self, kind: str):
+        if not HAS_MPL:
+            QMessageBox.information(self, "Guadagno", "Editor non disponibile (matplotlib mancante).")
+            return
+        if self._gain_panel is not None:
+            return
+        if not self._profiles or self._raw_data is None:
+            return
+        step = "pre_agc_gain" if kind == "tvg" else "agc"
+        original = np.asarray(self._range_gain_breakpoints, dtype=np.float64).copy()
+        self._gain_panel_kind = kind
+        self._gain_panel_saved = {
+            "tvg": (
+                {k: list(v) for k, v in self._range_gain_by_profile.items()},
+                np.asarray(self._range_gain_default).copy(),
+                str(self._range_gain_interp),
+                dict(self._range_gain_auto_settings),
+                original,
+            ),
+            "agc": (
+                {k: dict(v) for k, v in self._agc_by_profile.items()},
+                dict(self._agc_default),
+                self._agc_from_controls(),
+                dict(self._agc_auto_settings),
+            ),
+        }
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            try:
+                prima = self._pre_step_matrix(
+                    self._profiles[self._prof_idx], int(self._ch_idx), step, self._stage_cache)
+            except Exception as exc:
+                self._note_swallowed("dato prima del passo per l'editor", exc)
+                prima = self._raw_data
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if kind == "tvg":
+            def _live(points, gain_max=None):
+                self._range_gain_interp = panel.interp()
+                self._on_range_gain_curve_live_changed(points, gain_max)
+                self._draw_gain_amplitudes()
+
+            panel = RangeGainPanel(
+                points=original, max_points=16, on_curve_changed=_live, envelope_db=None,
+                trace_data=prima, interp=self._range_gain_interp,
+                auto_settings=self._range_gain_auto_settings,
+                on_auto_all=self._auto_gain_all_profiles,
+            )
+        else:
+            def _live_agc(params):
+                self._set_agc_controls(params)
+                self._store_current_agc()
+                if self._chk_agc.isChecked() and self._raw_data is not None:
+                    self._apply_processing_async()
+                self._draw_gain_amplitudes()
+
+            panel = AgcPanel(
+                self._agc_from_controls(), trace_data=prima, on_changed=_live_agc,
+                auto_settings=self._agc_auto_settings, on_auto_all=self._auto_agc_all_profiles,
+            )
+        panel.finished_with.connect(self._on_gain_panel_finished)
+        panel.view_changed.connect(lambda: self._draw_gain_amplitudes())
+        self._gain_panel = panel
+        self._gain_panel_host.layout().addWidget(panel)
+        self._gain_panel_host.setVisible(True)
+        # Grafico a sinistra del radargramma, stessa profondita'.
+        canvas = panel.curve_canvas()
+        if canvas is not None:
+            self._gain_curve_host.layout().addWidget(canvas)
+            self._gain_curve_host.setVisible(True)
+        panel.set_depth(self._depth_max_display(self._profiles[self._prof_idx]),
+                        ylim_fn=lambda: self._ax.get_ylim())
+        self._gain_ylim_cid = self._ax.callbacks.connect(
+            "ylim_changed", lambda _ax: panel.sync_ylim())
+        self._btn_range_gain_curve.setEnabled(False)
+        self._btn_agc_edit.setEnabled(False)
+        self._make_room_for_gain_panel()
+        self._draw_gain_amplitudes()
+
+    def _make_room_for_gain_panel(self, need: int = 210):
+        """Il pannello prende spazio prima dalla time-slice in alto, poi dal radargramma."""
+        sp = getattr(self, "_main_splitter", None)
+        if sp is None:
+            return
+        sz = list(sp.sizes())
+        if len(sz) < 3:
+            return
+        self._main_splitter_sizes = list(sz)
+        total = max(sum(sz), need + 200)
+        top = max(60, sz[0] - need)
+        rem = need - (sz[0] - top)
+        mid = max(160, sz[1] - rem)
+        sp.setSizes([top, mid, max(need, total - top - mid)])
+
+    def _close_gain_panel(self):
+        panel = self._gain_panel
+        self._gain_panel = None
+        cid = getattr(self, "_gain_ylim_cid", None)
+        if cid is not None:
+            try:
+                self._ax.callbacks.disconnect(cid)
+            except Exception:
+                pass
+            self._gain_ylim_cid = None
+        if panel is not None:
+            panel.dispose()
+            canvas = panel.curve_canvas()
+            if canvas is not None:
+                canvas.setParent(None)
+            panel.setParent(None)
+            panel.deleteLater()
+        if self._is_qt_alive(getattr(self, "_gain_curve_host", None)):
+            self._gain_curve_host.setVisible(False)
+        if self._is_qt_alive(getattr(self, "_gain_panel_host", None)):
+            self._gain_panel_host.setVisible(False)
+            sp = getattr(self, "_main_splitter", None)
+            saved = getattr(self, "_main_splitter_sizes", None)
+            if sp is not None and saved and len(saved) == 3:
+                sp.setSizes([saved[0], saved[1], 0])
+        if self._is_qt_alive(getattr(self, "_btn_range_gain_curve", None)):
+            self._btn_range_gain_curve.setEnabled(bool(self._chk_range_gain.isChecked()))
+        if self._is_qt_alive(getattr(self, "_btn_agc_edit", None)):
+            self._btn_agc_edit.setEnabled(bool(self._chk_agc.isChecked()))
+        try:
+            self._update_wiggle_plot(draw=True, force=True)
+        except Exception:
+            pass
+
+    def _on_gain_panel_finished(self, action: str):
+        panel = self._gain_panel
+        if panel is None:
+            return
+        kind = self._gain_panel_kind
+        if kind == "tvg":
+            if action == "cancel":
+                (self._range_gain_by_profile, self._range_gain_default,
+                 self._range_gain_interp, self._range_gain_auto_settings,
+                 original) = self._gain_panel_saved["tvg"]
+                self._range_gain_breakpoints = self._sanitize_range_gain_breakpoints(original)
+                self._sync_range_gain_spins_from_breakpoints()
+            else:
+                self._range_gain_interp = panel.interp()
+                self._range_gain_auto_settings = panel.auto_settings()
+                self._range_gain_breakpoints = self._sanitize_range_gain_breakpoints(panel.points())
+                self._sync_range_gain_spins_from_breakpoints()
+                if action == "all":
+                    self._set_range_gain_for_all_profiles(self._range_gain_breakpoints)
+                else:
+                    self._store_current_range_gain()
+            self._close_gain_panel()
             if self._chk_range_gain.isChecked():
                 self._apply_range_gain_change()
-            return
-        # Revert previewed edits on cancel.
-        self._range_gain_breakpoints = self._sanitize_range_gain_breakpoints(original)
-        self._sync_range_gain_spins_from_breakpoints()
-        if self._chk_range_gain.isChecked():
-            self._apply_range_gain_change()
+        else:
+            if action == "cancel":
+                (self._agc_by_profile, self._agc_default, controls,
+                 self._agc_auto_settings) = self._gain_panel_saved["agc"]
+                self._set_agc_controls(controls)
+            else:
+                self._agc_auto_settings = panel.auto_settings()
+                self._set_agc_controls(panel.params())
+                if action == "all":
+                    self._set_agc_for_all_profiles(panel.params())
+                else:
+                    self._store_current_agc()
+            self._close_gain_panel()
+            if self._chk_agc.isChecked() and self._raw_data is not None:
+                self._apply_processing_async()
 
     @staticmethod
     def _rdp_to_velocity_m_s(rdp: float) -> float:
@@ -4856,7 +5410,7 @@ class GprProfileViewer(
         "dewow_win", "tz_backup_nsamp",
         "bg_window", "bg_sample_start", "bg_sample_end",
         "agc_win", "agc_sample_start",
-        "pre_agc_breakpoints",
+        "pre_agc_breakpoints", BY_PROFILE_KEY, AGC_BY_PROFILE_KEY,
         "dcshift_sample_start", "dcshift_sample_end",
         "amp_eq_window", "boxcar_width", "boxcar_height",
         "median2d_w_trace", "median2d_w_sample",
@@ -4938,15 +5492,40 @@ class GprProfileViewer(
         # Range gain (TVG): non e' nella mapping sopra perche' i suoi controlli
         # (_spin_gain_surface/_spin_gain_deep) sono condivisi con l'editor curva
         # e vanno aggiornati insieme ai breakpoints, non come singolo spinbox.
+        # Curva di base per tutti + eventuali curve per profilo (BY_PROFILE_KEY);
+        # il profilo mostrato prende la propria se c'e'.
         bkpts = params.get("pre_agc_breakpoints")
-        if bkpts is not None:
+        by_profile = params.get(BY_PROFILE_KEY)
+        if bkpts is not None or isinstance(by_profile, dict):
+            # Ricette senza "pre_agc_interp" (preset, varianti e progetti
+            # precedenti) sono nate con l'interpolazione lineare.
+            self._range_gain_interp = (
+                "log" if str(params.get("pre_agc_interp", "linear")) == "log" else "linear"
+            )
             try:
-                bkpts_arr = np.asarray(bkpts, dtype=np.float64).reshape(-1, 2)
-                if bkpts_arr.shape[0] >= 2:
-                    self._range_gain_breakpoints = self._sanitize_range_gain_breakpoints(bkpts_arr)
-                    self._sync_range_gain_spins_from_breakpoints()
+                if bkpts is not None:
+                    bkpts_arr = np.asarray(bkpts, dtype=np.float64).reshape(-1, 2)
+                    if bkpts_arr.shape[0] >= 2:
+                        self._range_gain_default = self._sanitize_range_gain_breakpoints(bkpts_arr)
+                self._range_gain_by_profile = {
+                    str(k): self._curve_to_list(self._sanitize_range_gain_breakpoints(v))
+                    for k, v in (by_profile or {}).items()
+                    if isinstance(by_profile, dict)
+                }
+                self._load_range_gain_for_current_profile()
             except Exception:
                 pass
+        # AGC: valori comuni + eventuali valori per profilo.
+        agc_base = {k: params[k] for k in AGC_KEYS if k in params}
+        agc_map = params.get(AGC_BY_PROFILE_KEY)
+        if agc_base or isinstance(agc_map, dict):
+            self._agc_default = {**self._agc_default, **agc_base}
+            self._agc_by_profile = (
+                {str(k): {kk: v[kk] for kk in AGC_KEYS if kk in v}
+                 for k, v in agc_map.items() if isinstance(v, dict)}
+                if isinstance(agc_map, dict) else {}
+            )
+            self._load_agc_for_current_profile()
 
     # Coppie (id step catena) -> (chiave bool in _current_processing_params).
     # I 12 step Fase 1 usano il proprio id come chiave; qui solo le eccezioni.
@@ -5092,7 +5671,7 @@ class GprProfileViewer(
         try:
             if gain_hyper:
                 try:
-                    self._apply_gain_hyper_preset(gain_hyper)
+                    self._apply_gain_hyper_preset(gain_hyper, per_profile=False)
                 except Exception as exc:
                     print(f"[GPR viewer][WARN] ripristino gain/iperbole fallito: {exc}")
             self._apply_processing_widget_params(params)
@@ -5116,7 +5695,7 @@ class GprProfileViewer(
         except Exception:
             pass
 
-    def _apply_gain_hyper_preset(self, payload: dict):
+    def _apply_gain_hyper_preset(self, payload: dict, per_profile: bool = True):
         if not isinstance(payload, dict):
             raise ValueError("Preset non valido: struttura JSON non riconosciuta.")
         if payload.get("format") not in {"gpr_gain_hyper_preset", None}:
@@ -5159,9 +5738,13 @@ class GprProfileViewer(
             self._sync_range_gain_spins_from_breakpoints()
         else:
             self._sync_range_gain_breakpoints_from_spins()
+        if per_profile and rg:
+            # Preset caricato da file: vale per il profilo mostrato.
+            self._store_current_range_gain()
 
         self._chk_range_gain.setChecked(bool(rg.get("enabled", self._chk_range_gain.isChecked())))
         self._btn_range_gain_curve.setEnabled(bool(self._chk_range_gain.isChecked()))
+        self._btn_range_gain_all.setEnabled(bool(self._chk_range_gain.isChecked()))
 
         # Manual gain.
         mg = payload.get("manual_gain", {}) if isinstance(payload.get("manual_gain"), dict) else {}

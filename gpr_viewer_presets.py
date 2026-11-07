@@ -15,7 +15,9 @@ from .gpr_instrument_presets import (
     detect_instrument,
     preset_by_key,
 )
+from .gpr_profile_gain import BY_PROFILE_KEY, adaptive_gain_curves
 from .gpr_viewer_common import (
+    QApplication,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -124,6 +126,30 @@ class PresetsMixin:
             params[self._CHAIN_ENABLE_KEY.get(sid, sid)] = sid in steps
         params["chain_order"] = order
 
+        # TVG per profilo: la curva del preset e' il punto di partenza di ognuno;
+        # il livello in profondita' si adatta a quanto il profilo si attenua.
+        gain_note = ""
+        if params.get("pre_agc_breakpoints") is not None and len(self._profiles) > 0:
+            try:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                try:
+                    curves, info = adaptive_gain_curves(
+                        self._profiles, params["pre_agc_breakpoints"],
+                        progress=lambda i, n: self._safe_set_text(
+                            self._lbl_status, f"Guadagno per profilo: analisi {i}/{n}..."
+                        ) or QApplication.processEvents(),
+                    )
+                finally:
+                    QApplication.restoreOverrideCursor()
+                params[BY_PROFILE_KEY] = curves
+                f = [v for v in info["factor"].values()]
+                gain_note = (
+                    f" Guadagno adattato a ogni profilo ({len(curves)} profili, "
+                    f"livello profondo da x{min(f):.2f} a x{max(f):.2f} rispetto al preset)."
+                )
+            except Exception as exc:
+                gain_note = f" Guadagno per profilo non calcolato ({exc}): curva del preset per tutti."
+
         # "Auto" del fondo non e' nei parametri salvati: lo imposto a mano, senza
         # segnali (evita un riprocessamento in piu' dal timer dei parametri).
         auto_chk = getattr(self, "_chk_bg_auto", None)
@@ -141,7 +167,8 @@ class PresetsMixin:
             spin.setEnabled(bool(self._chk_bg.isChecked() and not auto_chk.isChecked()))
 
         msg = (
-            f"Preset {preset.label} applicato: {setup['summary']}. "
+            f"Preset {preset.label} applicato: {setup['summary']}."
+            f"{gain_note} "
             "Gli altri passi sono disattivati; tutti i valori restano modificabili."
         )
         self._safe_set_text(self._lbl_status, msg)

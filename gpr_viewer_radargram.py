@@ -281,7 +281,10 @@ class RadargramViewMixin:
         pts = self._sanitize_range_gain_breakpoints(self._range_gain_breakpoints)
         x = np.asarray(pts[:, 0], dtype=np.float64)
         y = np.asarray(pts[:, 1], dtype=np.float64)
-        g = np.interp(t, x, y)
+        if str(getattr(self, "_range_gain_interp", "linear")) == "log":
+            g = np.exp(np.interp(t, x, np.log(np.maximum(y, 1e-6))))
+        else:
+            g = np.interp(t, x, y)
         g = np.clip(g, 1e-6, 1e6).astype(np.float32)
         return g.reshape(-1, 1)
 
@@ -1055,6 +1058,10 @@ class RadargramViewMixin:
                 axw.set_visible(True)
             except Exception:
                 pass
+        if getattr(self, "_gain_panel", None) is not None:
+            # Editor del guadagno aperto: qui si confrontano le ampiezze prima/dopo.
+            self._draw_gain_amplitudes(draw)
+            return
         if self._disp_data is None or not self._profiles:
             self._wiggle_show_empty(draw)
             return

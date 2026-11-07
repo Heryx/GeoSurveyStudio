@@ -7,6 +7,7 @@ from qgis.PyQt.QtWidgets import QProgressDialog
 from qgis.core import QgsApplication, QgsTask
 
 from .project_catalog import (
+    group_timeslice_subfolder,
     link_surfer_grid_into_project,
     load_catalog,
     normalize_copy_into_project,
@@ -80,8 +81,13 @@ class TimesliceImportTask(CallbackTask):
                 continue
 
             try:
+                # Le slice di un gruppo vivono in timeslices_2d/<nome gruppo>/
+                subfolder = (
+                    group_timeslice_subfolder(self.name_prefix)
+                    if self.name_prefix.strip() else "timeslices_2d"
+                )
                 project_path, normalized_name = normalize_copy_into_project(
-                    self.project_root, "timeslices_2d", source_path, name_prefix=self.name_prefix
+                    self.project_root, subfolder, source_path, name_prefix=self.name_prefix
                 )
                 src_meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
                 record = {

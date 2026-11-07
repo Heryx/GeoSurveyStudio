@@ -23,7 +23,7 @@ from qgis.PyQt.QtWidgets import (
     QStyledItemDelegate,
     QStyle,
 )
-from qgis.core import QgsApplication, QgsLayerTreeLayer, QgsRasterLayer
+from qgis.core import Qgis, QgsApplication, QgsLayerTreeLayer, QgsMessageLog, QgsRasterLayer
 
 from .grid_options_ui import build_grid_options_controls
 
@@ -494,6 +494,13 @@ class UiLayoutMixin:
         tabs.addTab(drawing_tab, "Drawing Options")
         tabs.addTab(group_tab, "Groups")
         tabs.addTab(image_tab, "Images")
+        try:
+            amp_tab = self._build_amplitude_tab(tabs)
+        except Exception as _exc:  # la scheda e' accessoria: mai bloccare il pannello
+            amp_tab = None
+            QgsMessageLog.logMessage(f"Scheda Ampiezze non creata: {_exc}", "GeoSurvey Studio", Qgis.Warning)
+        if amp_tab is not None:
+            tabs.addTab(amp_tab, "Amplitudes")
         tabs.addTab(export_tab, "Export")
         tabs.setTabPosition(QTabWidget.West)
         tabs.tabBar().setExpanding(False)
@@ -508,8 +515,11 @@ class UiLayoutMixin:
             (0, "Drawing Options", ("mActionCapturePolygon.svg", "mActionAddPolygon.svg", "mActionEditNodesItem.svg")),
             (1, "Groups", ("mActionAddGroup.svg", "mActionFolder.svg", "mIconFolder.svg")),
             (2, "Images", ("mActionAddRasterLayer.svg", "mIconRaster.svg")),
-            (3, "Export", ("mActionSaveMapAsImage.svg", "mActionFileSave.svg", "mActionSaveAsPDF.svg")),
+            (tabs.indexOf(export_tab), "Export", ("mActionSaveMapAsImage.svg", "mActionFileSave.svg", "mActionSaveAsPDF.svg")),
         ]
+        if amp_tab is not None:
+            _tab_specs.append((tabs.indexOf(amp_tab), "Amplitudes",
+                               ("mActionHistogramStretch.svg", "mActionRasterHistogram.svg", "mActionOptions.svg")))
         for _idx, _name, _icon_names in _tab_specs:
             tabs.setTabToolTip(_idx, _name)
             _ic = None

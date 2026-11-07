@@ -1624,8 +1624,32 @@ class ProjectManagerDialog(
             self,
             on_updated=self._notify_project_updated,
             open_catalog_editor_callback=self._open_catalog_editor,
+            on_project_transferred=self._on_project_transferred,
         )
         dlg.exec_()
+        self._notify_project_updated()
+
+    def _on_project_transferred(self, old_root, new_root):
+        """Dopo il trasferimento: il nuovo percorso diventa il progetto attivo
+        e i layer del progetto QGIS aperto che puntavano nella vecchia cartella
+        vengono ripuntati alla nuova."""
+        from . import project_binding
+        from qgis.core import QgsProject
+        self.path_edit.setText(new_root)
+        self.project_root = new_root
+        self.settings.setValue(self.settings_key_active_project, new_root)
+        old_n = os.path.normcase(os.path.normpath(old_root))
+        for layer in list(QgsProject.instance().mapLayers().values()):
+            try:
+                src = layer.source()
+                base, sep, opts = src.partition("|")
+                if os.path.normcase(os.path.normpath(base)).startswith(old_n + os.sep):
+                    rel = os.path.relpath(os.path.normpath(base), os.path.normpath(old_root))
+                    new_src = os.path.join(new_root, rel) + sep + opts
+                    layer.setDataSource(new_src, layer.name(), layer.providerType())
+            except Exception:
+                continue
+        project_binding.remember_root(new_root)
         self._notify_project_updated()
 
     def _open_variant_manager(self):
